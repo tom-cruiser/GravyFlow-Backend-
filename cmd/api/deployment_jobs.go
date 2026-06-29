@@ -463,7 +463,7 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 		return DeploymentJobStatus{}, err
 	}
 
-	if err := deploymentStore.MarkDeploymentDeployed(ctx, deployment.DeploymentID, containerID, deployment.AppName); err != nil {
+	if err := deploymentStore.MarkDeploymentDeployed(ctx, deployment.DeploymentID, containerID, deployment.AppName, imageName); err != nil {
 		return DeploymentJobStatus{}, err
 	}
 

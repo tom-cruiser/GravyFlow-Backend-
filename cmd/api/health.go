@@ -217,7 +217,7 @@ func (m *DeploymentHealthManager) checkDeployment(ctx context.Context, dockerCli
 	}
 
 	_ = deploymentStore.RecordDeploymentRestartAudit(ctx, target.DeploymentID, "restart", "succeeded", reason, target.ContainerID, restartedContainerID)
-	if err := deploymentStore.MarkDeploymentDeployed(ctx, target.DeploymentID, restartedContainerID, target.AppName); err != nil {
+	if err := deploymentStore.MarkDeploymentDeployed(ctx, target.DeploymentID, restartedContainerID, target.AppName, target.ImageName); err != nil {
 		log.Printf("health checker: update running deployment for %s: %v", target.DeploymentID, err)
 	}
 	m.publishEvent(ctx, DeploymentHealthEvent{

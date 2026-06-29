@@ -597,7 +597,7 @@ RETURNING id::text
 	return deploymentID, nil
 }
 
-func (s *DeploymentStore) UpdateDeploymentStatus(ctx context.Context, deploymentID string, status DeploymentStatus, statusMessage string, containerID string, containerName string) error {
+func (s *DeploymentStore) UpdateDeploymentStatus(ctx context.Context, deploymentID string, status DeploymentStatus, statusMessage string, containerID string, containerName string, imageName string) error {
 	if s == nil || s.pool == nil {
 		return fmt.Errorf("deployment store is not initialized")
 	}
@@ -616,6 +616,7 @@ SET status = $2,
 	status_message = $3,
 	container_id = CASE WHEN $4 <> '' THEN $4 ELSE container_id END,
 	container_name = CASE WHEN $5 <> '' THEN $5 ELSE container_name END,
+	image_name = CASE WHEN $6 <> '' THEN $6 ELSE image_name END,
 	started_at = COALESCE(started_at, now()),
 	finished_at = CASE
 		WHEN $2 = 'DEPLOYED' OR $2 = 'FAILED' THEN COALESCE(finished_at, now())
@@ -623,7 +624,7 @@ SET status = $2,
 	END,
 	updated_at = now()
 WHERE id = $1
-`, deploymentID, status, statusMessage, containerID, containerName)
+`, deploymentID, status, statusMessage, containerID, containerName, imageName)
 	if err != nil {
 		return fmt.Errorf("update deployment %s status: %w", deploymentID, err)
 	}
@@ -636,11 +637,13 @@ func (s *DeploymentStore) MarkDeploymentFailed(ctx context.Context, deploymentID
 		cause = fmt.Errorf("deployment failed")
 	}
 
-	return s.UpdateDeploymentStatus(ctx, deploymentID, DeploymentStatusFailed, cause.Error(), "", "")
+	// Failures leave image_name untouched (pass ""), so a later retry/restart can
+	// still find the previously built image.
+	return s.UpdateDeploymentStatus(ctx, deploymentID, DeploymentStatusFailed, cause.Error(), "", "", "")
 }
 
-func (s *DeploymentStore) MarkDeploymentDeployed(ctx context.Context, deploymentID string, containerID string, containerName string) error {
-	return s.UpdateDeploymentStatus(ctx, deploymentID, DeploymentStatusRunning, "deployment completed successfully", containerID, containerName)
+func (s *DeploymentStore) MarkDeploymentDeployed(ctx context.Context, deploymentID string, containerID string, containerName string, imageName string) error {
+	return s.UpdateDeploymentStatus(ctx, deploymentID, DeploymentStatusRunning, "deployment completed successfully", containerID, containerName, imageName)
 }
 
 func (s *DeploymentStore) UpsertDeploymentHealthConfig(ctx context.Context, userID string, deploymentID string, healthCheckPath string, intervalSeconds int, maxRestarts int) error {

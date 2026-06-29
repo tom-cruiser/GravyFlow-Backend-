@@ -1,0 +1,79 @@
+name: gravyflow
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: gravyflow
+      POSTGRES_USER: gravyflow
+      POSTGRES_PASSWORD: gravyflow
+    volumes:
+      # Named volume → data survives `down`/`up` and restarts. NOT a bind mount,
+      # so it is never silently wiped by host-side changes.
+      - postgres-data:/var/lib/postgresql/data
+      # Runs ONLY on first init (empty data dir). Re-running compose does not
+      # re-apply it, which is why persisted data is not clobbered.
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gravyflow -d gravyflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      # Single source of truth for the DB connection. Using DATABASE_URL
+      # deliberately bypasses the localhost dev-default logic in db.go
+      # (useLocalDevPostgresDefaults), which only triggers for host=localhost.
+      DATABASE_URL: postgres://gravyflow:gravyflow@postgres:5432/gravyflow?sslmode=disable
+      REDIS_ADDR: redis:6379
+      PORT: "8080"
+      # Belt-and-suspenders DB wait inside the app (see db.go pingWithRetry).
+      PGCONNECTATTEMPTS: "30"
+      PGCONNECTRETRYINTERVAL: "1s"
+    ports:
+      - "8080:8080"
+    volumes:
+      # DooD: drive the host Docker daemon so the control plane can build/run
+      # user app containers. Those containers are SIBLINGS on the host, not
+      # nested children of this one.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Cloned/built app sources live here so nixpacks (running inside this
+      # container) has a stable path to build from across restarts.
+      - app-builds:/var/lib/gravyflow/apps
+    depends_on:
+      # Gate startup on health, not just "container started". This is what makes
+      # the API wait until Postgres/Redis are actually accepting connections.
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  app-builds:

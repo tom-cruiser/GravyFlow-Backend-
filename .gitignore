@@ -1,0 +1,16 @@
+# Compiled Go binary (built via `go build ./cmd/api`)
+/cmd/api/api
+*.exe
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.vscode/
+.DS_Store
+
+# Node / frontend (lives in a separate repo)
+node_modules/
+*.tsbuildinfo

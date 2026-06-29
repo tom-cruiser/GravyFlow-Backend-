@@ -1,0 +1,13 @@
+# Keep the build context small and deterministic. Without this, `context: .`
+# would tar up the entire Next.js frontend incl. node_modules/.next on every build.
+.git
+.gitignore
+**/node_modules
+gravyflow-ui
+*.md
+.vscode
+cmd/api/api
+**/*.tsbuildinfo
+.env
+.env.*
+!.env.example

@@ -59,7 +59,9 @@ func BuildCode(appPath string, appName string) (string, error) {
 	cmd := exec.Command("nixpacks", "build", absPath, "--name", appName)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = os.Environ()
+	// Enable BuildKit so nixpacks gets content-addressed layer caching and
+	// parallel build steps — markedly faster on repeat builds.
+	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=1")
 
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("nixpacks build failed: %w", err)

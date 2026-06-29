@@ -86,14 +86,19 @@ func CreateAndStartContainer(imageName string, containerName string, deploymentI
 	}
 	defer dockerClient.Close()
 
-	pullReader, err := dockerClient.ImagePull(ctx, imageName, image.PullOptions{})
-	if err != nil {
-		return "", fmt.Errorf("pull image %q: %w", imageName, err)
-	}
-	defer pullReader.Close()
+	// Images built locally by nixpacks (tagged with the app name) do not exist in
+	// any registry. Pulling them would resolve to docker.io/library/<name> and
+	// fail or stall, so only pull when the image isn't already present locally.
+	if _, err := dockerClient.ImageInspect(ctx, imageName); err != nil {
+		pullReader, pullErr := dockerClient.ImagePull(ctx, imageName, image.PullOptions{})
+		if pullErr != nil {
+			return "", fmt.Errorf("pull image %q: %w", imageName, pullErr)
+		}
+		defer pullReader.Close()
 
-	if _, err := io.Copy(io.Discard, pullReader); err != nil {
-		return "", fmt.Errorf("read image pull stream: %w", err)
+		if _, err := io.Copy(io.Discard, pullReader); err != nil {
+			return "", fmt.Errorf("read image pull stream: %w", err)
+		}
 	}
 
 	exposedPort, err := nat.NewPort("tcp", containerPort)

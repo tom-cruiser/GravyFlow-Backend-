@@ -62,7 +62,19 @@ func run() error {
 		api.GET("/apps", AuthMiddleware(true), listAppsHandler)
 		api.POST("/apps", AuthMiddleware(true), createAppHandler)
 		api.POST("/apps/:id/deploy", AuthMiddleware(true), deploymentDeployHandler)
+		api.POST("/apps/:id/restart", AuthMiddleware(true), restartAppHandler)
 		api.GET("/apps/:id/logs", AuthMiddleware(true), streamAppLogsHandler)
+
+		// Environment variables (encrypted at rest by the control plane).
+		api.GET("/apps/:id/env", AuthMiddleware(true), listAppEnvHandler)
+		api.POST("/apps/:id/env", AuthMiddleware(true), addAppEnvHandler)
+		api.DELETE("/apps/:id/env/:key", AuthMiddleware(true), deleteAppEnvHandler)
+
+		// Custom domains + DNS challenge verification.
+		api.GET("/apps/:id/domains", AuthMiddleware(true), listAppDomainsHandler)
+		api.POST("/apps/:id/domains", AuthMiddleware(true), addAppDomainHandler)
+		api.POST("/apps/:id/domains/:domain/verify", AuthMiddleware(true), verifyAppDomainHandler)
+		api.DELETE("/apps/:id/domains/:domain", AuthMiddleware(true), deleteAppDomainHandler)
 		api.GET("/jobs/:jobId", AuthMiddleware(true), deploymentJobStatusHandler)
 		api.GET("/jobs/:jobId/stream", AuthMiddleware(true), deploymentJobStatusHandler)
 		api.GET("/users/:id/quota", AuthMiddleware(true), quotaSummaryHandler)

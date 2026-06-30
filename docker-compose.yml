@@ -45,6 +45,10 @@ services:
       DATABASE_URL: postgres://gravyflow:gravyflow@postgres:5432/gravyflow?sslmode=disable
       REDIS_ADDR: redis:6379
       PORT: "8080"
+      # Explicit, stable JWT signing secret instead of the silent code default
+      # (dev-auth-secret-change-me). Reads AUTH_JWT_SECRET from the host env when
+      # set; otherwise a fixed local value — OVERRIDE this in production.
+      AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-gravyflow-local-dev-secret-change-in-prod}
       # Belt-and-suspenders DB wait inside the app (see db.go pingWithRetry).
       PGCONNECTATTEMPTS: "30"
       PGCONNECTRETRYINTERVAL: "1s"
@@ -58,6 +62,9 @@ services:
       # Cloned/built app sources live here so nixpacks (running inside this
       # container) has a stable path to build from across restarts.
       - app-builds:/var/lib/gravyflow/apps
+      # Persist the nixpacks toolchain cache so it survives container restarts
+      # (matches NIXPACKS_CACHE_DIR in build.go).
+      - nixpacks-cache:/var/cache/nixpacks
     depends_on:
       # Gate startup on health, not just "container started". This is what makes
       # the API wait until Postgres/Redis are actually accepting connections.
@@ -77,3 +84,4 @@ volumes:
   postgres-data:
   redis-data:
   app-builds:
+  nixpacks-cache:

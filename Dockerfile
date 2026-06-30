@@ -30,9 +30,14 @@ FROM debian:bookworm-slim
 ARG DOCKER_CLI_VERSION=27.3.1
 ARG TARGETARCH
 
+# Use bash with pipefail so a failed curl inside a pipe (e.g. `curl | bash`,
+# `curl | tar`) fails the build instead of silently producing an image with no
+# nixpacks/docker CLI — the failure mode behind "nixpacks not found" at runtime.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl git xz-utils; \
+    apt-get install -y --no-install-recommends ca-certificates curl git tar xz-utils; \
     # Static docker CLI — used by nixpacks to talk to the mounted host daemon.
     case "${TARGETARCH:-amd64}" in \
       amd64) DOCKER_ARCH=x86_64 ;; \
@@ -45,7 +50,11 @@ RUN set -eux; \
     rm -rf /tmp/docker; \
     # nixpacks — the builder the control plane invokes for user source.
     curl -fsSL https://nixpacks.com/install.sh | bash; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/*; \
+    # Assert both tools are present & on PATH now, so a broken install fails the
+    # build here rather than every deployment job later.
+    docker --version; \
+    nixpacks --version
 
 COPY --from=builder /out/gravyflow-api /usr/local/bin/gravyflow-api
 

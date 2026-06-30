@@ -64,7 +64,10 @@ func newDeploymentJobManager() (*DeploymentJobManager, error) {
 	})
 
 	asynqClient := asynq.NewClient(redisOpt)
-	concurrency := intFromEnvOrDefault("ASYNQ_CONCURRENCY", 4)
+	// Default to a single worker: Nixpacks builds are CPU/IO heavy and will
+	// thrash a small single-core VPS if several run at once. Still overridable
+	// via ASYNQ_CONCURRENCY for larger hosts.
+	concurrency := intFromEnvOrDefault("ASYNQ_CONCURRENCY", 1)
 	asynqServer := asynq.NewServer(redisOpt, asynq.Config{
 		Concurrency: concurrency,
 		Queues: map[string]int{

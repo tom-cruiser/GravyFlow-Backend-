@@ -19,7 +19,7 @@ func restartAppHandler(c *gin.Context) {
 		return
 	}
 
-	jobID, err := deploymentJobs.EnqueueDeployment(c.Request.Context(), user.ID, deployment.DeploymentID)
+	jobID, err := deploymentJobs.EnqueueDeployment(c.Request.Context(), user.ID, deployment.DeploymentID, false)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_restart_service", "details": err.Error()})
 		return

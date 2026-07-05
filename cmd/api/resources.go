@@ -238,6 +238,11 @@ func estimateStorageUsageMB(path string) (int64, error) {
 		return 0, fmt.Errorf("path is required")
 	}
 
+	if isRemoteRepoSource(path) {
+		// Remote URLs are cloned before quota checks; assume a modest checkout size.
+		return 256, nil
+	}
+
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return 0, fmt.Errorf("resolve path: %w", err)

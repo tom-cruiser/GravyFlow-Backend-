@@ -1,0 +1,8 @@
+{
+	# Expose admin API so the GravyFlow API can push routes from the host.
+	admin 0.0.0.0:2019
+}
+
+:80 {
+	respond "GravyFlow Caddy is running" 200
+}

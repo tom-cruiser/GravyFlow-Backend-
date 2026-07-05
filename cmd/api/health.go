@@ -197,7 +197,7 @@ func (m *DeploymentHealthManager) checkDeployment(ctx context.Context, dockerCli
 		return
 	}
 
-	restartedContainerID, err := RestartContainer(target.ContainerID, target.ImageName, target.AppName, target.DeploymentID, target.PortMap, loadDockerEnvList(envMap), defaultDeployMemoryMB, defaultDeployCPU)
+	restartedContainerID, err := RestartContainer(target.ContainerID, target.ImageName, target.AppName, target.DeploymentID, normalizePortMap(target.PortMap), loadDockerEnvList(envMap), defaultDeployMemoryMB, defaultDeployCPU)
 	if err != nil {
 		_ = deploymentStore.RecordDeploymentRestartAudit(ctx, target.DeploymentID, "restart", "failed", err.Error(), target.ContainerID, "")
 		if markErr := deploymentStore.MarkDeploymentFailed(ctx, target.DeploymentID, err); markErr != nil {
@@ -249,11 +249,6 @@ func (m *DeploymentHealthManager) inspectAndProbe(ctx context.Context, dockerCli
 		}
 	}
 
-	hostPort, _, err := parsePortMap(target.PortMap)
-	if err != nil {
-		return false, fmt.Sprintf("parse port map: %v", err)
-	}
-
 	healthPath := strings.TrimSpace(target.HealthCheckPath)
 	if healthPath == "" {
 		healthPath = "/health"
@@ -262,7 +257,23 @@ func (m *DeploymentHealthManager) inspectAndProbe(ctx context.Context, dockerCli
 		healthPath = "/" + healthPath
 	}
 
-	endpoint := fmt.Sprintf("http://127.0.0.1:%s%s", hostPort, healthPath)
+	internalIP := ""
+	for _, network := range inspect.NetworkSettings.Networks {
+		if network.IPAddress != "" {
+			internalIP = network.IPAddress
+			break
+		}
+	}
+	internalPort := ""
+	for port := range inspect.Config.ExposedPorts {
+		internalPort = port.Port()
+		break
+	}
+	if internalIP == "" || internalPort == "" {
+		return false, "container has no reachable internal endpoint"
+	}
+
+	endpoint := fmt.Sprintf("http://%s:%s%s", internalIP, internalPort, healthPath)
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return false, fmt.Sprintf("create health request: %v", err)

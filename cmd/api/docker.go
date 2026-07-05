@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
+	"sort"
 	"strings"
 
 	"github.com/docker/docker/api/types"
@@ -78,6 +80,7 @@ func CreateAndStartContainer(imageName string, containerName string, deploymentI
 	if err != nil {
 		return "", err
 	}
+	_ = hostPort // routing uses Caddy + container internal IP, not host port publish
 
 	ctx := context.Background()
 	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -101,6 +104,10 @@ func CreateAndStartContainer(imageName string, containerName string, deploymentI
 		}
 	}
 
+	if err := removeContainerByName(ctx, dockerClient, containerName); err != nil {
+		return "", err
+	}
+
 	exposedPort, err := nat.NewPort("tcp", containerPort)
 	if err != nil {
 		return "", fmt.Errorf("invalid container port %q: %w", containerPort, err)
@@ -110,9 +117,10 @@ func CreateAndStartContainer(imageName string, containerName string, deploymentI
 		Image: imageName,
 		Env:   envVars,
 		Labels: map[string]string{
-			managedByLabelKey:      managedByLabelValue,
+			managedByLabelKey:         managedByLabelValue,
 			"gravyflow.deployment-id": deploymentID,
 			"gravyflow.app-name":      containerName,
+			"gravyflow.internal-port": containerPort,
 		},
 		ExposedPorts: nat.PortSet{
 			exposedPort: struct{}{},
@@ -120,12 +128,6 @@ func CreateAndStartContainer(imageName string, containerName string, deploymentI
 	}
 
 	hostCfg := &container.HostConfig{
-		PortBindings: nat.PortMap{
-			exposedPort: []nat.PortBinding{{
-				HostIP:   "0.0.0.0",
-				HostPort: hostPort,
-			}},
-		},
 		Resources: container.Resources{
 			Memory:   memoryMB * 1024 * 1024,
 			NanoCPUs: int64(math.Round(cpus * 1_000_000_000)),
@@ -145,9 +147,7 @@ func CreateAndStartContainer(imageName string, containerName string, deploymentI
 	}
 
 	if err := SyncCaddyRoutesFromRunningContainers(); err != nil {
-		_ = dockerClient.ContainerStop(ctx, resp.ID, container.StopOptions{})
-		_ = dockerClient.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
-		return "", fmt.Errorf("sync caddy routes after start: %w", err)
+		log.Printf("warning: caddy sync after start failed for %q: %v (container kept running)", containerName, err)
 	}
 
 	return resp.ID, nil
@@ -272,6 +272,24 @@ func parsePortMap(portMap string) (string, string, error) {
 	return hostPort, containerPort, nil
 }
 
+// allocatePortMap returns host:container with host port 0 so Docker assigns a free port.
+func allocatePortMap(containerPort string) string {
+	containerPort = strings.TrimSpace(containerPort)
+	if containerPort == "" {
+		containerPort = "8080"
+	}
+	return "0:" + containerPort
+}
+
+// normalizePortMap upgrades legacy 8080:8080 maps that conflict with the API listener.
+func normalizePortMap(portMap string) string {
+	portMap = strings.TrimSpace(portMap)
+	if portMap == "" || portMap == "8080:8080" {
+		return allocatePortMap("8080")
+	}
+	return portMap
+}
+
 func asValidationError(err error) *ValidationError {
 	if err == nil {
 		return nil
@@ -325,10 +343,27 @@ func resolveManagedContainerEndpoint(ctx context.Context, dockerClient *client.C
 		return "", "", fmt.Errorf("container %q has no assigned internal IP", containerID)
 	}
 
-	internalPort := ""
-	for port := range inspect.Config.ExposedPorts {
-		internalPort = port.Port()
-		break
+	internalPort := strings.TrimSpace(inspect.Config.Labels["gravyflow.internal-port"])
+	if internalPort == "" {
+		exposed := make([]string, 0, len(inspect.Config.ExposedPorts))
+		for port := range inspect.Config.ExposedPorts {
+			exposed = append(exposed, port.Port())
+		}
+		sort.Strings(exposed)
+		for _, preferred := range []string{"8080", "3000", "5000", "80"} {
+			for _, candidate := range exposed {
+				if candidate == preferred {
+					internalPort = candidate
+					break
+				}
+			}
+			if internalPort != "" {
+				break
+			}
+		}
+		if internalPort == "" && len(exposed) > 0 {
+			internalPort = exposed[len(exposed)-1]
+		}
 	}
 	if internalPort == "" {
 		for _, binding := range inspect.NetworkSettings.Ports {
@@ -344,4 +379,28 @@ func resolveManagedContainerEndpoint(ctx context.Context, dockerClient *client.C
 	}
 
 	return internalIP, internalPort, nil
+}
+
+func removeContainerByName(ctx context.Context, dockerClient *client.Client, containerName string) error {
+	containerName = strings.TrimSpace(containerName)
+	if containerName == "" {
+		return nil
+	}
+
+	existing, err := dockerClient.ContainerInspect(ctx, containerName)
+	if err != nil {
+		if errdefs.IsNotFound(err) || client.IsErrNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("inspect container %q: %w", containerName, err)
+	}
+
+	if err := dockerClient.ContainerStop(ctx, existing.ID, container.StopOptions{}); err != nil && !errdefs.IsNotFound(err) {
+		return fmt.Errorf("stop container %q: %w", containerName, err)
+	}
+	if err := dockerClient.ContainerRemove(ctx, existing.ID, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
+		return fmt.Errorf("remove container %q: %w", containerName, err)
+	}
+
+	return SyncCaddyRoutesFromRunningContainers()
 }

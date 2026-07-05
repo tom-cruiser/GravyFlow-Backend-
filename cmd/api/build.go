@@ -59,6 +59,15 @@ func BuildCode(appPath string, appName string) (string, error) {
 		return "", fmt.Errorf("nixpacks CLI not found in PATH: %w", err)
 	}
 
+	// Node/Vite/Next.js apps use a direct Docker build path (much faster than nixpacks).
+	if kind := detectProjectKind(absPath); kind != projectKindUnknown {
+		log.Printf("build: using fast builder for %q (%s)", appName, projectKindLabel(kind))
+		if err := buildNodeDockerImage(absPath, appName, kind); err != nil {
+			return "", fmt.Errorf("docker build failed: %w", err)
+		}
+		return dockerImageTag(appName), nil
+	}
+
 	// Persist Nixpacks' toolchain cache across builds so it doesn't re-download
 	// the Nix environment on every deploy. Defaults to /var/cache/nixpacks;
 	// override via NIXPACKS_CACHE_DIR, or set it to "off"/"none" to omit the
@@ -80,24 +89,41 @@ func BuildCode(appPath string, appName string) (string, error) {
 				if fallbackErr := runNixpacksBuild(absPath, appName, ""); fallbackErr != nil {
 					return "", fmt.Errorf("nixpacks build failed: %w", fallbackErr)
 				}
-				return appName, nil
+				return dockerImageTag(appName), nil
 			}
 			return "", fmt.Errorf("nixpacks build failed: %w", err)
 		}
-		return appName, nil
+		return dockerImageTag(appName), nil
 	}
 
 	if err := runNixpacksBuild(absPath, appName, ""); err != nil {
 		return "", fmt.Errorf("nixpacks build failed: %w", err)
 	}
 
-	return appName, nil
+	return dockerImageTag(appName), nil
 }
 
 // runNixpacksBuild invokes the nixpacks CLI, streaming output to the server logs
 // while also capturing stderr so the caller can classify failures. Passing an
 // empty cacheDir omits the --cache-dir flag (native cache defaults).
 func runNixpacksBuild(absPath string, appName string, cacheDir string) error {
+	err := runNixpacksBuildWithEnv(absPath, appName, cacheDir, dockerCommandEnv())
+	if err != nil && isBuildKitMissingError(err) {
+		log.Printf("nixpacks: BuildKit/buildx unavailable, retrying with legacy docker builder")
+		if retryErr := runNixpacksBuildWithEnv(absPath, appName, cacheDir, dockerCommandEnvForceLegacyBuilder()); retryErr == nil {
+			return nil
+		} else {
+			err = retryErr
+		}
+	}
+
+	if err != nil && isBuildKitMissingError(err) {
+		return fmt.Errorf("%w (install docker-buildx or set GRAVYFLOW_DISABLE_BUILDKIT=1)", err)
+	}
+	return err
+}
+
+func runNixpacksBuildWithEnv(absPath string, appName string, cacheDir string, env []string) error {
 	args := []string{"build", absPath, "--name", appName}
 	if cacheDir != "" {
 		args = append(args, "--cache-dir", cacheDir)
@@ -107,9 +133,7 @@ func runNixpacksBuild(absPath string, appName string, cacheDir string) error {
 	cmd := exec.Command("nixpacks", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
-	// Enable BuildKit so nixpacks gets content-addressed layer caching and
-	// parallel build steps — markedly faster on repeat builds.
-	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=1")
+	cmd.Env = env
 
 	if err := cmd.Run(); err != nil {
 		if trimmed := strings.TrimSpace(stderr.String()); trimmed != "" {

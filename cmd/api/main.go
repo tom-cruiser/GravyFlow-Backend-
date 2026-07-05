@@ -45,8 +45,9 @@ func run() error {
 
 	go func() {
 		if err := jobs.asynqServer.Run(jobs.ServeMux()); err != nil {
-			log.Printf("asynq server stopped: %v", err)
+			log.Fatalf("deployment worker stopped: %v (restart the API)", err)
 		}
+		log.Fatal("deployment worker exited unexpectedly (restart the API)")
 	}()
 
 	router := gin.New()
@@ -64,6 +65,7 @@ func run() error {
 		api.POST("/apps/:id/deploy", AuthMiddleware(true), deploymentDeployHandler)
 		api.POST("/apps/:id/restart", AuthMiddleware(true), restartAppHandler)
 		api.GET("/apps/:id/logs", AuthMiddleware(true), streamAppLogsHandler)
+		api.GET("/apps/:id/deploy-log", AuthMiddleware(true), deployLogHandler)
 
 		// Environment variables (encrypted at rest by the control plane).
 		api.GET("/apps/:id/env", AuthMiddleware(true), listAppEnvHandler)
@@ -116,8 +118,9 @@ func createAppHandler(c *gin.Context) {
 		return
 	}
 
-	// Default port map: expose container port 8080 on host port 8080
-	portMap := "8080:8080"
+	// Container listens on 8080 internally; host port 0 lets Docker pick a free port
+	// so we don't collide with the GravyFlow API (also on 8080).
+	portMap := allocatePortMap("8080")
 
 	deploymentID, err := deploymentStore.CreateDeploymentAttemptForUser(
 		c.Request.Context(),
@@ -137,7 +140,7 @@ func createAppHandler(c *gin.Context) {
 		return
 	}
 
-	jobID, err := deploymentJobs.EnqueueDeployment(c.Request.Context(), user.ID, deploymentID)
+	jobID, err := deploymentJobs.EnqueueDeployment(c.Request.Context(), user.ID, deploymentID, true)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_enqueue_deployment", "details": err.Error()})
 		return

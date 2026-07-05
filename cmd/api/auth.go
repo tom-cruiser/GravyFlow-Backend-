@@ -320,6 +320,16 @@ func authenticateRequest(c *gin.Context, allowAPIKey bool) (UserRecord, error) {
 		return deploymentStore.GetUserByID(c.Request.Context(), claims.Subject)
 	}
 
+	// WebSocket clients cannot set Authorization headers; accept access JWT via query.
+	if queryToken := strings.TrimSpace(c.Query("token")); queryToken != "" {
+		claims, err := parseAndValidateToken(queryToken, tokenTypeAccess)
+		if err != nil {
+			return UserRecord{}, err
+		}
+
+		return deploymentStore.GetUserByID(c.Request.Context(), claims.Subject)
+	}
+
 	if allowAPIKey {
 		if apiKey := extractAPIKey(c); apiKey != "" {
 			return deploymentStore.GetUserByAPIKey(c.Request.Context(), apiKey)

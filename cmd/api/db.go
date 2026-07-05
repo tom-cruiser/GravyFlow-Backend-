@@ -612,21 +612,45 @@ func (s *DeploymentStore) UpdateDeploymentStatus(ctx context.Context, deployment
 
 	_, err := s.pool.Exec(ctx, `
 UPDATE deployments
-SET status = $2,
+SET status = $2::deployment_status,
 	status_message = $3,
 	container_id = CASE WHEN $4 <> '' THEN $4 ELSE container_id END,
 	container_name = CASE WHEN $5 <> '' THEN $5 ELSE container_name END,
 	image_name = CASE WHEN $6 <> '' THEN $6 ELSE image_name END,
 	started_at = COALESCE(started_at, now()),
 	finished_at = CASE
-		WHEN $2 = 'DEPLOYED' OR $2 = 'FAILED' THEN COALESCE(finished_at, now())
+		WHEN $2::text IN ('DEPLOYED', 'FAILED', 'RUNNING') THEN COALESCE(finished_at, now())
 		ELSE finished_at
 	END,
 	updated_at = now()
 WHERE id = $1
-`, deploymentID, status, statusMessage, containerID, containerName, imageName)
+`, deploymentID, string(status), statusMessage, containerID, containerName, imageName)
 	if err != nil {
 		return fmt.Errorf("update deployment %s status: %w", deploymentID, err)
+	}
+
+	return nil
+}
+
+func (s *DeploymentStore) UpdateDeploymentAppPath(ctx context.Context, deploymentID string, appPath string) error {
+	if s == nil || s.pool == nil {
+		return fmt.Errorf("deployment store is not initialized")
+	}
+
+	deploymentID = strings.TrimSpace(deploymentID)
+	appPath = strings.TrimSpace(appPath)
+	if deploymentID == "" || appPath == "" {
+		return fmt.Errorf("deploymentID and appPath are required")
+	}
+
+	_, err := s.pool.Exec(ctx, `
+UPDATE deployments
+SET app_path = $2,
+	updated_at = now()
+WHERE id = $1
+`, deploymentID, appPath)
+	if err != nil {
+		return fmt.Errorf("update deployment %s app path: %w", deploymentID, err)
 	}
 
 	return nil

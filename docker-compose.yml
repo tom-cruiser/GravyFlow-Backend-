@@ -52,6 +52,8 @@ services:
       # Belt-and-suspenders DB wait inside the app (see db.go pingWithRetry).
       PGCONNECTATTEMPTS: "30"
       PGCONNECTRETRYINTERVAL: "1s"
+      GRAVYFLOW_APPS_DIR: /var/lib/gravyflow/apps
+      NIXPACKS_CACHE_DIR: /var/cache/nixpacks
     ports:
       - "8080:8080"
     volumes:

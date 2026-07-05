@@ -27,6 +27,7 @@ const (
 type DeploymentJobPayload struct {
 	DeploymentID string `json:"deploymentId"`
 	UserID       string `json:"userId"`
+	RebuildImage bool   `json:"rebuildImage"`
 }
 
 type DeploymentJobStatus struct {
@@ -108,7 +109,7 @@ func (m *DeploymentJobManager) ServeMux() *asynq.ServeMux {
 	return mux
 }
 
-func (m *DeploymentJobManager) EnqueueDeployment(ctx context.Context, userID string, deploymentID string) (string, error) {
+func (m *DeploymentJobManager) EnqueueDeployment(ctx context.Context, userID string, deploymentID string, rebuildImage bool) (string, error) {
 	if m == nil || m.asynqClient == nil || m.redisClient == nil {
 		return "", fmt.Errorf("deployment job manager is not initialized")
 	}
@@ -139,7 +140,7 @@ func (m *DeploymentJobManager) EnqueueDeployment(ctx context.Context, userID str
 		return "", err
 	}
 
-	payloadBytes, err := json.Marshal(DeploymentJobPayload{UserID: userID, DeploymentID: deploymentID})
+	payloadBytes, err := json.Marshal(DeploymentJobPayload{UserID: userID, DeploymentID: deploymentID, RebuildImage: rebuildImage})
 	if err != nil {
 		_ = m.redisClient.Del(ctx, m.statusKey(jobID)).Err()
 		return "", fmt.Errorf("marshal deployment job payload: %w", err)
@@ -377,7 +378,7 @@ func deploymentDeployHandler(c *gin.Context) {
 		return
 	}
 
-	jobID, err := deploymentJobs.EnqueueDeployment(c.Request.Context(), user.ID, deployment.DeploymentID)
+	jobID, err := deploymentJobs.EnqueueDeployment(c.Request.Context(), user.ID, deployment.DeploymentID, true)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_enqueue_deployment", "details": err.Error()})
 		return
@@ -405,12 +406,33 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 		progress("loading", 10, "loading deployment details")
 	}
 
+	imageName := strings.TrimSpace(deployment.ImageName)
+	fastRestart := !payload.RebuildImage && imageName != ""
+
 	requestedCPU := defaultDeployCPU
 	requestedMemoryMB := int64(defaultDeployMemoryMB)
 	requestedApps := int64(defaultDeployApps)
-	requestedStorageMB, err := estimateStorageUsageMB(deployment.AppPath)
-	if err != nil {
-		return DeploymentJobStatus{}, err
+	var requestedStorageMB int64
+
+	if fastRestart {
+		if progress != nil {
+			progress("restarting", 20, "restarting service without rebuild")
+		}
+	} else {
+		if progress != nil {
+			progress("cloning", 15, "cloning source repository")
+		}
+
+		localAppPath, err := prepareDeploymentSource(ctx, deployment)
+		if err != nil {
+			return DeploymentJobStatus{}, err
+		}
+		deployment.AppPath = localAppPath
+
+		requestedStorageMB, err = estimateStorageUsageMB(deployment.AppPath)
+		if err != nil {
+			return DeploymentJobStatus{}, err
+		}
 	}
 
 	shouldReserve := deployment.Status == string(DeploymentStatusFailed)
@@ -422,21 +444,19 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 		}
 	}
 
-	if progress != nil {
-		progress("building", 25, "building application image")
-	}
-
 	if strings.TrimSpace(deployment.ContainerID) != "" {
 		if progress != nil {
-			progress("stopping", 15, "stopping existing container")
+			progress("stopping", 35, "stopping existing container")
 		}
 		if err := StopAndRemoveContainer(deployment.ContainerID); err != nil {
 			return DeploymentJobStatus{}, err
 		}
 	}
 
-	imageName := strings.TrimSpace(deployment.ImageName)
-	if imageName == "" {
+	if payload.RebuildImage || imageName == "" {
+		if progress != nil {
+			progress("building", 50, "building application image")
+		}
 		imageName, err = BuildCode(deployment.AppPath, deployment.AppName)
 		if err != nil {
 			if shouldReleaseOnError {
@@ -444,6 +464,8 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 			}
 			return DeploymentJobStatus{}, err
 		}
+	} else if progress != nil {
+		progress("deploying", 60, "reusing existing image")
 	}
 
 	if progress != nil {
@@ -458,7 +480,7 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 		return DeploymentJobStatus{}, err
 	}
 
-	containerID, err := CreateAndStartContainer(imageName, deployment.AppName, deployment.DeploymentID, deployment.PortMap, loadDockerEnvList(envMap), requestedMemoryMB, requestedCPU)
+	containerID, err := CreateAndStartContainer(imageName, deployment.AppName, deployment.DeploymentID, normalizePortMap(deployment.PortMap), loadDockerEnvList(envMap), requestedMemoryMB, requestedCPU)
 	if err != nil {
 		if shouldReleaseOnError {
 			_ = deploymentStore.ReleaseDeploymentResources(ctx, payload.UserID, requestedCPU, requestedMemoryMB, requestedApps, requestedStorageMB)

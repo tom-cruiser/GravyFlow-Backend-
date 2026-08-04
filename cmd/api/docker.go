@@ -1,406 +1,674 @@
 package main
 
 import (
-	"context"
-	"errors"
-	"fmt"
-	"io"
-	"log"
-	"math"
-	"sort"
-	"strings"
+    "bytes"
+    "context"
+    "encoding/json"
+    "fmt"
+    "io"
+    "log"
+    "math"
+    "sort"
+    "strings"
+    "time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/go-connections/nat"
+    "github.com/docker/docker/api/types"
+    "github.com/docker/docker/api/types/container"
+    "github.com/docker/docker/api/types/filters"
+    "github.com/docker/docker/api/types/image"
+    "github.com/docker/docker/api/types/network"
+    "github.com/docker/docker/api/types/volume"
+    "github.com/docker/docker/client"
+    "github.com/docker/docker/errdefs"
+    "github.com/docker/go-connections/nat"
 )
 
-const (
-	managedByLabelKey   = "gravyflow.managed-by"
-	managedByLabelValue = "control-plane"
-)
+// ============================================================================
+// NEW TYPES
+// ============================================================================
 
-type ValidationError struct {
-	Field   string
-	Code    string
-	Message string
+type HealthCheckConfig struct {
+    Path     string        `json:"path"`
+    Interval time.Duration `json:"interval"`
+    Timeout  time.Duration `json:"timeout"`
+    Retries  int           `json:"retries"`
 }
 
-func (e *ValidationError) Error() string {
-	return e.Message
+type ContainerLogOptions struct {
+    ShowStdout bool      `json:"showStdout"`
+    ShowStderr bool      `json:"showStderr"`
+    Tail       int       `json:"tail"`
+    Since      time.Time `json:"since"`
 }
 
-type ConflictError struct {
-	Resource string
-	Value    string
+type ContainerStats struct {
+    ContainerID   string    `json:"containerId"`
+    CPUUsage      float64   `json:"cpuUsage"`
+    MemoryUsage   float64   `json:"memoryUsage"`
+    MemoryLimit   float64   `json:"memoryLimit"`
+    NetworkIn     int64     `json:"networkIn"`
+    NetworkOut    int64     `json:"networkOut"`
+    BlockRead     int64     `json:"blockRead"`
+    BlockWrite    int64     `json:"blockWrite"`
+    PIDs          int       `json:"pids"`
+    Timestamp     time.Time `json:"timestamp"`
 }
 
-func (e *ConflictError) Error() string {
-	return fmt.Sprintf("%s %q already exists", e.Resource, e.Value)
+type NetworkConfig struct {
+    Name    string            `json:"name"`
+    Driver  string            `json:"driver"`
+    Subnet  string            `json:"subnet"`
+    Gateway string            `json:"gateway"`
+    IPRange string            `json:"ipRange"`
+    Labels  map[string]string `json:"labels"`
 }
 
-type ManagedContainer struct {
-	ContainerID   string `json:"containerId"`
-	ContainerName string `json:"containerName"`
-	DeploymentID  string `json:"deploymentId"`
-	AppName       string `json:"appName"`
-	ImageName     string `json:"imageName"`
-	InternalIP    string `json:"internalIP"`
-	InternalPort  string `json:"internalPort"`
-	Status        string `json:"status"`
-	PortMap       string `json:"portMap"`
+type CleanupPolicy struct {
+    MaxAge        time.Duration `json:"maxAge"`
+    MaxCount      int           `json:"maxCount"`
+    StopBefore    bool          `json:"stopBefore"`
+    RemoveVolumes bool          `json:"removeVolumes"`
 }
 
-// CreateAndStartContainer pulls an image, creates a container with port mapping, and starts it.
-func CreateAndStartContainer(imageName string, containerName string, deploymentID string, portMap string, envVars []string, memoryMB int64, cpus float64) (string, error) {
-	imageName = strings.TrimSpace(imageName)
-	containerName = strings.TrimSpace(containerName)
-	deploymentID = strings.TrimSpace(deploymentID)
-	portMap = strings.TrimSpace(portMap)
-
-	if imageName == "" {
-		return "", fmt.Errorf("imageName is required")
-	}
-	if containerName == "" {
-		return "", fmt.Errorf("containerName is required")
-	}
-	if deploymentID == "" {
-		return "", fmt.Errorf("deploymentID is required")
-	}
-	if portMap == "" {
-		return "", fmt.Errorf("portMap is required")
-	}
-
-	hostPort, containerPort, err := parsePortMap(portMap)
-	if err != nil {
-		return "", err
-	}
-	_ = hostPort // routing uses Caddy + container internal IP, not host port publish
-
-	ctx := context.Background()
-	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		return "", fmt.Errorf("create docker client: %w", err)
-	}
-	defer dockerClient.Close()
-
-	// Images built locally by nixpacks (tagged with the app name) do not exist in
-	// any registry. Pulling them would resolve to docker.io/library/<name> and
-	// fail or stall, so only pull when the image isn't already present locally.
-	if _, err := dockerClient.ImageInspect(ctx, imageName); err != nil {
-		pullReader, pullErr := dockerClient.ImagePull(ctx, imageName, image.PullOptions{})
-		if pullErr != nil {
-			return "", fmt.Errorf("pull image %q: %w", imageName, pullErr)
-		}
-		defer pullReader.Close()
-
-		if _, err := io.Copy(io.Discard, pullReader); err != nil {
-			return "", fmt.Errorf("read image pull stream: %w", err)
-		}
-	}
-
-	if err := removeContainerByName(ctx, dockerClient, containerName); err != nil {
-		return "", err
-	}
-
-	exposedPort, err := nat.NewPort("tcp", containerPort)
-	if err != nil {
-		return "", fmt.Errorf("invalid container port %q: %w", containerPort, err)
-	}
-
-	containerCfg := &container.Config{
-		Image: imageName,
-		Env:   envVars,
-		Labels: map[string]string{
-			managedByLabelKey:         managedByLabelValue,
-			"gravyflow.deployment-id": deploymentID,
-			"gravyflow.app-name":      containerName,
-			"gravyflow.internal-port": containerPort,
-		},
-		ExposedPorts: nat.PortSet{
-			exposedPort: struct{}{},
-		},
-	}
-
-	hostCfg := &container.HostConfig{
-		Resources: container.Resources{
-			Memory:   memoryMB * 1024 * 1024,
-			NanoCPUs: int64(math.Round(cpus * 1_000_000_000)),
-		},
-	}
-
-	resp, err := dockerClient.ContainerCreate(ctx, containerCfg, hostCfg, &network.NetworkingConfig{}, nil, containerName)
-	if err != nil {
-		if errdefs.IsConflict(err) || strings.Contains(strings.ToLower(err.Error()), "is already in use") {
-			return "", &ConflictError{Resource: "containerName", Value: containerName}
-		}
-		return "", fmt.Errorf("create container %q: %w", containerName, err)
-	}
-
-	if err := dockerClient.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		return "", fmt.Errorf("start container %q: %w", containerName, err)
-	}
-
-	if err := SyncCaddyRoutesFromRunningContainers(); err != nil {
-		log.Printf("warning: caddy sync after start failed for %q: %v (container kept running)", containerName, err)
-	}
-
-	return resp.ID, nil
+type ContainerEvent struct {
+    Type       string            `json:"type"`
+    Action     string            `json:"action"`
+    ActorID    string            `json:"actorId"`
+    Attributes map[string]string `json:"attributes"`
+    Timestamp  time.Time         `json:"timestamp"`
 }
 
-func RestartContainer(containerID string, imageName string, containerName string, deploymentID string, portMap string, envVars []string, memoryMB int64, cpus float64) (string, error) {
-	if strings.TrimSpace(containerID) != "" {
-		if err := StopAndRemoveContainer(containerID); err != nil {
-			return "", err
-		}
-	}
+type EventHandler func(event ContainerEvent) error
 
-	return CreateAndStartContainer(imageName, containerName, deploymentID, portMap, envVars, memoryMB, cpus)
+type VolumeConfig struct {
+    Name    string            `json:"name"`
+    Driver  string            `json:"driver"`
+    Labels  map[string]string `json:"labels"`
+    Options map[string]string `json:"options"`
 }
 
-// StopAndRemoveContainer stops and removes a managed container, then rebuilds the Caddy config from live containers.
-// This is the safe deletion path: once the container disappears from Docker, the next sync removes its route.
-func StopAndRemoveContainer(containerID string) error {
-	containerID = strings.TrimSpace(containerID)
-	if containerID == "" {
-		return &ValidationError{
-			Field:   "containerId",
-			Code:    "required",
-			Message: "containerId is required",
-		}
-	}
-
-	ctx := context.Background()
-	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		return fmt.Errorf("create docker client: %w", err)
-	}
-	defer dockerClient.Close()
-
-	if err := dockerClient.ContainerStop(ctx, containerID, container.StopOptions{}); err != nil && !errdefs.IsNotFound(err) {
-		return fmt.Errorf("stop container %q: %w", containerID, err)
-	}
-	if err := dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
-		return fmt.Errorf("remove container %q: %w", containerID, err)
-	}
-
-	return SyncCaddyRoutesFromRunningContainers()
+type BackupConfig struct {
+    Source      string   `json:"source"`
+    Destination string   `json:"destination"`
+    Compress    bool     `json:"compress"`
+    Exclude     []string `json:"exclude"`
 }
 
-func ListRunningManagedContainers() ([]ManagedContainer, error) {
-	ctx := context.Background()
-	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		return nil, fmt.Errorf("create docker client: %w", err)
-	}
-	defer dockerClient.Close()
-
-	args := filters.NewArgs(filters.Arg("label", managedByLabelKey+"="+managedByLabelValue))
-	containers, err := dockerClient.ContainerList(ctx, container.ListOptions{Filters: args})
-	if err != nil {
-		return nil, fmt.Errorf("list containers: %w", err)
-	}
-
-	out := make([]ManagedContainer, 0, len(containers))
-	for _, c := range containers {
-		name := ""
-		if len(c.Names) > 0 {
-			name = strings.TrimPrefix(c.Names[0], "/")
-		}
-
-		internalIP, internalPort, err := resolveManagedContainerEndpoint(ctx, dockerClient, c.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		out = append(out, ManagedContainer{
-			ContainerID:   c.ID,
-			ContainerName: name,
-			DeploymentID:  c.Labels["gravyflow.deployment-id"],
-			AppName:       c.Labels["gravyflow.app-name"],
-			ImageName:     c.Image,
-			InternalIP:    internalIP,
-			InternalPort:  internalPort,
-			Status:        c.Status,
-			PortMap:       formatPortMap(c.Ports),
-		})
-	}
-
-	return out, nil
+type ImageManager struct {
+    client *client.Client
 }
 
-func parsePortMap(portMap string) (string, string, error) {
-	parts := strings.Split(portMap, ":")
-	if len(parts) != 2 {
-		return "", "", &ValidationError{
-			Field:   "portMap",
-			Code:    "invalid_format",
-			Message: "portMap must be in host:container format, e.g. 8080:80",
-		}
-	}
+// ============================================================================
+// ENHANCED CONTAINER CREATION WITH HEALTH CHECK
+// ============================================================================
 
-	hostPort := strings.TrimSpace(parts[0])
-	containerPort := strings.TrimSpace(parts[1])
-	if hostPort == "" || containerPort == "" {
-		return "", "", &ValidationError{
-			Field:   "portMap",
-			Code:    "missing_port",
-			Message: "both host and container ports are required",
-		}
-	}
+func CreateAndStartContainerWithHealthCheck(
+    imageName string,
+    containerName string,
+    deploymentID string,
+    portMap string,
+    envVars []string,
+    memoryMB int64,
+    cpus float64,
+    healthCheck HealthCheckConfig,
+) (string, error) {
+    imageName = strings.TrimSpace(imageName)
+    containerName = strings.TrimSpace(containerName)
+    deploymentID = strings.TrimSpace(deploymentID)
+    portMap = strings.TrimSpace(portMap)
 
-	if _, err := nat.NewPort("tcp", hostPort); err != nil {
-		return "", "", &ValidationError{
-			Field:   "portMap",
-			Code:    "invalid_host_port",
-			Message: fmt.Sprintf("host port %q is invalid", hostPort),
-		}
-	}
-	if _, err := nat.NewPort("tcp", containerPort); err != nil {
-		return "", "", &ValidationError{
-			Field:   "portMap",
-			Code:    "invalid_container_port",
-			Message: fmt.Sprintf("container port %q is invalid", containerPort),
-		}
-	}
+    if imageName == "" {
+        return "", fmt.Errorf("imageName is required")
+    }
+    if containerName == "" {
+        return "", fmt.Errorf("containerName is required")
+    }
+    if deploymentID == "" {
+        return "", fmt.Errorf("deploymentID is required")
+    }
+    if portMap == "" {
+        return "", fmt.Errorf("portMap is required")
+    }
 
-	return hostPort, containerPort, nil
+    hostPort, containerPort, err := parsePortMap(portMap)
+    if err != nil {
+        return "", err
+    }
+    _ = hostPort // routing uses Caddy + container internal IP
+
+    ctx := context.Background()
+    dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+    if err != nil {
+        return "", fmt.Errorf("create docker client: %w", err)
+    }
+    defer dockerClient.Close()
+
+    // Pull image if not present
+    if _, err := dockerClient.ImageInspect(ctx, imageName); err != nil {
+        pullReader, pullErr := dockerClient.ImagePull(ctx, imageName, image.PullOptions{})
+        if pullErr != nil {
+            return "", fmt.Errorf("pull image %q: %w", imageName, pullErr)
+        }
+        defer pullReader.Close()
+
+        if _, err := io.Copy(io.Discard, pullReader); err != nil {
+            return "", fmt.Errorf("read image pull stream: %w", err)
+        }
+    }
+
+    if err := removeContainerByName(ctx, dockerClient, containerName); err != nil {
+        return "", err
+    }
+
+    exposedPort, err := nat.NewPort("tcp", containerPort)
+    if err != nil {
+        return "", fmt.Errorf("invalid container port %q: %w", containerPort, err)
+    }
+
+    containerCfg := &container.Config{
+        Image: imageName,
+        Env:   envVars,
+        Labels: map[string]string{
+            managedByLabelKey:         managedByLabelValue,
+            "gravyflow.deployment-id": deploymentID,
+            "gravyflow.app-name":      containerName,
+            "gravyflow.internal-port": containerPort,
+        },
+        ExposedPorts: nat.PortSet{
+            exposedPort: struct{}{},
+        },
+    }
+
+    // Configure health check if provided
+    if healthCheck.Path != "" {
+        if healthCheck.Interval == 0 {
+            healthCheck.Interval = 30 * time.Second
+        }
+        if healthCheck.Timeout == 0 {
+            healthCheck.Timeout = 5 * time.Second
+        }
+        if healthCheck.Retries == 0 {
+            healthCheck.Retries = 3
+        }
+
+        containerCfg.Healthcheck = &container.HealthConfig{
+            Test:     []string{"CMD", "curl", "-f", fmt.Sprintf("http://localhost:%s%s", containerPort, healthCheck.Path)},
+            Interval: healthCheck.Interval,
+            Timeout:  healthCheck.Timeout,
+            Retries:  healthCheck.Retries,
+        }
+    }
+
+    hostCfg := &container.HostConfig{
+        Resources: container.Resources{
+            Memory:   memoryMB * 1024 * 1024,
+            NanoCPUs: int64(math.Round(cpus * 1_000_000_000)),
+        },
+    }
+
+    resp, err := dockerClient.ContainerCreate(ctx, containerCfg, hostCfg, &network.NetworkingConfig{}, nil, containerName)
+    if err != nil {
+        if errdefs.IsConflict(err) || strings.Contains(strings.ToLower(err.Error()), "is already in use") {
+            return "", &ConflictError{Resource: "containerName", Value: containerName}
+        }
+        return "", fmt.Errorf("create container %q: %w", containerName, err)
+    }
+
+    if err := dockerClient.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+        return "", fmt.Errorf("start container %q: %w", containerName, err)
+    }
+
+    if err := SyncCaddyRoutesFromRunningContainers(); err != nil {
+        log.Printf("warning: caddy sync after start failed for %q: %v (container kept running)", containerName, err)
+    }
+
+    return resp.ID, nil
 }
 
-// allocatePortMap returns host:container with host port 0 so Docker assigns a free port.
-func allocatePortMap(containerPort string) string {
-	containerPort = strings.TrimSpace(containerPort)
-	if containerPort == "" {
-		containerPort = "8080"
-	}
-	return "0:" + containerPort
+// ============================================================================
+// CONTAINER LOGGING
+// ============================================================================
+
+func GetContainerLogs(ctx context.Context, containerID string, opts ContainerLogOptions) (string, error) {
+    dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+    if err != nil {
+        return "", fmt.Errorf("create docker client: %w", err)
+    }
+    defer dockerClient.Close()
+
+    options := container.LogsOptions{
+        ShowStdout: opts.ShowStdout,
+        ShowStderr: opts.ShowStderr,
+        Tail:       fmt.Sprintf("%d", opts.Tail),
+        Timestamps: true,
+    }
+
+    if !opts.Since.IsZero() {
+        options.Since = opts.Since.Format(time.RFC3339)
+    }
+
+    logs, err := dockerClient.ContainerLogs(ctx, containerID, options)
+    if err != nil {
+        return "", fmt.Errorf("get container logs: %w", err)
+    }
+    defer logs.Close()
+
+    var buf bytes.Buffer
+    if _, err := io.Copy(&buf, logs); err != nil {
+        return "", fmt.Errorf("read container logs: %w", err)
+    }
+
+    return buf.String(), nil
 }
 
-// normalizePortMap upgrades legacy 8080:8080 maps that conflict with the API listener.
-func normalizePortMap(portMap string) string {
-	portMap = strings.TrimSpace(portMap)
-	if portMap == "" || portMap == "8080:8080" {
-		return allocatePortMap("8080")
-	}
-	return portMap
+// ============================================================================
+// CONTAINER STATS
+// ============================================================================
+
+func GetContainerStats(ctx context.Context, containerID string) (*ContainerStats, error) {
+    dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+    if err != nil {
+        return nil, fmt.Errorf("create docker client: %w", err)
+    }
+    defer dockerClient.Close()
+
+    stats, err := dockerClient.ContainerStats(ctx, containerID, false)
+    if err != nil {
+        return nil, fmt.Errorf("get container stats: %w", err)
+    }
+    defer stats.Body.Close()
+
+    var v types.StatsJSON
+    if err := json.NewDecoder(stats.Body).Decode(&v); err != nil {
+        return nil, fmt.Errorf("decode stats: %w", err)
+    }
+
+    // Calculate CPU usage
+    cpuDelta := v.CPUStats.CPUUsage.TotalUsage - v.PreCPUStats.CPUUsage.TotalUsage
+    systemDelta := v.CPUStats.SystemUsage - v.PreCPUStats.SystemUsage
+    cpuPercent := 0.0
+    if systemDelta > 0 && cpuDelta > 0 {
+        cpuPercent = float64(cpuDelta) / float64(systemDelta) * 100.0
+    }
+
+    // Memory usage
+    memoryUsage := float64(v.MemoryStats.Usage)
+    memoryLimit := float64(v.MemoryStats.Limit)
+
+    return &ContainerStats{
+        ContainerID: containerID,
+        CPUUsage:    cpuPercent,
+        MemoryUsage: memoryUsage,
+        MemoryLimit: memoryLimit,
+        NetworkIn:   v.Networks.EthRxBytes,
+        NetworkOut:  v.Networks.EthTxBytes,
+        BlockRead:   v.BlkioStats.IoServiceBytesRecursive[0].Value,
+        BlockWrite:  v.BlkioStats.IoServiceBytesRecursive[1].Value,
+        PIDs:        v.PidsStats.Current,
+        Timestamp:   time.Now(),
+    }, nil
 }
 
-func asValidationError(err error) *ValidationError {
-	if err == nil {
-		return nil
-	}
+// ============================================================================
+// NETWORK MANAGEMENT
+// ============================================================================
 
-	var validationErr *ValidationError
-	if errors.As(err, &validationErr) {
-		return validationErr
-	}
+func EnsureNetwork(ctx context.Context, config NetworkConfig) (string, error) {
+    dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+    if err != nil {
+        return "", fmt.Errorf("create docker client: %w", err)
+    }
+    defer dockerClient.Close()
 
-	return nil
+    networks, err := dockerClient.NetworkList(ctx, types.NetworkListOptions{
+        Filters: filters.NewArgs(filters.Arg("name", config.Name)),
+    })
+    if err != nil {
+        return "", fmt.Errorf("list networks: %w", err)
+    }
+
+    if len(networks) > 0 {
+        return networks[0].ID, nil
+    }
+
+    createOpts := types.NetworkCreate{
+        Driver: config.Driver,
+        Options: map[string]string{},
+        Labels: config.Labels,
+    }
+
+    if config.Subnet != "" {
+        createOpts.IPAM = &network.IPAM{
+            Config: []network.IPAMConfig{
+                {
+                    Subnet:  config.Subnet,
+                    Gateway: config.Gateway,
+                    IPRange: config.IPRange,
+                },
+            },
+        }
+    }
+
+    resp, err := dockerClient.NetworkCreate(ctx, config.Name, createOpts)
+    if err != nil {
+        return "", fmt.Errorf("create network: %w", err)
+    }
+
+    return resp.ID, nil
 }
 
-func formatPortMap(ports []types.Port) string {
-	if len(ports) == 0 {
-		return ""
-	}
+// ============================================================================
+// CONTAINER CLEANUP
+// ============================================================================
 
-	mappings := make([]string, 0, len(ports))
-	for _, p := range ports {
-		protocol := p.Type
-		if protocol == "" {
-			protocol = "tcp"
-		}
+func CleanupOldContainers(ctx context.Context, policy CleanupPolicy) error {
+    dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+    if err != nil {
+        return fmt.Errorf("create docker client: %w", err)
+    }
+    defer dockerClient.Close()
 
-		if p.PublicPort > 0 {
-			mappings = append(mappings, fmt.Sprintf("%d:%d/%s", p.PublicPort, p.PrivatePort, protocol))
-			continue
-		}
+    args := filters.NewArgs(
+        filters.Arg("label", managedByLabelKey+"="+managedByLabelValue),
+        filters.Arg("status", "exited"),
+    )
+    containers, err := dockerClient.ContainerList(ctx, container.ListOptions{
+        Filters: args,
+        All:     true,
+    })
+    if err != nil {
+        return fmt.Errorf("list containers: %w", err)
+    }
 
-		mappings = append(mappings, fmt.Sprintf("%d/%s", p.PrivatePort, protocol))
-	}
+    sort.Slice(containers, func(i, j int) bool {
+        return containers[i].Created < containers[j].Created
+    })
 
-	return strings.Join(mappings, ",")
+    var toRemove []types.Container
+    now := time.Now()
+
+    for _, c := range containers {
+        created := time.Unix(c.Created, 0)
+        shouldRemove := false
+
+        if policy.MaxAge > 0 && now.Sub(created) > policy.MaxAge {
+            shouldRemove = true
+        }
+
+        if policy.MaxCount > 0 && len(toRemove) >= policy.MaxCount {
+            continue
+        }
+
+        if shouldRemove {
+            toRemove = append(toRemove, c)
+        }
+    }
+
+    for _, c := range toRemove {
+        if err := dockerClient.ContainerRemove(ctx, c.ID, container.RemoveOptions{
+            Force:         policy.StopBefore,
+            RemoveVolumes: policy.RemoveVolumes,
+        }); err != nil {
+            log.Printf("Failed to remove container %s: %v", c.ID[:12], err)
+        } else {
+            log.Printf("Cleaned up container %s", c.ID[:12])
+        }
+    }
+
+    return nil
 }
 
-func resolveManagedContainerEndpoint(ctx context.Context, dockerClient *client.Client, containerID string) (string, string, error) {
-	inspect, err := dockerClient.ContainerInspect(ctx, containerID)
-	if err != nil {
-		return "", "", fmt.Errorf("inspect container %q: %w", containerID, err)
-	}
+// ============================================================================
+// IMAGE MANAGEMENT
+// ============================================================================
 
-	internalIP := ""
-	for _, network := range inspect.NetworkSettings.Networks {
-		if network.IPAddress != "" {
-			internalIP = network.IPAddress
-			break
-		}
-	}
-	if internalIP == "" {
-		return "", "", fmt.Errorf("container %q has no assigned internal IP", containerID)
-	}
-
-	internalPort := strings.TrimSpace(inspect.Config.Labels["gravyflow.internal-port"])
-	if internalPort == "" {
-		exposed := make([]string, 0, len(inspect.Config.ExposedPorts))
-		for port := range inspect.Config.ExposedPorts {
-			exposed = append(exposed, port.Port())
-		}
-		sort.Strings(exposed)
-		for _, preferred := range []string{"8080", "3000", "5000", "80"} {
-			for _, candidate := range exposed {
-				if candidate == preferred {
-					internalPort = candidate
-					break
-				}
-			}
-			if internalPort != "" {
-				break
-			}
-		}
-		if internalPort == "" && len(exposed) > 0 {
-			internalPort = exposed[len(exposed)-1]
-		}
-	}
-	if internalPort == "" {
-		for _, binding := range inspect.NetworkSettings.Ports {
-			if len(binding) == 0 {
-				continue
-			}
-			internalPort = binding[0].HostPort
-			break
-		}
-	}
-	if internalPort == "" {
-		return "", "", fmt.Errorf("container %q has no exposed internal port", containerID)
-	}
-
-	return internalIP, internalPort, nil
+func NewImageManager() (*ImageManager, error) {
+    dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+    if err != nil {
+        return nil, err
+    }
+    return &ImageManager{client: dockerClient}, nil
 }
 
-func removeContainerByName(ctx context.Context, dockerClient *client.Client, containerName string) error {
-	containerName = strings.TrimSpace(containerName)
-	if containerName == "" {
-		return nil
-	}
+func (im *ImageManager) PruneImages(ctx context.Context, keepLatest int) error {
+    images, err := im.client.ImageList(ctx, image.ListOptions{
+        Filters: filters.NewArgs(
+            filters.Arg("label", managedByLabelKey+"="+managedByLabelValue),
+        ),
+    })
+    if err != nil {
+        return err
+    }
 
-	existing, err := dockerClient.ContainerInspect(ctx, containerName)
-	if err != nil {
-		if errdefs.IsNotFound(err) || client.IsErrNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("inspect container %q: %w", containerName, err)
-	}
+    imageMap := make(map[string][]image.Summary)
+    for _, img := range images {
+        for _, repoTag := range img.RepoTags {
+            parts := strings.Split(repoTag, ":")
+            if len(parts) > 1 {
+                imageMap[parts[0]] = append(imageMap[parts[0]], img)
+            }
+        }
+    }
 
-	if err := dockerClient.ContainerStop(ctx, existing.ID, container.StopOptions{}); err != nil && !errdefs.IsNotFound(err) {
-		return fmt.Errorf("stop container %q: %w", containerName, err)
-	}
-	if err := dockerClient.ContainerRemove(ctx, existing.ID, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
-		return fmt.Errorf("remove container %q: %w", containerName, err)
-	}
+    for repo, imgs := range imageMap {
+        if len(imgs) <= keepLatest {
+            continue
+        }
 
-	return SyncCaddyRoutesFromRunningContainers()
+        sort.Slice(imgs, func(i, j int) bool {
+            return imgs[i].Created < imgs[j].Created
+        })
+
+        for i := 0; i < len(imgs)-keepLatest; i++ {
+            if _, err := im.client.ImageRemove(ctx, imgs[i].ID, image.RemoveOptions{
+                Force: true,
+            }); err != nil {
+                log.Printf("Failed to remove image %s: %v", imgs[i].ID[:12], err)
+            }
+        }
+    }
+
+    return nil
 }
+
+// ============================================================================
+// EVENT MONITORING
+// ============================================================================
+
+func MonitorContainerEvents(ctx context.Context, handler EventHandler) error {
+    dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+    if err != nil {
+        return fmt.Errorf("create docker client: %w", err)
+    }
+    defer dockerClient.Close()
+
+    events, errs := dockerClient.Events(ctx, types.EventsOptions{
+        Filters: filters.NewArgs(
+            filters.Arg("type", "container"),
+            filters.Arg("label", managedByLabelKey+"="+managedByLabelValue),
+        ),
+    })
+
+    for {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        case err := <-errs:
+            return fmt.Errorf("events error: %w", err)
+        case event := <-events:
+            containerEvent := ContainerEvent{
+                Type:       event.Type,
+                Action:     event.Action,
+                ActorID:    event.Actor.ID,
+                Attributes: event.Actor.Attributes,
+                Timestamp:  time.Unix(event.Time, 0),
+            }
+
+            if err := handler(containerEvent); err != nil {
+                log.Printf("Event handler error: %v", err)
+            }
+        }
+    }
+}
+
+// ============================================================================
+// VOLUME MANAGEMENT
+// ============================================================================
+
+func CreateVolume(ctx context.Context, config VolumeConfig) (string, error) {
+    dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+    if err != nil {
+        return "", fmt.Errorf("create docker client: %w", err)
+    }
+    defer dockerClient.Close()
+
+    volume, err := dockerClient.VolumeCreate(ctx, volume.CreateOptions{
+        Name:       config.Name,
+        Driver:     config.Driver,
+        Labels:     config.Labels,
+        DriverOpts: config.Options,
+    })
+    if err != nil {
+        return "", fmt.Errorf("create volume: %w", err)
+    }
+
+    return volume.Name, nil
+}
+
+func ListContainerVolumes(ctx context.Context, containerID string) ([]types.MountPoint, error) {
+    dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+    if err != nil {
+        return nil, fmt.Errorf("create docker client: %w", err)
+    }
+    defer dockerClient.Close()
+
+    inspect, err := dockerClient.ContainerInspect(ctx, containerID)
+    if err != nil {
+        return nil, fmt.Errorf("inspect container: %w", err)
+    }
+
+    return inspect.Mounts, nil
+}
+
+// ============================================================================
+// BACKUP SUPPORT
+// ============================================================================
+
+func BackupContainerVolume(ctx context.Context, containerID string, config BackupConfig) error {
+    dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+    if err != nil {
+        return fmt.Errorf("create docker client: %w", err)
+    }
+    defer dockerClient.Close()
+
+    backupCmd := []string{"tar", "-czf", config.Destination}
+    if config.Compress {
+        backupCmd = []string{"tar", "-czf", config.Destination}
+    } else {
+        backupCmd = []string{"tar", "-cf", config.Destination}
+    }
+
+    for _, exclude := range config.Exclude {
+        backupCmd = append(backupCmd, "--exclude", exclude)
+    }
+
+    backupCmd = append(backupCmd, "-C", config.Source, ".")
+
+    execConfig := container.ExecOptions{
+        Cmd:          backupCmd,
+        AttachStdout: true,
+        AttachStderr: true,
+        WorkingDir:   "/",
+    }
+
+    execID, err := dockerClient.ContainerExecCreate(ctx, containerID, execConfig)
+    if err != nil {
+        return fmt.Errorf("create backup exec: %w", err)
+    }
+
+    attach, err := dockerClient.ContainerExecAttach(ctx, execID.ID, container.ExecStartOptions{})
+    if err != nil {
+        return fmt.Errorf("attach backup exec: %w", err)
+    }
+    defer attach.Close()
+
+    inspect, err := dockerClient.ContainerExecInspect(ctx, execID.ID)
+    if err != nil {
+        return fmt.Errorf("inspect backup exec: %w", err)
+    }
+
+    for inspect.Running {
+        time.Sleep(1 * time.Second)
+        inspect, err = dockerClient.ContainerExecInspect(ctx, execID.ID)
+        if err != nil {
+            return fmt.Errorf("inspect backup exec: %w", err)
+        }
+    }
+
+    if inspect.ExitCode != 0 {
+        return fmt.Errorf("backup failed with exit code %d", inspect.ExitCode)
+    }
+
+    return nil
+}
+
+// ============================================================================
+// USAGE EXAMPLES
+// ============================================================================
+
+/*
+EXAMPLE USAGE:
+
+1. Create container with health check:
+   healthCheck := HealthCheckConfig{
+       Path:     "/health",
+       Interval: 30 * time.Second,
+       Timeout:  5 * time.Second,
+       Retries:  3,
+   }
+   id, err := CreateAndStartContainerWithHealthCheck(
+       "my-app:latest",
+       "my-app-1",
+       "deploy-123",
+       "8080:80",
+       []string{"NODE_ENV=production"},
+       1024, 0.5,
+       healthCheck,
+   )
+
+2. Get container logs:
+   logs, err := GetContainerLogs(ctx, containerID, ContainerLogOptions{
+       ShowStdout: true,
+       ShowStderr: true,
+       Tail: 100,
+   })
+
+3. Get container stats:
+   stats, err := GetContainerStats(ctx, containerID)
+   fmt.Printf("CPU: %.2f%%, Memory: %.2f MB\n", stats.CPUUsage, stats.MemoryUsage/1024/1024)
+
+4. Cleanup old containers:
+   err := CleanupOldContainers(ctx, CleanupPolicy{
+       MaxAge: 24 * time.Hour,
+       MaxCount: 5,
+       RemoveVolumes: true,
+   })
+
+5. Monitor container events:
+   handler := func(event ContainerEvent) error {
+       fmt.Printf("Event: %s %s %s\n", event.Type, event.Action, event.ActorID)
+       return nil
+   }
+   err := MonitorContainerEvents(ctx, handler)
+
+6. Prune old images:
+   imgManager, _ := NewImageManager()
+   err := imgManager.PruneImages(ctx, 3) // Keep latest 3 images
+
+7. Create and manage volumes:
+   volumeName, err := CreateVolume(ctx, VolumeConfig{
+       Name: "app-data",
+       Driver: "local",
+       Labels: map[string]string{"app": "my-app"},
+   })
+*/

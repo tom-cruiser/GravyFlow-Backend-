@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -17,41 +18,163 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
 const (
 	deploymentJobTaskType   = "deployment:execute"
 	deploymentJobQueueName  = "deployments"
 	deploymentJobStatusKey  = "deployment:job:%s"
 	deploymentJobChannelKey = "deployment:job:%s:events"
+	
+	defaultDeployCPU      = 1.0
+	defaultDeployMemoryMB = 1024
+	defaultDeployApps     = 1
+)
+
+// ============================================================================
+// TYPES
+// ============================================================================
+
+type JobPriority int
+
+const (
+	PriorityLow    JobPriority = 10
+	PriorityNormal JobPriority = 50
+	PriorityHigh   JobPriority = 100
+	PriorityUrgent JobPriority = 200
+)
+
+type JobStatus string
+
+const (
+	JobStatusQueued     JobStatus = "queued"
+	JobStatusActive     JobStatus = "active"
+	JobStatusCompleted  JobStatus = "completed"
+	JobStatusFailed     JobStatus = "failed"
+	JobStatusCancelled  JobStatus = "cancelled"
+	JobStatusPaused     JobStatus = "paused"
+	JobStatusScheduled  JobStatus = "scheduled"
 )
 
 type DeploymentJobPayload struct {
-	DeploymentID string `json:"deploymentId"`
-	UserID       string `json:"userId"`
-	RebuildImage bool   `json:"rebuildImage"`
+	DeploymentID   string            `json:"deploymentId"`
+	UserID         string            `json:"userId"`
+	RebuildImage   bool              `json:"rebuildImage"`
+	Priority       JobPriority       `json:"priority,omitempty"`
+	Timeout        time.Duration     `json:"timeout,omitempty"`
+	EnvOverrides   map[string]string `json:"envOverrides,omitempty"`
+	Labels         map[string]string `json:"labels,omitempty"`
 }
 
 type DeploymentJobStatus struct {
+	JobID        string      `json:"jobId"`
+	DeploymentID string      `json:"deploymentId"`
+	UserID       string      `json:"userId"`
+	Status       JobStatus   `json:"status"`
+	Stage        string      `json:"stage"`
+	Message      string      `json:"message"`
+	Progress     int         `json:"progress"`
+	Error        string      `json:"error,omitempty"`
+	CreatedAt    time.Time   `json:"createdAt"`
+	UpdatedAt    time.Time   `json:"updatedAt"`
+	StartedAt    *time.Time  `json:"startedAt,omitempty"`
+	CompletedAt  *time.Time  `json:"completedAt,omitempty"`
+	Priority     JobPriority `json:"priority,omitempty"`
+	Duration     string      `json:"duration,omitempty"`
+}
+
+type JobConfig struct {
+	Timeout          time.Duration
+	MaxRetries       int
+	RetryDelay       time.Duration
+	GracefulShutdown time.Duration
+	Priority         JobPriority
+}
+
+type JobHistory struct {
+	ID           string    `json:"id"`
 	JobID        string    `json:"jobId"`
 	DeploymentID string    `json:"deploymentId"`
 	UserID       string    `json:"userId"`
-	Status       string    `json:"status"`
+	Event        string    `json:"event"`
 	Stage        string    `json:"stage"`
 	Message      string    `json:"message"`
-	Progress     int       `json:"progress"`
-	Error        string    `json:"error,omitempty"`
 	CreatedAt    time.Time `json:"createdAt"`
-	UpdatedAt    time.Time `json:"updatedAt"`
 }
+
+type JobMetrics struct {
+	TotalJobs       int64         `json:"totalJobs"`
+	QueuedJobs      int64         `json:"queuedJobs"`
+	ActiveJobs      int64         `json:"activeJobs"`
+	CompletedJobs   int64         `json:"completedJobs"`
+	FailedJobs      int64         `json:"failedJobs"`
+	CancelledJobs   int64         `json:"cancelledJobs"`
+	AverageDuration time.Duration `json:"averageDuration"`
+	SuccessRate     float64       `json:"successRate"`
+}
+
+type SystemHealth struct {
+	Redis       bool   `json:"redis"`
+	Asynq       bool   `json:"asynq"`
+	Database    bool   `json:"database"`
+	Docker      bool   `json:"docker"`
+	Workers     int    `json:"workers"`
+	QueueLength int    `json:"queueLength"`
+	Status      string `json:"status"`
+}
+
+type BatchJob struct {
+	ID          string   `json:"id"`
+	Deployments []string `json:"deployments"`
+	Status      string   `json:"status"`
+	Progress    int      `json:"progress"`
+	Total       int      `json:"total"`
+	Completed   int      `json:"completed"`
+	Failed      int      `json:"failed"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+}
+
+type NotificationType string
+
+const (
+	NotificationEmail   NotificationType = "email"
+	NotificationSlack   NotificationType = "slack"
+	NotificationWebhook NotificationType = "webhook"
+)
+
+type JobNotification struct {
+	Type     NotificationType        `json:"type"`
+	Target   string                  `json:"target"`
+	Template string                  `json:"template"`
+	Data     map[string]interface{}  `json:"data"`
+}
+
+// ============================================================================
+// DEPLOYMENT JOB MANAGER
+// ============================================================================
 
 type DeploymentJobManager struct {
 	redisClient *redis.Client
-	asynqClient  *asynq.Client
-	asynqServer  *asynq.Server
+	asynqClient *asynq.Client
+	asynqServer *asynq.Server
+	config      JobConfig
+	metrics     JobMetrics
+	mu          sync.RWMutex
 }
 
 var deploymentJobs *DeploymentJobManager
+var logsWebsocketUpgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
 
-func newDeploymentJobManager() (*DeploymentJobManager, error) {
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+func NewDeploymentJobManager(config JobConfig) (*DeploymentJobManager, error) {
 	redisOpt, err := buildAsynqRedisClientOpt()
 	if err != nil {
 		return nil, err
@@ -65,17 +188,20 @@ func newDeploymentJobManager() (*DeploymentJobManager, error) {
 	})
 
 	asynqClient := asynq.NewClient(redisOpt)
-	// Default to a single worker: Nixpacks builds are CPU/IO heavy and will
-	// thrash a small single-core VPS if several run at once. Still overridable
-	// via ASYNQ_CONCURRENCY for larger hosts.
+	
 	concurrency := intFromEnvOrDefault("ASYNQ_CONCURRENCY", 1)
 	asynqServer := asynq.NewServer(redisOpt, asynq.Config{
 		Concurrency: concurrency,
 		Queues: map[string]int{
 			deploymentJobQueueName: 1,
 		},
+		// Add retry and timeout config
+		RetryDelayFunc: func(n int, err error, task *asynq.Task) time.Duration {
+			return time.Duration(n) * 5 * time.Second
+		},
 	})
 
+	// Verify Redis connection
 	pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := redisClient.Ping(pingCtx).Err(); err != nil {
@@ -86,8 +212,9 @@ func newDeploymentJobManager() (*DeploymentJobManager, error) {
 
 	return &DeploymentJobManager{
 		redisClient: redisClient,
-		asynqClient:  asynqClient,
-		asynqServer:  asynqServer,
+		asynqClient: asynqClient,
+		asynqServer: asynqServer,
+		config:      config,
 	}, nil
 }
 
@@ -109,7 +236,26 @@ func (m *DeploymentJobManager) ServeMux() *asynq.ServeMux {
 	return mux
 }
 
-func (m *DeploymentJobManager) EnqueueDeployment(ctx context.Context, userID string, deploymentID string, rebuildImage bool) (string, error) {
+// ============================================================================
+// JOB ENQUEUEING
+// ============================================================================
+
+func (m *DeploymentJobManager) EnqueueDeployment(
+	ctx context.Context,
+	userID string,
+	deploymentID string,
+	rebuildImage bool,
+) (string, error) {
+	return m.EnqueueDeploymentWithConfig(ctx, userID, deploymentID, rebuildImage, m.config)
+}
+
+func (m *DeploymentJobManager) EnqueueDeploymentWithConfig(
+	ctx context.Context,
+	userID string,
+	deploymentID string,
+	rebuildImage bool,
+	config JobConfig,
+) (string, error) {
 	if m == nil || m.asynqClient == nil || m.redisClient == nil {
 		return "", fmt.Errorf("deployment job manager is not initialized")
 	}
@@ -129,10 +275,11 @@ func (m *DeploymentJobManager) EnqueueDeployment(ctx context.Context, userID str
 		JobID:        jobID,
 		DeploymentID: deploymentID,
 		UserID:       userID,
-		Status:       "queued",
+		Status:       JobStatusQueued,
 		Stage:        "queued",
 		Message:      "deployment queued",
 		Progress:     0,
+		Priority:     config.Priority,
 		CreatedAt:    time.Now().UTC(),
 		UpdatedAt:    time.Now().UTC(),
 	}
@@ -140,21 +287,60 @@ func (m *DeploymentJobManager) EnqueueDeployment(ctx context.Context, userID str
 		return "", err
 	}
 
-	payloadBytes, err := json.Marshal(DeploymentJobPayload{UserID: userID, DeploymentID: deploymentID, RebuildImage: rebuildImage})
+	// Save initial history entry
+	if err := m.SaveJobHistory(ctx, JobHistory{
+		JobID:        jobID,
+		DeploymentID: deploymentID,
+		UserID:       userID,
+		Event:        "queued",
+		Stage:        "queued",
+		Message:      "Job queued",
+		CreatedAt:    time.Now().UTC(),
+	}); err != nil {
+		log.Printf("Failed to save job history: %v", err)
+	}
+
+	payload := DeploymentJobPayload{
+		UserID:       userID,
+		DeploymentID: deploymentID,
+		RebuildImage: rebuildImage,
+		Priority:     config.Priority,
+		Timeout:      config.Timeout,
+	}
+
+	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		_ = m.redisClient.Del(ctx, m.statusKey(jobID)).Err()
 		return "", fmt.Errorf("marshal deployment job payload: %w", err)
 	}
 
 	task := asynq.NewTask(deploymentJobTaskType, payloadBytes)
-	info, err := m.asynqClient.EnqueueContext(ctx, task, asynq.Queue(deploymentJobQueueName), asynq.TaskID(jobID), asynq.MaxRetry(0))
+	
+	opts := []asynq.Option{
+		asynq.Queue(deploymentJobQueueName),
+		asynq.TaskID(jobID),
+		asynq.MaxRetry(config.MaxRetries),
+	}
+	
+	if config.Timeout > 0 {
+		opts = append(opts, asynq.ProcessAt(time.Now().Add(config.Timeout)))
+	}
+	
+	info, err := m.asynqClient.EnqueueContext(ctx, task, opts...)
 	if err != nil {
 		_ = m.redisClient.Del(ctx, m.statusKey(jobID)).Err()
 		return "", fmt.Errorf("enqueue deployment job: %w", err)
 	}
 
+	// Increment metrics
+	_ = m.IncrementMetrics(ctx, "total")
+
 	return info.ID, nil
 }
+
+// ============================================================================
+// JOB MANAGEMENT
+// ============================================================================
 
 func (m *DeploymentJobManager) GetStatus(ctx context.Context, jobID string) (DeploymentJobStatus, bool, error) {
 	if m == nil || m.redisClient == nil {
@@ -182,6 +368,70 @@ func (m *DeploymentJobManager) GetStatus(ctx context.Context, jobID string) (Dep
 	return status, true, nil
 }
 
+func (m *DeploymentJobManager) CancelJob(ctx context.Context, jobID string, userID string) error {
+	if m == nil || m.redisClient == nil {
+		return fmt.Errorf("deployment job manager is not initialized")
+	}
+
+	jobID = strings.TrimSpace(jobID)
+	userID = strings.TrimSpace(userID)
+	if jobID == "" || userID == "" {
+		return fmt.Errorf("jobID and userID are required")
+	}
+
+	status, found, err := m.GetStatus(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("job not found")
+	}
+	if status.UserID != userID {
+		return fmt.Errorf("unauthorized")
+	}
+
+	if status.Status == JobStatusCompleted || status.Status == JobStatusFailed {
+		return fmt.Errorf("job already finished")
+	}
+
+	status.Status = JobStatusCancelled
+	status.Stage = "cancelled"
+	status.Message = "Job cancelled by user"
+	status.Progress = 100
+	
+	now := time.Now().UTC()
+	status.CompletedAt = &now
+
+	if err := m.saveStatus(ctx, status); err != nil {
+		return err
+	}
+
+	// Remove from queue
+	inspector := asynq.NewInspector(*m.asynqClient)
+	if err := inspector.DeleteTask(deploymentJobQueueName, jobID); err != nil {
+		log.Printf("Failed to delete task from queue: %v", err)
+	}
+
+	// Save history
+	if err := m.SaveJobHistory(ctx, JobHistory{
+		JobID:        jobID,
+		DeploymentID: status.DeploymentID,
+		UserID:       userID,
+		Event:        "cancelled",
+		Stage:        "cancelled",
+		Message:      "Job cancelled by user",
+		CreatedAt:    time.Now().UTC(),
+	}); err != nil {
+		log.Printf("Failed to save job history: %v", err)
+	}
+
+	return nil
+}
+
+// ============================================================================
+// STATUS MANAGEMENT
+// ============================================================================
+
 func (m *DeploymentJobManager) statusKey(jobID string) string {
 	return fmt.Sprintf(deploymentJobStatusKey, strings.TrimSpace(jobID))
 }
@@ -196,25 +446,170 @@ func (m *DeploymentJobManager) saveStatus(ctx context.Context, status Deployment
 		status.CreatedAt = status.UpdatedAt
 	}
 
+	// Calculate duration if completed
+	if status.CompletedAt != nil {
+		status.Duration = status.CompletedAt.Sub(status.CreatedAt).String()
+	}
+
 	data, err := json.Marshal(status)
 	if err != nil {
 		return fmt.Errorf("marshal job status: %w", err)
 	}
 
-	if err := m.redisClient.Set(ctx, m.statusKey(status.JobID), data, 0).Err(); err != nil {
-		return fmt.Errorf("persist job status: %w", err)
-	}
-	if err := m.redisClient.Publish(ctx, m.channelKey(status.JobID), data).Err(); err != nil {
-		return fmt.Errorf("publish job status: %w", err)
+	pipe := m.redisClient.Pipeline()
+	pipe.Set(ctx, m.statusKey(status.JobID), data, 0)
+	pipe.Publish(ctx, m.channelKey(status.JobID), data)
+	
+	_, err = pipe.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("save and publish job status: %w", err)
 	}
 
 	return nil
 }
 
-func (m *DeploymentJobManager) updateStatus(ctx context.Context, current DeploymentJobStatus, mutate func(*DeploymentJobStatus)) error {
-	mutate(&current)
-	return m.saveStatus(ctx, current)
+// ============================================================================
+// JOB HISTORY
+// ============================================================================
+
+func (m *DeploymentJobManager) SaveJobHistory(ctx context.Context, history JobHistory) error {
+	key := fmt.Sprintf("deployment:job:%s:history", history.JobID)
+	
+	data, err := json.Marshal(history)
+	if err != nil {
+		return err
+	}
+	
+	pipe := m.redisClient.Pipeline()
+	pipe.LPush(ctx, key, data)
+	pipe.LTrim(ctx, key, 0, 99)
+	pipe.Expire(ctx, key, 24*time.Hour)
+	
+	_, err = pipe.Exec(ctx)
+	return err
 }
+
+func (m *DeploymentJobManager) GetJobHistory(ctx context.Context, jobID string, limit int) ([]JobHistory, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	
+	key := fmt.Sprintf("deployment:job:%s:history", jobID)
+	results, err := m.redisClient.LRange(ctx, key, 0, int64(limit-1)).Result()
+	if err != nil {
+		return nil, err
+	}
+	
+	history := make([]JobHistory, 0, len(results))
+	for _, result := range results {
+		var entry JobHistory
+		if err := json.Unmarshal([]byte(result), &entry); err != nil {
+			continue
+		}
+		history = append(history, entry)
+	}
+	
+	return history, nil
+}
+
+// ============================================================================
+// METRICS
+// ============================================================================
+
+func (m *DeploymentJobManager) IncrementMetrics(ctx context.Context, key string) error {
+	return m.redisClient.Incr(ctx, "deployment:stats:"+key).Err()
+}
+
+func (m *DeploymentJobManager) GetMetrics(ctx context.Context) (JobMetrics, error) {
+	inspector := asynq.NewInspector(*m.asynqClient)
+	
+	queueInfo, err := inspector.GetQueueInfo(deploymentJobQueueName)
+	if err != nil {
+		return JobMetrics{}, err
+	}
+	
+	var metrics JobMetrics
+	metrics.QueuedJobs = queueInfo.Pending
+	metrics.ActiveJobs = queueInfo.Active
+	
+	if val, err := m.redisClient.Get(ctx, "deployment:stats:total").Int64(); err == nil {
+		metrics.TotalJobs = val
+	}
+	if val, err := m.redisClient.Get(ctx, "deployment:stats:completed").Int64(); err == nil {
+		metrics.CompletedJobs = val
+	}
+	if val, err := m.redisClient.Get(ctx, "deployment:stats:failed").Int64(); err == nil {
+		metrics.FailedJobs = val
+	}
+	if val, err := m.redisClient.Get(ctx, "deployment:stats:cancelled").Int64(); err == nil {
+		metrics.CancelledJobs = val
+	}
+	
+	if metrics.TotalJobs > 0 {
+		metrics.SuccessRate = float64(metrics.CompletedJobs) / float64(metrics.TotalJobs) * 100
+	}
+	
+	return metrics, nil
+}
+
+// ============================================================================
+// HEALTH CHECK
+// ============================================================================
+
+func (m *DeploymentJobManager) HealthCheck(ctx context.Context) (SystemHealth, error) {
+	health := SystemHealth{}
+	
+	// Check Redis
+	if err := m.redisClient.Ping(ctx).Err(); err != nil {
+		health.Status = "unhealthy"
+		return health, fmt.Errorf("redis unhealthy: %w", err)
+	}
+	health.Redis = true
+	
+	// Check Asynq
+	inspector := asynq.NewInspector(*m.asynqClient)
+	info, err := inspector.GetQueueInfo(deploymentJobQueueName)
+	if err != nil {
+		health.Status = "unhealthy"
+		return health, fmt.Errorf("asynq unhealthy: %w", err)
+	}
+	health.Asynq = true
+	health.QueueLength = info.Pending + info.Active
+	health.Workers = intFromEnvOrDefault("ASYNQ_CONCURRENCY", 1)
+	
+	// Check Database
+	if deploymentStore != nil {
+		if err := deploymentStore.HealthCheck(ctx); err != nil {
+			health.Status = "unhealthy"
+			return health, fmt.Errorf("database unhealthy: %w", err)
+		}
+		health.Database = true
+	}
+	
+	// Check Docker - basic check
+	if err := checkDockerHealth(ctx); err != nil {
+		health.Status = "degraded"
+		health.Docker = false
+	} else {
+		health.Docker = true
+	}
+	
+	if health.Status == "" {
+		health.Status = "healthy"
+	}
+	
+	return health, nil
+}
+
+func checkDockerHealth(ctx context.Context) error {
+	// Basic Docker health check
+	// Could check if docker daemon is running
+	return nil
+}
+
+// ============================================================================
+// WORKER HANDLER
+// ============================================================================
 
 func (m *DeploymentJobManager) handleDeploymentJobTask(ctx context.Context, task *asynq.Task) error {
 	if task == nil {
@@ -236,7 +631,7 @@ func (m *DeploymentJobManager) handleDeploymentJobTask(ctx context.Context, task
 			JobID:        jobID,
 			DeploymentID: payload.DeploymentID,
 			UserID:       payload.UserID,
-			Status:       "queued",
+			Status:       JobStatusQueued,
 			Stage:        "queued",
 			Message:      "deployment queued",
 			Progress:     0,
@@ -244,38 +639,56 @@ func (m *DeploymentJobManager) handleDeploymentJobTask(ctx context.Context, task
 		}
 	}
 
+	// Update to active
+	now := time.Now().UTC()
 	if err := m.updateStatus(ctx, status, func(s *DeploymentJobStatus) {
-		s.Status = "active"
+		s.Status = JobStatusActive
 		s.Stage = "starting"
 		s.Message = "deployment started"
 		s.Progress = 5
+		s.StartedAt = &now
 	}); err != nil {
 		return asynq.SkipRetry
 	}
 
+	// Save history
+	_ = m.SaveJobHistory(ctx, JobHistory{
+		JobID:        jobID,
+		DeploymentID: payload.DeploymentID,
+		UserID:       payload.UserID,
+		Event:        "started",
+		Stage:        "starting",
+		Message:      "Deployment started",
+		CreatedAt:    now,
+	})
+
+	// Run deployment workflow
 	deployedStatus, runErr := runDeploymentWorkflow(ctx, payload, func(stage string, progress int, message string) {
 		_ = m.updateStatus(ctx, status, func(s *DeploymentJobStatus) {
-			s.Status = "active"
+			s.Status = JobStatusActive
 			s.Stage = stage
 			s.Message = message
 			s.Progress = progress
 		})
 	})
+	
 	if runErr != nil {
+		// Handle failure
 		if deploymentStore != nil {
 			if markErr := deploymentStore.MarkDeploymentFailed(ctx, payload.DeploymentID, runErr); markErr != nil {
 				_ = m.updateStatus(ctx, status, func(s *DeploymentJobStatus) {
 					s.Message = fmt.Sprintf("deployment failed: %v; failed to update database: %v", runErr, markErr)
 					s.Error = runErr.Error()
-					s.Status = "failed"
+					s.Status = JobStatusFailed
 					s.Stage = "failed"
 					s.Progress = 100
 				})
+				_ = m.IncrementMetrics(ctx, "failed")
 				return asynq.SkipRetry
 			}
 		}
 
-		status.Status = "failed"
+		status.Status = JobStatusFailed
 		status.Stage = "failed"
 		status.Message = runErr.Error()
 		status.Error = runErr.Error()
@@ -283,21 +696,63 @@ func (m *DeploymentJobManager) handleDeploymentJobTask(ctx context.Context, task
 		status.JobID = jobID
 		status.DeploymentID = payload.DeploymentID
 		status.UserID = payload.UserID
+		completeTime := time.Now().UTC()
+		status.CompletedAt = &completeTime
+		
 		if err := m.saveStatus(ctx, status); err != nil {
 			return asynq.SkipRetry
 		}
+		
+		_ = m.IncrementMetrics(ctx, "failed")
+		
+		_ = m.SaveJobHistory(ctx, JobHistory{
+			JobID:        jobID,
+			DeploymentID: payload.DeploymentID,
+			UserID:       payload.UserID,
+			Event:        "failed",
+			Stage:        "failed",
+			Message:      runErr.Error(),
+			CreatedAt:    completeTime,
+		})
+		
 		return asynq.SkipRetry
 	}
 
+	// Mark as completed
+	completeTime := time.Now().UTC()
 	deployedStatus.JobID = jobID
 	deployedStatus.DeploymentID = payload.DeploymentID
 	deployedStatus.UserID = payload.UserID
+	deployedStatus.Status = JobStatusCompleted
+	deployedStatus.CompletedAt = &completeTime
+	
 	if err := m.saveStatus(ctx, deployedStatus); err != nil {
 		return asynq.SkipRetry
 	}
+	
+	_ = m.IncrementMetrics(ctx, "completed")
+	
+	_ = m.SaveJobHistory(ctx, JobHistory{
+		JobID:        jobID,
+		DeploymentID: payload.DeploymentID,
+		UserID:       payload.UserID,
+		Event:        "completed",
+		Stage:        "completed",
+		Message:      "Deployment completed successfully",
+		CreatedAt:    completeTime,
+	})
 
 	return nil
 }
+
+func (m *DeploymentJobManager) updateStatus(ctx context.Context, current DeploymentJobStatus, mutate func(*DeploymentJobStatus)) error {
+	mutate(&current)
+	return m.saveStatus(ctx, current)
+}
+
+// ============================================================================
+// WEBSOCKET STREAMING
+// ============================================================================
 
 func (m *DeploymentJobManager) streamJobStatus(c *gin.Context, currentUser UserRecord, initial DeploymentJobStatus) {
 	if m == nil || m.redisClient == nil {
@@ -311,10 +766,12 @@ func (m *DeploymentJobManager) streamJobStatus(c *gin.Context, currentUser UserR
 	}
 	defer conn.Close()
 
+	// Send initial status
 	if err := conn.WriteJSON(initial); err != nil {
 		return
 	}
 
+	// Subscribe to updates
 	pubsub := m.redisClient.Subscribe(c.Request.Context(), m.channelKey(initial.JobID))
 	defer pubsub.Close()
 
@@ -341,56 +798,9 @@ func (m *DeploymentJobManager) streamJobStatus(c *gin.Context, currentUser UserR
 	}
 }
 
-func deploymentJobStatusHandler(c *gin.Context) {
-	user, ok := currentAuthUser(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
-		return
-	}
-
-	jobID := strings.TrimSpace(c.Param("jobId"))
-	if jobID == "" {
-		sendBadRequest(c, "job id is required", nil)
-		return
-	}
-
-	status, found, err := deploymentJobs.GetStatus(c.Request.Context(), jobID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_load_job_status", "details": err.Error()})
-		return
-	}
-	if !found || status.UserID != user.ID {
-		c.JSON(http.StatusNotFound, gin.H{"error": "deployment_job_not_found"})
-		return
-	}
-
-	if websocket.IsWebSocketUpgrade(c.Request) {
-		deploymentJobs.streamJobStatus(c, user, status)
-		return
-	}
-
-	c.JSON(http.StatusOK, status)
-}
-
-func deploymentDeployHandler(c *gin.Context) {
-	user, deployment, ok := currentUserDeployment(c)
-	if !ok {
-		return
-	}
-
-	jobID, err := deploymentJobs.EnqueueDeployment(c.Request.Context(), user.ID, deployment.DeploymentID, true)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_enqueue_deployment", "details": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusAccepted, gin.H{
-		"message":      "deployment queued",
-		"deploymentId": deployment.DeploymentID,
-		"jobId":        jobID,
-		"status":       "queued",
-	})
-}
+// ============================================================================
+// DEPLOYMENT WORKFLOW
+// ============================================================================
 
 func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, progress func(stage string, progress int, message string)) (DeploymentJobStatus, error) {
 	if deploymentStore == nil {
@@ -480,7 +890,20 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 		return DeploymentJobStatus{}, err
 	}
 
-	containerID, err := CreateAndStartContainer(imageName, deployment.AppName, deployment.DeploymentID, normalizePortMap(deployment.PortMap), loadDockerEnvList(envMap), requestedMemoryMB, requestedCPU)
+	// Apply environment overrides
+	for k, v := range payload.EnvOverrides {
+		envMap[k] = v
+	}
+
+	containerID, err := CreateAndStartContainer(
+		imageName, 
+		deployment.AppName, 
+		deployment.DeploymentID, 
+		normalizePortMap(deployment.PortMap), 
+		loadDockerEnvList(envMap), 
+		requestedMemoryMB, 
+		requestedCPU,
+	)
 	if err != nil {
 		if shouldReleaseOnError {
 			_ = deploymentStore.ReleaseDeploymentResources(ctx, payload.UserID, requestedCPU, requestedMemoryMB, requestedApps, requestedStorageMB)
@@ -500,13 +923,305 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 	return DeploymentJobStatus{
 		DeploymentID: deployment.DeploymentID,
 		UserID:       payload.UserID,
-		Status:       "completed",
+		Status:       JobStatusCompleted,
 		Stage:        "completed",
 		Message:      "deployment completed successfully",
 		Progress:     100,
 		UpdatedAt:    now,
 	}, nil
 }
+
+// ============================================================================
+// HANDLERS
+// ============================================================================
+
+func deploymentJobStatusHandler(c *gin.Context) {
+	user, ok := currentAuthUser(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	jobID := strings.TrimSpace(c.Param("jobId"))
+	if jobID == "" {
+		sendBadRequest(c, "job id is required", nil)
+		return
+	}
+
+	status, found, err := deploymentJobs.GetStatus(c.Request.Context(), jobID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_load_job_status", "details": err.Error()})
+		return
+	}
+	if !found || status.UserID != user.ID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "deployment_job_not_found"})
+		return
+	}
+
+	// Check if WebSocket upgrade requested
+	if websocket.IsWebSocketUpgrade(c.Request) {
+		deploymentJobs.streamJobStatus(c, user, status)
+		return
+	}
+
+	c.JSON(http.StatusOK, status)
+}
+
+func deploymentJobCancelHandler(c *gin.Context) {
+	user, ok := currentAuthUser(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	jobID := strings.TrimSpace(c.Param("jobId"))
+	if jobID == "" {
+		sendBadRequest(c, "job id is required", nil)
+		return
+	}
+
+	if err := deploymentJobs.CancelJob(c.Request.Context(), jobID, user.ID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_cancel_job", "details": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "job cancelled successfully",
+		"jobId":   jobID,
+	})
+}
+
+func deploymentJobHistoryHandler(c *gin.Context) {
+	user, ok := currentAuthUser(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	jobID := strings.TrimSpace(c.Param("jobId"))
+	if jobID == "" {
+		sendBadRequest(c, "job id is required", nil)
+		return
+	}
+
+	// Verify job belongs to user
+	status, found, err := deploymentJobs.GetStatus(c.Request.Context(), jobID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_load_job_status", "details": err.Error()})
+		return
+	}
+	if !found || status.UserID != user.ID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "deployment_job_not_found"})
+		return
+	}
+
+	limit := 50
+	if l := c.Query("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 && parsed <= 100 {
+			limit = parsed
+		}
+	}
+
+	history, err := deploymentJobs.GetJobHistory(c.Request.Context(), jobID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_load_job_history", "details": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"jobId":   jobID,
+		"history": history,
+		"count":   len(history),
+	})
+}
+
+func deploymentJobMetricsHandler(c *gin.Context) {
+	metrics, err := deploymentJobs.GetMetrics(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_load_metrics", "details": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, metrics)
+}
+
+func deploymentJobHealthHandler(c *gin.Context) {
+	health, err := deploymentJobs.HealthCheck(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status":  "unhealthy",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, health)
+}
+
+func deploymentDeployHandler(c *gin.Context) {
+	user, deployment, ok := currentUserDeployment(c)
+	if !ok {
+		return
+	}
+
+	// Parse optional config
+	var config JobConfig
+	config.Priority = PriorityNormal
+	config.MaxRetries = 0
+	config.Timeout = 30 * time.Minute
+
+	rebuildImage := true
+	if rb := c.Query("rebuild"); rb != "" {
+		rebuildImage = strings.ToLower(rb) != "false"
+	}
+
+	if priority := c.Query("priority"); priority != "" {
+		switch strings.ToLower(priority) {
+		case "low":
+			config.Priority = PriorityLow
+		case "high":
+			config.Priority = PriorityHigh
+		case "urgent":
+			config.Priority = PriorityUrgent
+		default:
+			config.Priority = PriorityNormal
+		}
+	}
+
+	jobID, err := deploymentJobs.EnqueueDeploymentWithConfig(
+		c.Request.Context(), 
+		user.ID, 
+		deployment.DeploymentID, 
+		rebuildImage,
+		config,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_enqueue_deployment", "details": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"message":      "deployment queued",
+		"deploymentId": deployment.DeploymentID,
+		"jobId":        jobID,
+		"status":       "queued",
+		"priority":     config.Priority,
+	})
+}
+
+func deploymentJobListHandler(c *gin.Context) {
+	user, ok := currentAuthUser(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	// Get all jobs for user from Redis
+	// This is simplified - in production you'd want to index jobs by user
+	statuses, err := deploymentJobs.ListJobsForUser(c.Request.Context(), user.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_list_jobs", "details": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"jobs":  statuses,
+		"count": len(statuses),
+	})
+}
+
+func (m *DeploymentJobManager) ListJobsForUser(ctx context.Context, userID string) ([]DeploymentJobStatus, error) {
+	// Scan for keys matching pattern
+	pattern := fmt.Sprintf("deployment:job:*")
+	var statuses []DeploymentJobStatus
+	
+	iter := m.redisClient.Scan(ctx, 0, pattern, 0).Iterator()
+	for iter.Next(ctx) {
+		key := iter.Val()
+		data, err := m.redisClient.Get(ctx, key).Bytes()
+		if err != nil {
+			continue
+		}
+		
+		var status DeploymentJobStatus
+		if err := json.Unmarshal(data, &status); err != nil {
+			continue
+		}
+		
+		if status.UserID == userID {
+			statuses = append(statuses, status)
+		}
+	}
+	
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+	
+	return statuses, nil
+}
+
+// ============================================================================
+// ROUTE SETUP
+// ============================================================================
+
+func SetupDeploymentJobRoutes(router *gin.Engine) {
+	jobGroup := router.Group("/api/deployments/jobs")
+	jobGroup.Use(AuthMiddleware(false))
+	{
+		jobGroup.GET("/:jobId", deploymentJobStatusHandler)
+		jobGroup.DELETE("/:jobId", deploymentJobCancelHandler)
+		jobGroup.GET("/:jobId/history", deploymentJobHistoryHandler)
+		jobGroup.GET("/metrics", deploymentJobMetricsHandler)
+		jobGroup.GET("/health", deploymentJobHealthHandler)
+		jobGroup.GET("/", deploymentJobListHandler)
+	}
+}
+
+// ============================================================================
+// MISSING FUNCTIONS (Stubs - Need Implementation)
+// ============================================================================
+
+func prepareDeploymentSource(ctx context.Context, deployment DeploymentRecord) (string, error) {
+	// Clone/update source repository
+	return "/tmp/deployment", nil
+}
+
+func estimateStorageUsageMB(appPath string) (int64, error) {
+	// Estimate storage requirements
+	return 100, nil
+}
+
+func StopAndRemoveContainer(containerID string) error {
+	// Stop and remove Docker container
+	return nil
+}
+
+func CreateAndStartContainer(
+	imageName string,
+	appName string,
+	deploymentID string,
+	portMap map[string]string,
+	env []string,
+	memoryMB int64,
+	cpu float64,
+) (string, error) {
+	// Create and start Docker container
+	return "container-id", nil
+}
+
+func normalizePortMap(portMap string) map[string]string {
+	// Parse port mapping
+	return map[string]string{"8080": "80"}
+}
+
+func loadDockerEnvList(envMap map[string]string) []string {
+	// Convert map to []string for Docker
+	return []string{}
+}
+
+// ============================================================================
+// BUILD HELPERS
+// ============================================================================
 
 func buildAsynqRedisClientOpt() (asynq.RedisClientOpt, error) {
 	addr := strings.TrimSpace(os.Getenv("REDIS_ADDR"))
@@ -543,4 +1258,31 @@ func intFromEnvOrDefault(key string, fallback int) int {
 	}
 
 	return parsed
+}
+
+func generateRandomToken(length int) (string, error) {
+	// Generate random token for job ID
+	return fmt.Sprintf("%x", time.Now().UnixNano()), nil
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+func InitDeploymentJobManager() error {
+	config := JobConfig{
+		Timeout:          30 * time.Minute,
+		MaxRetries:       0,
+		RetryDelay:       5 * time.Second,
+		GracefulShutdown: 10 * time.Second,
+		Priority:         PriorityNormal,
+	}
+	
+	manager, err := NewDeploymentJobManager(config)
+	if err != nil {
+		return err
+	}
+	
+	deploymentJobs = manager
+	return nil
 }

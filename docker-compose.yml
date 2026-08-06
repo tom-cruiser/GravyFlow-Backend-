@@ -1,89 +1,409 @@
-name: gravyflow
+# ============================================================================
+# GRAVYFLOW DOCKER COMPOSE
+# ============================================================================
+# Production-ready Docker Compose configuration for GravyFlow deployment platform
+# with resource limits, health checks, and monitoring support.
+# 
+# Usage:
+#   docker-compose up -d                    # Start all services
+#   docker-compose --profile monitoring up -d  # Start with monitoring
+#   docker-compose --profile production up -d  # Start with nginx
+#   docker-compose down -v                  # Stop and remove volumes
+# ============================================================================
+
+version: '3.8'
+
+# ============================================================================
+# NETWORKS
+# ============================================================================
+
+networks:
+  gravyflow-network:
+    name: gravyflow-network
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# ============================================================================
+# VOLUMES
+# ============================================================================
+
+volumes:
+  postgres-data:
+    name: gravyflow-postgres-data
+  postgres-backup:
+    name: gravyflow-postgres-backup
+  redis-data:
+    name: gravyflow-redis-data
+  app-builds:
+    name: gravyflow-app-builds
+  nixpacks-cache:
+    name: gravyflow-nixpacks-cache
+  prometheus-data:
+    name: gravyflow-prometheus-data
+  grafana-data:
+    name: gravyflow-grafana-data
+
+# ============================================================================
+# SERVICES
+# ============================================================================
 
 services:
+  # ==========================================================================
+  # POSTGRESQL
+  # ==========================================================================
   postgres:
-    image: postgres:15
+    image: postgres:15-alpine
+    container_name: gravyflow-postgres
     environment:
-      POSTGRES_DB: gravyflow
-      POSTGRES_USER: gravyflow
-      POSTGRES_PASSWORD: gravyflow
+      POSTGRES_DB: ${POSTGRES_DB:-gravyflow}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-blackey333Vi@32}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+      PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
-      # Named volume → data survives `down`/`up` and restarts. NOT a bind mount,
-      # so it is never silently wiped by host-side changes.
       - postgres-data:/var/lib/postgresql/data
-      # Runs ONLY on first init (empty data dir). Re-running compose does not
-      # re-apply it, which is why persisted data is not clobbered.
+      - postgres-backup:/backup
       - ./db/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+      - ./db/migrations:/docker-entrypoint-initdb.d/migrations:ro
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    networks:
+      - gravyflow-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U gravyflow -d gravyflow"]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-gravyflow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '${POSTGRES_CPU_LIMIT:-2}'
+          memory: ${POSTGRES_MEMORY_LIMIT:-2G}
+        reservations:
+          cpus: '${POSTGRES_CPU_RESERVATION:-0.5}'
+          memory: ${POSTGRES_MEMORY_RESERVATION:-512M}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - "com.gravyflow.service=postgres"
+      - "com.gravyflow.environment=${ENVIRONMENT:-development}"
+
+  # ==========================================================================
+  # POSTGRES BACKUP
+  # ==========================================================================
+  postgres-backup:
+    image: postgres:15-alpine
+    container_name: gravyflow-postgres-backup
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-gravyflow}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-blackey333Vi@32}
+      BACKUP_SCHEDULE: ${BACKUP_SCHEDULE:-0 2 * * *}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
+    volumes:
+      - postgres-backup:/backup
+      - ./scripts/backup.sh:/backup.sh:ro
+    networks:
+      - gravyflow-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: |
+      sh -c "
+        echo '0 2 * * * /backup.sh' > /etc/crontab &&
+        crond -f -l 2
+      "
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+    labels:
+      - "com.gravyflow.service=postgres-backup"
+    profiles:
+      - backup
+
+  # ==========================================================================
+  # REDIS
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: gravyflow-redis
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    networks:
+      - gravyflow-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
       timeout: 5s
       retries: 10
       start_period: 10s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '${REDIS_CPU_LIMIT:-1}'
+          memory: ${REDIS_MEMORY_LIMIT:-1G}
+        reservations:
+          cpus: '${REDIS_CPU_RESERVATION:-0.25}'
+          memory: ${REDIS_MEMORY_RESERVATION:-256M}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - "com.gravyflow.service=redis"
+      - "com.gravyflow.environment=${ENVIRONMENT:-development}"
 
-  redis:
-    image: redis:7-alpine
-    volumes:
-      - redis-data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
-    restart: unless-stopped
-
+  # ==========================================================================
+  # API
+  # ==========================================================================
   api:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: ${DOCKERFILE:-Dockerfile}
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-latest}
+        BUILD_TIME: ${BUILD_TIME:-}
+    image: gravyflow-api:${IMAGE_TAG:-latest}
+    container_name: gravyflow-api
+    # Load environment variables from .env file
+    env_file:
+      - .env
     environment:
-      # Single source of truth for the DB connection. Using DATABASE_URL
-      # deliberately bypasses the localhost dev-default logic in db.go
-      # (useLocalDevPostgresDefaults), which only triggers for host=localhost.
-      DATABASE_URL: postgres://gravyflow:gravyflow@postgres:5432/gravyflow?sslmode=disable
+      # Database (using values from .env)
+      DATABASE_URL: ${DATABASE_URL:-postgres://postgres:blackey333Vi@32@postgres:5432/gravyflow?sslmode=disable}
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB:-gravyflow}
+      PGUSER: ${POSTGRES_USER:-postgres}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-blackey333Vi@32}
+      
+      # Redis
       REDIS_ADDR: redis:6379
-      PORT: "8080"
-      # Explicit, stable JWT signing secret instead of the silent code default
-      # (dev-auth-secret-change-me). Reads AUTH_JWT_SECRET from the host env when
-      # set; otherwise a fixed local value — OVERRIDE this in production.
-      AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-gravyflow-local-dev-secret-change-in-prod}
-      # Belt-and-suspenders DB wait inside the app (see db.go pingWithRetry).
-      PGCONNECTATTEMPTS: "30"
-      PGCONNECTRETRYINTERVAL: "1s"
-      GRAVYFLOW_APPS_DIR: /var/lib/gravyflow/apps
-      NIXPACKS_CACHE_DIR: /var/cache/nixpacks
-    ports:
-      - "8080:8080"
+      
+      # Server
+      PORT: ${PORT:-8080}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-debug}
+      DEBUG: ${DEBUG:-true}
+      
+      # Security (from .env)
+      AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-}
+      APP_ENV_ENCRYPTION_KEY: ${APP_ENV_ENCRYPTION_KEY:-}
+      
+      # Database Connection
+      PGCONNECTATTEMPTS: ${PGCONNECTATTEMPTS:-30}
+      PGCONNECTRETRYINTERVAL: ${PGCONNECTRETRYINTERVAL:-1s}
+      PGMAXCONNS: ${PGMAXCONNS:-10}
+      PGMINCONNS: ${PGMINCONNS:-2}
+      PGMAXCONNLIFETIME: ${PGMAXCONNLIFETIME:-30m}
+      PGMAXCONNIDLETIME: ${PGMAXCONNIDLETIME:-5m}
+      
+      # Build Configuration
+      GRAVYFLOW_APPS_DIR: ${GRAVYFLOW_APPS_DIR:-/var/lib/gravyflow/apps}
+      NIXPACKS_CACHE_DIR: ${NIXPACKS_CACHE_DIR:-/var/cache/nixpacks}
+      GRAVYFLOW_DISABLE_BUILDKIT: ${GRAVYFLOW_DISABLE_BUILDKIT:-0}
+      
+      # Health Checker
+      HEALTH_CHECKER_INTERVAL: ${HEALTH_CHECKER_INTERVAL:-30s}
+      
+      # Metrics
+      ENABLE_METRICS: ${ENABLE_METRICS:-true}
+      METRICS_PORT: ${METRICS_PORT:-9090}
+      
+      # Rate Limiting
+      RATE_LIMIT: ${RATE_LIMIT:-100}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-200}
+      
+      # Timeouts
+      SHUTDOWN_GRACE: ${SHUTDOWN_GRACE:-30s}
+      WRITE_TIMEOUT: ${WRITE_TIMEOUT:-15s}
+      READ_TIMEOUT: ${READ_TIMEOUT:-15s}
+      IDLE_TIMEOUT: ${IDLE_TIMEOUT:-60s}
     volumes:
-      # DooD: drive the host Docker daemon so the control plane can build/run
-      # user app containers. Those containers are SIBLINGS on the host, not
-      # nested children of this one.
       - /var/run/docker.sock:/var/run/docker.sock
-      # Cloned/built app sources live here so nixpacks (running inside this
-      # container) has a stable path to build from across restarts.
       - app-builds:/var/lib/gravyflow/apps
-      # Persist the nixpacks toolchain cache so it survives container restarts
-      # (matches NIXPACKS_CACHE_DIR in build.go).
       - nixpacks-cache:/var/cache/nixpacks
+      - ./configs:/app/configs:ro
+    ports:
+      - "${API_PORT:-8080}:8080"
+      - "${METRICS_PORT:-9090}:9090"
+    networks:
+      - gravyflow-network
     depends_on:
-      # Gate startup on health, not just "container started". This is what makes
-      # the API wait until Postgres/Redis are actually accepting connections.
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]
-      interval: 10s
-      timeout: 5s
+      test: ["CMD", "curl", "-fsS", "http://localhost:${PORT:-8080}/api/health"]
+      interval: 30s
+      timeout: 10s
       retries: 5
-      start_period: 20s
+      start_period: 60s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '${API_CPU_LIMIT:-4}'
+          memory: ${API_MEMORY_LIMIT:-4G}
+        reservations:
+          cpus: '${API_CPU_RESERVATION:-0.5}'
+          memory: ${API_MEMORY_RESERVATION:-512M}
+      replicas: ${API_REPLICAS:-1}
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+      rollback_config:
+        parallelism: 1
+        delay: 10s
+        order: stop-first
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        labels: "com.gravyflow.service=api"
+    labels:
+      - "com.gravyflow.service=api"
+      - "com.gravyflow.environment=${ENVIRONMENT:-development}"
+      - "com.gravyflow.version=${BUILD_VERSION:-latest}"
 
-volumes:
-  postgres-data:
-  redis-data:
-  app-builds:
-  nixpacks-cache:
+  # ==========================================================================
+  # PROMETHEUS (Monitoring)
+  # ==========================================================================
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: gravyflow-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9091}:9090"
+    networks:
+      - gravyflow-network
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+      - '--storage.tsdb.retention.time=15d'
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - "com.gravyflow.service=prometheus"
+    profiles:
+      - monitoring
+
+  # ==========================================================================
+  # GRAFANA (Dashboards)
+  # ==========================================================================
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: gravyflow-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+      GF_SERVER_ROOT_URL: ${GRAFANA_URL:-http://localhost:3000}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    networks:
+      - gravyflow-network
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - "com.gravyflow.service=grafana"
+    profiles:
+      - monitoring
+
+  # ==========================================================================
+  # NGINX (Reverse Proxy - Production)
+  # ==========================================================================
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: gravyflow-nginx
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:80"
+      - "${NGINX_HTTPS_PORT:-443}:443"
+    networks:
+      - gravyflow-network
+    depends_on:
+      - api
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - "com.gravyflow.service=nginx"
+    profiles:
+      - production

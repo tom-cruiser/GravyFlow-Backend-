@@ -17,7 +17,7 @@ import (
 
 const (
 	gravyflowAppTag = "gravyflow-app"
-	minDiskSpaceGB  = 1
+	// Note: minDiskSpaceGB is now in helpers.go - DO NOT redeclare here
 )
 
 // ============================================================================
@@ -254,7 +254,7 @@ func validateDockerEnvironment() EnvValidation {
 		}
 	}
 
-	// Check disk space
+	// Check disk space - minDiskSpaceGB is now in helpers.go
 	if !hasEnoughDiskSpace() {
 		validation.Warnings = append(validation.Warnings,
 			"low disk space available for Docker builds (< 1GB)")
@@ -304,6 +304,7 @@ func hasEnoughDiskSpace() bool {
 	}
 	freeBytes := stat.Bavail * uint64(stat.Bsize)
 	freeGB := freeBytes / (1024 * 1024 * 1024)
+	// minDiskSpaceGB is now in helpers.go
 	return freeGB >= minDiskSpaceGB
 }
 
@@ -407,14 +408,8 @@ func logDockerEnvironment(env []string) {
 // ERROR DETECTION
 // ============================================================================
 
-func isBuildKitMissingError(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "buildkit") &&
-		(strings.Contains(s, "buildx") || strings.Contains(s, "buildkit is enabled"))
-}
+// Note: isBuildKitMissingError is now in helpers.go - DO NOT redeclare here
+// The function is used from helpers.go
 
 func isBuildKitIncompatibleError(err error) bool {
 	if err == nil {
@@ -460,37 +455,9 @@ func getBuildKitStrategies() []BuildKitStrategy {
 }
 
 // ============================================================================
-// IMAGE TAG SANITIZATION
+// IMAGE TAG SANITIZATION - REMOVED (now in build.go)
 // ============================================================================
-
-func dockerImageTag(appName string) string {
-	appName = strings.ToLower(strings.TrimSpace(appName))
-	if appName == "" {
-		return gravyflowAppTag
-	}
-	
-	var b strings.Builder
-	for _, r := range appName {
-		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == '_', r == '-', r == '/':
-			b.WriteRune(r)
-		default:
-			b.WriteRune('-')
-		}
-	}
-	
-	tag := strings.Trim(b.String(), "-./")
-	if tag == "" {
-		return gravyflowAppTag
-	}
-	
-	// Ensure tag length is valid (max 128 characters for Docker)
-	if len(tag) > 128 {
-		tag = tag[:128]
-	}
-	
-	return tag
-}
+// Note: dockerImageTag is now in build.go - DO NOT redeclare here
 
 // ============================================================================
 // INITIALIZATION
@@ -561,7 +528,7 @@ EXAMPLE USAGE:
        fmt.Printf("%s: %s (available: %v)\n", s.Name, s.Description, s.Available)
    }
 
-7. Sanitize image tag:
+7. Sanitize image tag (now in build.go):
    tag := dockerImageTag("My App with Spaces")
    // tag = "my-app-with-spaces"
 */

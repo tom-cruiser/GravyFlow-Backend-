@@ -3,13 +3,11 @@ package main
 import (
 	"context"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -75,44 +73,15 @@ type authClaims struct {
 }
 
 // ============================================================================
-// HELPER FUNCTIONS
+// HELPER FUNCTIONS (REMOVED - Now in helpers.go)
 // ============================================================================
-
-// generateRandomToken generates a cryptographically secure random token
-func generateRandomToken(length int) (string, error) {
-	bytes := make([]byte, length)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", fmt.Errorf("failed to generate random token: %w", err)
-	}
-	return hex.EncodeToString(bytes), nil
-}
-
-// hashToken creates a SHA256 hash of a token for storage
-func hashToken(token string) string {
-	hash := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(hash[:])
-}
+// Removed: generateRandomToken, hashToken, envOrDefault, durationFromEnv, sendBadRequest
+// These are now imported from helpers.go
 
 // fingerprintAPIKey creates a short fingerprint of an API key for logging
 func fingerprintAPIKey(apiKey string) string {
 	sum := sha256.Sum256([]byte(apiKey))
 	return hex.EncodeToString(sum[:8])
-}
-
-// envOrDefault returns environment variable value or default
-func envOrDefault(key string, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
-}
-
-// durationFromEnv parses duration from environment variable
-func durationFromEnv(key string, fallback time.Duration) (time.Duration, error) {
-	if value := os.Getenv(key); value != "" {
-		return time.ParseDuration(value)
-	}
-	return fallback, nil
 }
 
 // tokenTTLFromEnv gets TTL from environment or returns fallback
@@ -127,15 +96,6 @@ func tokenTTLFromEnv(key string, fallback time.Duration) time.Duration {
 // hmacEqual performs constant-time comparison
 func hmacEqual(a string, b string) bool {
 	return hmac.Equal([]byte(a), []byte(b))
-}
-
-// sendBadRequest sends a standardized bad request response
-func sendBadRequest(c *gin.Context, message string, err error) {
-	response := gin.H{"error": message}
-	if err != nil {
-		response["details"] = err.Error()
-	}
-	c.JSON(http.StatusBadRequest, response)
 }
 
 // ============================================================================

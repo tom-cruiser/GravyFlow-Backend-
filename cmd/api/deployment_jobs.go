@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -165,7 +166,9 @@ type DeploymentJobManager struct {
 	mu          sync.RWMutex
 }
 
-var deploymentJobs *DeploymentJobManager
+// Note: deploymentJobs is now in globals.go
+// var deploymentJobs *DeploymentJobManager
+
 var logsWebsocketUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
@@ -266,6 +269,7 @@ func (m *DeploymentJobManager) EnqueueDeploymentWithConfig(
 		return "", fmt.Errorf("userID and deploymentID are required")
 	}
 
+	// generateRandomToken is now in helpers.go
 	jobID, err := generateRandomToken(16)
 	if err != nil {
 		return "", fmt.Errorf("generate job id: %w", err)
@@ -577,7 +581,7 @@ func (m *DeploymentJobManager) HealthCheck(ctx context.Context) (SystemHealth, e
 	health.QueueLength = info.Pending + info.Active
 	health.Workers = intFromEnvOrDefault("ASYNQ_CONCURRENCY", 1)
 	
-	// Check Database
+	// Check Database (deploymentStore is now in globals.go)
 	if deploymentStore != nil {
 		if err := deploymentStore.HealthCheck(ctx); err != nil {
 			health.Status = "unhealthy"
@@ -803,6 +807,7 @@ func (m *DeploymentJobManager) streamJobStatus(c *gin.Context, currentUser UserR
 // ============================================================================
 
 func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, progress func(stage string, progress int, message string)) (DeploymentJobStatus, error) {
+	// deploymentStore is now in globals.go
 	if deploymentStore == nil {
 		return DeploymentJobStatus{}, fmt.Errorf("deployment store is not initialized")
 	}
@@ -936,6 +941,7 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 // ============================================================================
 
 func deploymentJobStatusHandler(c *gin.Context) {
+	// currentAuthUser is now in auth.go
 	user, ok := currentAuthUser(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
@@ -944,10 +950,12 @@ func deploymentJobStatusHandler(c *gin.Context) {
 
 	jobID := strings.TrimSpace(c.Param("jobId"))
 	if jobID == "" {
+		// sendBadRequest is now in helpers.go
 		sendBadRequest(c, "job id is required", nil)
 		return
 	}
 
+	// deploymentJobs is now in globals.go
 	status, found, err := deploymentJobs.GetStatus(c.Request.Context(), jobID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_load_job_status", "details": err.Error()})
@@ -1117,7 +1125,6 @@ func deploymentJobListHandler(c *gin.Context) {
 	}
 
 	// Get all jobs for user from Redis
-	// This is simplified - in production you'd want to index jobs by user
 	statuses, err := deploymentJobs.ListJobsForUser(c.Request.Context(), user.ID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_list_jobs", "details": err.Error()})
@@ -1260,10 +1267,7 @@ func intFromEnvOrDefault(key string, fallback int) int {
 	return parsed
 }
 
-func generateRandomToken(length int) (string, error) {
-	// Generate random token for job ID
-	return fmt.Sprintf("%x", time.Now().UnixNano()), nil
-}
+// Note: generateRandomToken is now in helpers.go (REMOVED from here)
 
 // ============================================================================
 // INITIALIZATION
@@ -1283,6 +1287,7 @@ func InitDeploymentJobManager() error {
 		return err
 	}
 	
+	// deploymentJobs is now in globals.go
 	deploymentJobs = manager
 	return nil
 }

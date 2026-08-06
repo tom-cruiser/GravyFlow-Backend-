@@ -31,10 +31,14 @@ POSTGRES_CONTAINER_PORT="5432"
 REDIS_HOST_PORT="${REDIS_PORT:-6379}"
 REDIS_CONTAINER_PORT="6379"
 
-# Database credentials
+# ============================================================================
+# DATABASE CREDENTIALS - YOUR CUSTOM CONFIGURATION
+# ============================================================================
+
+# Database credentials (YOUR CUSTOM VALUES)
 POSTGRES_DB="${POSTGRES_DB:-gravyflow}"
-POSTGRES_USER="${POSTGRES_USER:-gravyflow}"
-POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-gravyflow}"
+POSTGRES_USER="${POSTGRES_USER:-postgres}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-blackey333Vi@32}"
 
 # Timeouts
 HEALTH_CHECK_TIMEOUT="${HEALTH_CHECK_TIMEOUT:-60}"
@@ -43,6 +47,18 @@ HEALTH_CHECK_INTERVAL="${HEALTH_CHECK_INTERVAL:-1}"
 # Application
 APP_PATH="${APP_PATH:-./cmd/api}"
 BUILD_COMMAND="${BUILD_COMMAND:-go run}"
+
+# ============================================================================
+# GENERATE SECRETS
+# ============================================================================
+
+generate_secret() {
+    if command -v openssl &> /dev/null; then
+        openssl rand -base64 32 2>/dev/null || head -c 32 /dev/urandom | base64
+    else
+        head -c 32 /dev/urandom | base64
+    fi
+}
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -86,7 +102,7 @@ check_docker() {
 
 check_port() {
     local port=$1
-    if lsof -i ":$port" &> /dev/null; then
+    if command -v lsof &> /dev/null && lsof -i ":$port" &> /dev/null; then
         print_warning "Port $port is already in use"
         return 1
     fi
@@ -202,6 +218,20 @@ setup_environment() {
             exit 1
         fi
     fi
+    
+    # Generate secrets if not set
+    if [ -z "${AUTH_JWT_SECRET:-}" ]; then
+        AUTH_JWT_SECRET="$(generate_secret)"
+        print_warning "Generated temporary AUTH_JWT_SECRET"
+    fi
+    
+    if [ -z "${APP_ENV_ENCRYPTION_KEY:-}" ]; then
+        APP_ENV_ENCRYPTION_KEY="$(generate_secret)"
+        print_warning "Generated temporary APP_ENV_ENCRYPTION_KEY"
+    fi
+    
+    export AUTH_JWT_SECRET
+    export APP_ENV_ENCRYPTION_KEY
 }
 
 # ============================================================================
@@ -223,6 +253,9 @@ setup_postgres() {
     local schema_path="${repo_root}/db/schema.sql"
     if [ -f "$schema_path" ]; then
         extra_args="-v $schema_path:/docker-entrypoint-initdb.d/001-schema.sql:ro"
+        print_info "Schema file found: $schema_path"
+    else
+        print_warning "Schema file not found at: $schema_path"
     fi
     
     ensure_container "$POSTGRES_CONTAINER" "postgres:15" "$port_mapping" "$volume" "$env_vars" "$extra_args"
@@ -230,6 +263,21 @@ setup_postgres() {
     # Wait for PostgreSQL
     local check_cmd="docker exec $POSTGRES_CONTAINER pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"
     wait_for_service "PostgreSQL" "$check_cmd" "$HEALTH_CHECK_TIMEOUT" "$HEALTH_CHECK_INTERVAL"
+    
+    # Apply schema if already exists (for updates)
+    if [ -f "$schema_path" ]; then
+        print_info "Applying database schema..."
+        docker exec -i "$POSTGRES_CONTAINER" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" < "$schema_path" 2>/dev/null || true
+        print_success "Schema applied"
+    fi
+    
+    # Verify database connection
+    print_info "Verifying database connection..."
+    if docker exec "$POSTGRES_CONTAINER" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT 1" &> /dev/null; then
+        print_success "Database connection verified"
+    else
+        print_warning "Could not verify database connection"
+    fi
 }
 
 # ============================================================================
@@ -249,6 +297,14 @@ setup_redis() {
     # Wait for Redis
     local check_cmd="docker exec $REDIS_CONTAINER redis-cli ping"
     wait_for_service "Redis" "$check_cmd" "$HEALTH_CHECK_TIMEOUT" "$HEALTH_CHECK_INTERVAL"
+    
+    # Verify Redis connection
+    print_info "Verifying Redis connection..."
+    if docker exec "$REDIS_CONTAINER" redis-cli ping | grep -q "PONG"; then
+        print_success "Redis connection verified"
+    else
+        print_warning "Could not verify Redis connection"
+    fi
 }
 
 # ============================================================================
@@ -304,6 +360,9 @@ show_status() {
     # PostgreSQL status
     if container_running "$POSTGRES_CONTAINER"; then
         print_success "PostgreSQL: Running (port $POSTGRES_HOST_PORT)"
+        print_info "  Database: $POSTGRES_DB"
+        print_info "  User: $POSTGRES_USER"
+        print_info "  Password: ********"
     elif container_exists "$POSTGRES_CONTAINER"; then
         print_warning "PostgreSQL: Stopped"
     else
@@ -325,6 +384,11 @@ show_status() {
     print_info "Connection Strings:"
     echo "  PostgreSQL: postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@localhost:$POSTGRES_HOST_PORT/$POSTGRES_DB"
     echo "  Redis: redis://localhost:$REDIS_HOST_PORT"
+    echo ""
+    
+    print_info "API Environment Variables:"
+    echo "  AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:0:10}..."
+    echo "  APP_ENV_ENCRYPTION_KEY: ${APP_ENV_ENCRYPTION_KEY:0:10}..."
 }
 
 # ============================================================================
@@ -334,7 +398,7 @@ show_status() {
 run_application() {
     print_header "Starting Application"
     
-    # Set environment variables
+    # Set environment variables with your custom credentials
     export PGHOST=127.0.0.1
     export PGPORT=$POSTGRES_HOST_PORT
     export PGDATABASE=$POSTGRES_DB
@@ -342,13 +406,32 @@ run_application() {
     export PGPASSWORD=$POSTGRES_PASSWORD
     export REDIS_ADDR=127.0.0.1:$REDIS_HOST_PORT
     
+    # Application-specific environment variables
+    export DATABASE_URL="postgres://$PGUSER:$PGPASSWORD@$PGHOST:$PGPORT/$PGDATABASE?sslmode=disable"
+    export PORT=8080
+    export ENVIRONMENT=development
+    export LOG_LEVEL=debug
+    
+    # Generate secrets if not set
+    if [ -z "${AUTH_JWT_SECRET:-}" ]; then
+        export AUTH_JWT_SECRET="$(generate_secret)"
+    fi
+    
+    if [ -z "${APP_ENV_ENCRYPTION_KEY:-}" ]; then
+        export APP_ENV_ENCRYPTION_KEY="$(generate_secret)"
+    fi
+    
     # Show environment
     print_info "Environment:"
     echo "  PGHOST=$PGHOST"
     echo "  PGPORT=$PGPORT"
     echo "  PGDATABASE=$PGDATABASE"
     echo "  PGUSER=$PGUSER"
+    echo "  PGPASSWORD=********"
     echo "  REDIS_ADDR=$REDIS_ADDR"
+    echo "  DATABASE_URL=postgres://$PGUSER:***@$PGHOST:$PGPORT/$PGDATABASE"
+    echo "  PORT=$PORT"
+    echo "  AUTH_JWT_SECRET=${AUTH_JWT_SECRET:0:10}..."
     echo ""
     
     # Build or run
@@ -384,17 +467,20 @@ Commands:
     logs        Show container logs
     clean       Remove containers (keeps data)
     clean-all   Remove containers and volumes (deletes data)
+    shell       Open a shell in the PostgreSQL container
     help        Show this help message
 
 Environment Variables:
     POSTGRES_PORT       PostgreSQL host port (default: 5433)
     REDIS_PORT          Redis host port (default: 6379)
     POSTGRES_DB         Database name (default: gravyflow)
-    POSTGRES_USER       Database user (default: gravyflow)
-    POSTGRES_PASSWORD   Database password (default: gravyflow)
+    POSTGRES_USER       Database user (default: postgres)
+    POSTGRES_PASSWORD   Database password (default: blackey333Vi@32)
     HEALTH_CHECK_TIMEOUT Health check timeout in seconds (default: 60)
     APP_PATH           Application path (default: ./cmd/api)
     BUILD_COMMAND      Build command (default: go run)
+    AUTH_JWT_SECRET    JWT signing secret (auto-generated)
+    APP_ENV_ENCRYPTION_KEY Encryption key (auto-generated)
 
 Examples:
     $0                  # Start development environment
@@ -441,6 +527,10 @@ handle_command() {
             echo ""
             echo -e "${YELLOW}Redis logs:${NC}"
             docker logs --tail 50 "$REDIS_CONTAINER" 2>&1 || echo "Container not found"
+            ;;
+        shell)
+            print_header "Opening shell in PostgreSQL container"
+            docker exec -it "$POSTGRES_CONTAINER" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"
             ;;
         clean)
             cleanup_containers

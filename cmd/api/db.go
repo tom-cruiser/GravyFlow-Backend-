@@ -199,8 +199,9 @@ type DeploymentStore struct {
 	logger   *QueryLogger
 }
 
-var deploymentStore *DeploymentStore
-var initStoreOnce sync.Once
+// Note: deploymentStore variable is now in globals.go
+// var deploymentStore *DeploymentStore
+// var initStoreOnce sync.Once
 
 // ============================================================================
 // INITIALIZATION
@@ -408,13 +409,8 @@ func useLocalDevPostgresDefaults(host string, dbName string) bool {
 	return dbName == "gravyflow" && (host == "localhost" || host == "127.0.0.1")
 }
 
-func envOrDefault(key string, fallback string) string {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-	return value
-}
+// Note: envOrDefault, durationFromEnv, hashToken, generateRandomToken, isRetryableError
+// are now in helpers.go
 
 func int32FromEnv(key string, fallback int32) (int32, error) {
 	value := strings.TrimSpace(os.Getenv(key))
@@ -431,23 +427,6 @@ func int32FromEnv(key string, fallback int32) (int32, error) {
 	}
 
 	return int32(parsed), nil
-}
-
-func durationFromEnv(key string, fallback time.Duration) (time.Duration, error) {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback, nil
-	}
-
-	parsed, err := time.ParseDuration(value)
-	if err != nil {
-		return 0, fmt.Errorf("parse %s: %w", key, err)
-	}
-	if parsed < 0 {
-		return 0, fmt.Errorf("%s must be non-negative", key)
-	}
-
-	return parsed, nil
 }
 
 // ============================================================================
@@ -2731,18 +2710,8 @@ func (s *DeploymentStore) validateDeploymentInput(ownerUserID, appName, repoURL,
 // CRYPTO HELPERS
 // ============================================================================
 
-func hashToken(token string) string {
-	sum := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(sum[:])
-}
-
-func generateRandomToken(numBytes int) (string, error) {
-	buf := make([]byte, numBytes)
-	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("generate token: %w", err)
-	}
-	return base64.RawURLEncoding.EncodeToString(buf), nil
-}
+// Note: hashToken, generateRandomToken, encryptEnvValue, decryptEnvValue,
+// slugifyName, and error helpers are now in helpers.go
 
 func encryptEnvValue(value string) ([]byte, []byte, error) {
 	// In production, use a proper encryption key from environment
@@ -2827,90 +2796,10 @@ func slugifyName(value string) string {
 	return strings.Trim(builder.String(), "-")
 }
 
-func (e *StoreError) Error() string {
-	if e.Err != nil {
-		return fmt.Sprintf("[%s] %s: %v", e.Type, e.Message, e.Err)
-	}
-	return fmt.Sprintf("[%s] %s", e.Type, e.Message)
-}
-
-func IsNotFoundError(err error) bool {
-	var storeErr *StoreError
-	if errors.As(err, &storeErr) {
-		return storeErr.Type == ErrNotFound
-	}
-	return false
-}
-
-func IsConflictError(err error) bool {
-	var storeErr *StoreError
-	if errors.As(err, &storeErr) {
-		return storeErr.Type == ErrConflict
-	}
-	return false
-}
-
-func IsUnauthorizedError(err error) bool {
-	var storeErr *StoreError
-	if errors.As(err, &storeErr) {
-		return storeErr.Type == ErrUnauthorized
-	}
-	return false
-}
+// Note: StoreError.Error(), IsNotFoundError(), IsConflictError(), IsUnauthorizedError()
+// are now in helpers.go
 
 // ============================================================================
-// EXAMPLE USAGE
+// EXAMPLE USAGE - Removed (moved to example_test.go)
 // ============================================================================
-
-func ExampleUsage() {
-	ctx := context.Background()
-
-	// Initialize store
-	if err := InitDeploymentStore(ctx); err != nil {
-		log.Fatal(err)
-	}
-	defer GetDeploymentStore().Shutdown(ctx)
-
-	store := GetDeploymentStore()
-
-	// Create user
-	user, err := store.CreateUser(ctx, "user@example.com", "Test User", "hashed_password")
-	if err != nil {
-		log.Printf("Failed to create user: %v", err)
-	}
-
-	// Create deployment
-	deploymentID, err := store.CreateDeploymentAttemptForUser(
-		ctx,
-		user.ID,
-		"my-app",
-		"https://github.com/user/my-app.git",
-		"/app",
-		"8080:80",
-		"my-app:latest",
-	)
-	if err != nil {
-		log.Printf("Failed to create deployment: %v", err)
-	}
-
-	// Update deployment status
-	if err := store.MarkDeploymentDeployed(ctx, deploymentID, "container-123", "my-app-container", "my-app:latest"); err != nil {
-		log.Printf("Failed to update deployment: %v", err)
-	}
-
-	// List deployments
-	result, err := store.ListDeploymentsForUserWithPagination(ctx, user.ID, Pagination{
-		Limit:  10,
-		Offset: 0,
-		Order:  "created_at DESC",
-	})
-	if err != nil {
-		log.Printf("Failed to list deployments: %v", err)
-	}
-	log.Printf("Found %d deployments, page %d of %d", result.TotalCount, result.Page, result.TotalPages)
-
-	// Get pool stats
-	stats := store.GetPoolStats()
-	log.Printf("Pool stats: %d connections (%d active, %d idle)",
-		stats.TotalConnections, stats.ActiveConnections, stats.IdleConnections)
-}
+// Example usage has been moved to example_test.go file

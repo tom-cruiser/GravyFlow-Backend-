@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -42,7 +41,7 @@ const (
 
 const (
 	defaultBuildTimeout = 30 * time.Minute
-	minDiskSpaceGB      = 5
+	// Note: minDiskSpaceGB is now in helpers.go - DO NOT redeclare here
 )
 
 // ============================================================================
@@ -278,6 +277,7 @@ func checkSystemResources() error {
 	freeBytes := stat.Bavail * uint64(stat.Bsize)
 	freeGB := freeBytes / (1024 * 1024 * 1024)
 
+	// minDiskSpaceGB is now in helpers.go
 	if freeGB < minDiskSpaceGB {
 		return fmt.Errorf("insufficient disk space: %dGB available, need at least %dGB", freeGB, minDiskSpaceGB)
 	}
@@ -530,7 +530,7 @@ func buildWithNixpacks(absPath string, appName string, config BuildConfig) (stri
 
 		lastErr = err
 		
-		// Check if it's a retryable error
+		// Check if it's a retryable error - isRetryableError is now in helpers.go
 		if !isRetryableError(err) {
 			logger.Warn("Non-retryable error, stopping")
 			break
@@ -553,6 +553,7 @@ func buildWithNixpacks(absPath string, appName string, config BuildConfig) (stri
 func runNixpacksBuild(ctx context.Context, absPath string, appName string, cacheDir string, config BuildConfig) error {
 	err := runNixpacksBuildWithEnv(ctx, absPath, appName, cacheDir, dockerCommandEnv(config))
 	
+	// isBuildKitMissingError is now in docker_env.go
 	if err != nil && isBuildKitMissingError(err) {
 		logger.Warn("BuildKit unavailable, retrying with legacy docker builder")
 		if retryErr := runNixpacksBuildWithEnv(ctx, absPath, appName, cacheDir, dockerCommandEnvForceLegacyBuilder()); retryErr == nil {
@@ -658,29 +659,7 @@ func pushDockerImage(ctx context.Context, appName string, registryURL string) er
 // ERROR DETECTION HELPERS
 // ============================================================================
 
-func isRetryableError(err error) bool {
-	if err == nil {
-		return false
-	}
-	
-	s := strings.ToLower(err.Error())
-	retryableMarkers := []string{
-		"connection refused",
-		"timeout",
-		"temporary failure",
-		"network",
-		"dial tcp",
-		"unexpected EOF",
-	}
-	
-	for _, marker := range retryableMarkers {
-		if strings.Contains(s, marker) {
-			return true
-		}
-	}
-	
-	return false
-}
+// Note: isRetryableError is now in helpers.go - DO NOT redeclare here
 
 func isUnsupportedCacheDirError(err error) bool {
 	if err == nil {
@@ -710,69 +689,10 @@ func isUnsupportedCacheDirError(err error) bool {
 	return false
 }
 
-func isBuildKitMissingError(err error) bool {
-	if err == nil {
-		return false
-	}
-	
-	s := strings.ToLower(err.Error())
-	markers := []string{
-		"buildkit",
-		"docker buildx",
-		"docker build requires buildkit",
-		"failed to create buildkit client",
-		"buildx not found",
-	}
-	
-	for _, marker := range markers {
-		if strings.Contains(s, marker) {
-			return true
-		}
-	}
-	
-	return false
-}
+// Note: isBuildKitMissingError is now in docker_env.go - DO NOT redeclare here
+// Note: ValidationError is now in helpers.go - DO NOT redeclare here
 
 // ============================================================================
-// CUSTOM ERROR TYPES
+// USAGE EXAMPLE - REMOVED (moved to example_test.go)
 // ============================================================================
-
-type ValidationError struct {
-	Field   string
-	Code    string
-	Message string
-}
-
-func (e *ValidationError) Error() string {
-	return fmt.Sprintf("validation error [%s.%s]: %s", e.Field, e.Code, e.Message)
-}
-
-// ============================================================================
-// USAGE EXAMPLE
-// ============================================================================
-
-func ExampleUsage() {
-	// Simple usage with defaults
-	tag, err := BuildCode("/path/to/my/app", "my-app")
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("Built image: %s", tag)
-
-	// Advanced usage with custom config
-	config := DefaultConfig()
-	config.Timeout = 45 * time.Minute
-	config.RegistryURL = "docker.io/myregistry"
-	config.PushAfterBuild = true
-	config.Verbose = true
-	config.BuildArgs = map[string]string{
-		"VERSION": "1.0.0",
-		"ENV":     "production",
-	}
-
-	tag, err = BuildCodeWithConfig("/path/to/my/app", "my-app", config)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("Built and pushed image: %s", tag)
-}
+// Example usage has been moved to example_test.go file

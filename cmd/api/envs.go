@@ -2,9 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -20,93 +17,26 @@ import (
 // ============================================================================
 
 type DeploymentEnvRecord struct {
-	ID          string     `json:"id,omitempty"`
-	DeploymentID string    `json:"deploymentId,omitempty"`
-	Key         string     `json:"key"`
-	Value       string     `json:"value,omitempty"`
-	Category    string     `json:"category,omitempty"`
-	Sensitive   bool       `json:"sensitive,omitempty"`
-	Description string     `json:"description,omitempty"`
-	CreatedAt   time.Time  `json:"createdAt,omitempty"`
-	UpdatedAt   time.Time  `json:"updatedAt,omitempty"`
+	ID           string     `json:"id,omitempty"`
+	DeploymentID string     `json:"deploymentId,omitempty"`
+	Key          string     `json:"key"`
+	Value        string     `json:"value,omitempty"`
+	Category     string     `json:"category,omitempty"`
+	Sensitive    bool       `json:"sensitive,omitempty"`
+	Description  string     `json:"description,omitempty"`
+	CreatedAt    time.Time  `json:"createdAt,omitempty"`
+	UpdatedAt    time.Time  `json:"updatedAt,omitempty"`
 }
 
-type EnvVarHistory struct {
-	ID          string    `json:"id"`
-	DeploymentID string   `json:"deploymentId"`
-	EnvKey      string    `json:"envKey"`
-	Action      string    `json:"action"`
-	ChangedBy   string    `json:"changedBy"`
-	CreatedAt   time.Time `json:"createdAt"`
-}
-
-type EnvVarValidation struct {
-	Key      string   `json:"key"`
-	Value    string   `json:"value"`
-	Valid    bool     `json:"valid"`
-	Errors   []string `json:"errors,omitempty"`
-	Warnings []string `json:"warnings,omitempty"`
-}
-
-type EnvExport struct {
-	Variables map[string]string `json:"variables"`
-	Metadata  struct {
-		ExportedAt   time.Time `json:"exportedAt"`
-		DeploymentID string    `json:"deploymentId"`
-		Count        int       `json:"count"`
-	} `json:"metadata"`
-}
+// Note: EnvVarHistory, EnvVarValidation, and EnvExport are now in env_handlers.go
+// DO NOT redeclare them here
 
 // ============================================================================
 // ENCRYPTION FUNCTIONS
 // ============================================================================
 
-func encryptEnvValue(value string) ([]byte, []byte, error) {
-	key, err := envEncryptionKey()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, nil, fmt.Errorf("create cipher: %w", err)
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, nil, fmt.Errorf("create gcm: %w", err)
-	}
-
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, nil, fmt.Errorf("generate nonce: %w", err)
-	}
-
-	sealed := gcm.Seal(nil, nonce, []byte(value), nil)
-	return sealed, nonce, nil
-}
-
-func decryptEnvValue(ciphertext []byte, nonce []byte) (string, error) {
-	key, err := envEncryptionKey()
-	if err != nil {
-		return "", err
-	}
-
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", fmt.Errorf("create cipher: %w", err)
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", fmt.Errorf("create gcm: %w", err)
-	}
-
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return "", fmt.Errorf("decrypt env value: %w", err)
-	}
-
-	return string(plaintext), nil
-}
+// Note: encryptEnvValue and decryptEnvValue are now in db.go
+// DO NOT redeclare them here
 
 func envEncryptionKey() ([]byte, error) {
 	raw := strings.TrimSpace(os.Getenv("APP_ENV_ENCRYPTION_KEY"))
@@ -129,7 +59,7 @@ func envEncryptionKey() ([]byte, error) {
 }
 
 // ============================================================================
-// KEY NORMALIZATION
+// KEY NORMALIZATION - KEEP HERE (used by env_handlers.go)
 // ============================================================================
 
 func normalizeEnvKey(key string) string {
@@ -137,7 +67,7 @@ func normalizeEnvKey(key string) string {
 }
 
 // ============================================================================
-// CATEGORY DETECTION
+// CATEGORY DETECTION - KEEP HERE (used by env_handlers.go)
 // ============================================================================
 
 func getCategoryFromKey(key string) string {
@@ -167,6 +97,10 @@ func getCategoryFromKey(key string) string {
 	}
 }
 
+// ============================================================================
+// SENSITIVE KEY DETECTION - KEEP HERE (used by env_handlers.go)
+// ============================================================================
+
 func isSensitiveKey(key string) bool {
 	sensitiveTerms := []string{
 		"secret", "password", "token", "key", "auth", "credential",
@@ -182,8 +116,11 @@ func isSensitiveKey(key string) bool {
 }
 
 // ============================================================================
-// VALIDATION
+// VALIDATION - KEEP HERE (uses EnvVarValidation from env_handlers.go)
 // ============================================================================
+
+// Note: EnvVarValidation is now in env_handlers.go
+// Use the type from env_handlers.go
 
 func validateEnvVar(key string, value string) EnvVarValidation {
 	validation := EnvVarValidation{
@@ -192,34 +129,43 @@ func validateEnvVar(key string, value string) EnvVarValidation {
 		Valid: true,
 	}
 
-	// Check key format
+	// POSIX env var keys: [A-Z_][A-Z0-9_]* (we also accept lowercase before normalisation)
+	// Dashes are NOT valid POSIX env var characters and cause issues with many shells/tools.
 	if key == "" {
 		validation.Valid = false
 		validation.Errors = append(validation.Errors, "key cannot be empty")
 	} else {
-		// Key should only contain alphanumeric, underscore, and dash
 		validKey := true
-		for _, r := range key {
-			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-				(r >= '0' && r <= '9') || r == '_' || r == '-') {
-				validKey = false
-				break
+		for i, r := range key {
+			isLetter := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_'
+			isDigit := r >= '0' && r <= '9'
+			if i == 0 {
+				// First char must be letter or underscore
+				if !isLetter {
+					validKey = false
+					break
+				}
+			} else {
+				if !isLetter && !isDigit {
+					validKey = false
+					break
+				}
 			}
 		}
 		if !validKey {
 			validation.Valid = false
 			validation.Errors = append(validation.Errors,
-				"key can only contain alphanumeric, underscore, and dash characters")
+				"key must start with a letter or underscore and contain only letters, digits, and underscores (e.g. DATABASE_URL)")
 		}
 	}
 
-	// Check for common sensitive patterns
+	// Check for common sensitive patterns with empty value
 	if isSensitiveKey(key) && value == "" {
 		validation.Warnings = append(validation.Warnings,
 			"sensitive key has empty value")
 	}
 
-	// Check for common misconfigurations
+	// Warn about common misconfigurations
 	if strings.Contains(value, " ") && !strings.Contains(value, "=") {
 		validation.Warnings = append(validation.Warnings,
 			"value contains spaces which might be unintended")
@@ -241,7 +187,7 @@ func validateEnvVar(key string, value string) EnvVarValidation {
 }
 
 // ============================================================================
-// DOCKER HELPER
+// DOCKER HELPER - KEEP HERE (used by deployment_jobs.go)
 // ============================================================================
 
 func loadDockerEnvList(envMap map[string]string) []string {
@@ -316,6 +262,7 @@ func (s *DeploymentStore) UpsertDeploymentEnvVarWithOptions(
 		sensitive = isSensitiveKey(key)
 	}
 
+	// encryptEnvValue is now in db.go
 	encryptedValue, nonce, err := encryptEnvValue(value)
 	if err != nil {
 		return err
@@ -472,6 +419,7 @@ ORDER BY env_key ASC
 		if record.Sensitive && !includeSensitive {
 			record.Value = "***REDACTED***"
 		} else {
+			// decryptEnvValue is now in db.go - DO NOT redeclare
 			value, err := decryptEnvValue(encryptedValue, nonce)
 			if err != nil {
 				return nil, err
@@ -529,6 +477,7 @@ ORDER BY env_key ASC
 		if err := rows.Scan(&key, &encryptedValue, &nonce); err != nil {
 			return nil, fmt.Errorf("scan deployment env var: %w", err)
 		}
+		// decryptEnvValue is now in db.go - DO NOT redeclare
 		value, err := decryptEnvValue(encryptedValue, nonce)
 		if err != nil {
 			return nil, err
@@ -543,73 +492,11 @@ ORDER BY env_key ASC
 }
 
 // ============================================================================
-// DELETE ENVIRONMENT VARIABLE
-// ============================================================================
-
-func (s *DeploymentStore) DeleteDeploymentEnvVar(
-	ctx context.Context,
-	userID string,
-	deploymentID string,
-	key string,
-) error {
-	if s == nil || s.pool == nil {
-		return fmt.Errorf("deployment store is not initialized")
-	}
-
-	userID = strings.TrimSpace(userID)
-	deploymentID = strings.TrimSpace(deploymentID)
-	key = normalizeEnvKey(key)
-	if userID == "" || deploymentID == "" || key == "" {
-		return fmt.Errorf("userID, deploymentID, and key are required")
-	}
-
-	if _, err := s.GetDeploymentForUser(ctx, userID, deploymentID); err != nil {
-		return err
-	}
-
-	// Record history before deletion
-	_ = s.RecordEnvVarHistory(ctx, deploymentID, key, "deleted", userID)
-
-	_, err := s.pool.Exec(ctx, `
-DELETE FROM deployment_env_vars
-WHERE deployment_id = $1 AND env_key = $2
-`, deploymentID, key)
-	if err != nil {
-		return fmt.Errorf("delete deployment env var: %w", err)
-	}
-
-	return nil
-}
-
-// ============================================================================
-// CHECK EXISTS
-// ============================================================================
-
-func (s *DeploymentStore) DeploymentEnvVarExists(
-	ctx context.Context,
-	deploymentID string,
-	key string,
-) (bool, error) {
-	if s == nil || s.pool == nil {
-		return false, fmt.Errorf("deployment store is not initialized")
-	}
-
-	deploymentID = strings.TrimSpace(deploymentID)
-	key = normalizeEnvKey(key)
-	if deploymentID == "" || key == "" {
-		return false, fmt.Errorf("deploymentID and key are required")
-	}
-
-	var exists bool
-	err := s.pool.QueryRow(ctx, `
-SELECT EXISTS(SELECT 1 FROM deployment_env_vars WHERE deployment_id = $1 AND env_key = $2)
-`, deploymentID, key).Scan(&exists)
-	return exists, err
-}
-
-// ============================================================================
 // ENVIRONMENT VARIABLE HISTORY
 // ============================================================================
+
+// Note: EnvVarHistory is now in env_handlers.go
+// Use the type from env_handlers.go
 
 func (s *DeploymentStore) RecordEnvVarHistory(
 	ctx context.Context,
@@ -783,6 +670,9 @@ func (s *DeploymentStore) BulkUpsertEnvVars(
 // ============================================================================
 // EXPORT/IMPORT
 // ============================================================================
+
+// Note: EnvExport is now in env_handlers.go
+// Use the type from env_handlers.go
 
 func (s *DeploymentStore) ExportEnvVars(
 	ctx context.Context,

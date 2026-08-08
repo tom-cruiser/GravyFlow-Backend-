@@ -20,6 +20,8 @@ import (
 
 type projectKind int
 
+type ProjectKind = projectKind
+
 const (
 	projectKindUnknown projectKind = iota
 	projectKindNodeNext
@@ -32,7 +34,12 @@ const (
 	projectKindSolid
 	projectKindAstro
 	projectKindRemix
+	projectKindPython
+	projectKindGo
+	projectKindRust
 )
+
+const projectKindNextJS = projectKindNodeNext
 
 type packageManifest struct {
 	Scripts         map[string]string `json:"scripts"`
@@ -49,26 +56,27 @@ type packageManifest struct {
 }
 
 type BuildOptions struct {
-	Platform      string
-	BuildArgs     map[string]string
-	Labels        map[string]string
-	HealthCheck   bool
-	HealthPath    string
-	Target        string
-	NoCache       bool
-	Push          bool
-	Registry      string
-	Timeout       time.Duration
+	Platform        string
+	BuildArgs       map[string]string
+	Labels          map[string]string
+	HealthCheck     bool
+	HealthPath      string
+	Target          string
+	NoCache         bool
+	Push            bool
+	Registry        string
+	Timeout         time.Duration
+	DisableBuildKit bool
 }
 
 type BuildResult struct {
-	ImageTag    string
-	ImageID     string
-	Size        int64
-	BuildTime   time.Duration
-	Layers      int
-	CacheHit    bool
-	Error       error
+	ImageTag  string
+	ImageID   string
+	Size      int64
+	BuildTime time.Duration
+	Layers    int
+	CacheHit  bool
+	Error     error
 }
 
 // ============================================================================
@@ -76,6 +84,19 @@ type BuildResult struct {
 // ============================================================================
 
 func detectProjectKind(appPath string) projectKind {
+	if _, err := os.Stat(filepath.Join(appPath, "requirements.txt")); err == nil {
+		return projectKindPython
+	}
+	if _, err := os.Stat(filepath.Join(appPath, "pyproject.toml")); err == nil {
+		return projectKindPython
+	}
+	if _, err := os.Stat(filepath.Join(appPath, "go.mod")); err == nil {
+		return projectKindGo
+	}
+	if _, err := os.Stat(filepath.Join(appPath, "Cargo.toml")); err == nil {
+		return projectKindRust
+	}
+
 	manifestPath := filepath.Join(appPath, "package.json")
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
@@ -353,6 +374,12 @@ func projectKindLabel(kind projectKind) string {
 		return "astro"
 	case projectKindRemix:
 		return "remix"
+	case projectKindPython:
+		return "python"
+	case projectKindGo:
+		return "go"
+	case projectKindRust:
+		return "rust"
 	default:
 		return "unknown"
 	}
@@ -376,7 +403,6 @@ func buildNodeDockerImageWithOptions(appPath string, appName string, kind projec
 
 	var dockerfile string
 	var dockerfilePath string
-	var err error
 
 	switch kind {
 	case projectKindNodeNext:
@@ -542,250 +568,57 @@ CMD ["nginx", "-g", "daemon off;"]
 `, nodeVersion, installCmd, nodeVersion, buildCmd)
 }
 
-func reactDockerfile(installCmd string, buildCmd string, pm string, nodeVersion string) string {
-	return fmt.Sprintf(`FROM node:%s AS deps
-WORKDIR /app
-COPY package.json package-lock.json* pnpm-lock.yaml* yarn.lock* bun.lockb* ./
-RUN %s
-
-FROM node:%s AS builder
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
-COPY . .
-RUN %s
-
-FROM nginx:1.27-alpine AS runner
-RUN printf 'server { listen 8080; listen [::]:8080; root /usr/share/nginx/html; index index.html; location / { try_files $uri $uri/ /index.html; } }\n' > /etc/nginx/conf.d/default.conf
-COPY --from=builder /app/build /usr/share/nginx/html
-EXPOSE 8080
-CMD ["nginx", "-g", "daemon off;"]
-`, nodeVersion, installCmd, nodeVersion, buildCmd)
-}
-
-func angularDockerfile(installCmd string, buildCmd string, pm string, nodeVersion string) string {
-	return fmt.Sprintf(`FROM node:%s AS deps
-WORKDIR /app
-COPY package.json package-lock.json* pnpm-lock.yaml* yarn.lock* bun.lockb* ./
-RUN %s
-
-FROM node:%s AS builder
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
-COPY . .
-RUN %s
-
-FROM nginx:1.27-alpine AS runner
-RUN printf 'server { listen 8080; listen [::]:8080; root /usr/share/nginx/html; index index.html; location / { try_files $uri $uri/ /index.html; } }\n' > /etc/nginx/conf.d/default.conf
-COPY --from=builder /app/dist/* /usr/share/nginx/html
-EXPOSE 8080
-CMD ["nginx", "-g", "daemon off;"]
-`, nodeVersion, installCmd, nodeVersion, buildCmd)
-}
-
-func nuxtDockerfile(appPath string, installCmd string, pm string, nodeVersion string) string {
-	startCmd := fmt.Sprintf(`["%s", "start"]`, pm)
-	if pm == "npm" {
-		startCmd = `["npm", "start"]`
-	}
-
-	return fmt.Sprintf(`FROM node:%s AS deps
-WORKDIR /app
-COPY package.json package-lock.json* pnpm-lock.yaml* yarn.lock* bun.lockb* ./
-RUN %s
-
-FROM node:%s AS builder
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
-COPY . .
-RUN npm run build
-
-FROM node:%s AS runner
-WORKDIR /app
-ENV NODE_ENV=production
-ENV PORT=8080
-COPY --from=builder /app/.output ./.output
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/package.json ./package.json
-EXPOSE 8080
-CMD %s
-`, nodeVersion, installCmd, nodeVersion, nodeVersion, startCmd)
-}
-
-func astroDockerfile(installCmd string, buildCmd string, pm string, nodeVersion string) string {
-	return fmt.Sprintf(`FROM node:%s AS deps
-WORKDIR /app
-COPY package.json package-lock.json* pnpm-lock.yaml* yarn.lock* bun.lockb* ./
-RUN %s
-
-FROM node:%s AS builder
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
-COPY . .
-RUN %s
-
-FROM node:%s AS runner
-WORKDIR /app
-ENV NODE_ENV=production
-ENV PORT=8080
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/package.json ./package.json
-EXPOSE 8080
-CMD ["node", "./dist/server/entry.mjs"]
-`, nodeVersion, installCmd, nodeVersion, nodeVersion)
-}
-
-func remixDockerfile(appPath string, installCmd string, pm string, nodeVersion string) string {
-	return fmt.Sprintf(`FROM node:%s AS deps
-WORKDIR /app
-COPY package.json package-lock.json* pnpm-lock.yaml* yarn.lock* bun.lockb* ./
-RUN %s
-
-FROM node:%s AS builder
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
-COPY . .
-RUN npm run build
-
-FROM node:%s AS runner
-WORKDIR /app
-ENV NODE_ENV=production
-ENV PORT=8080
-COPY --from=builder /app/build ./build
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/package.json ./package.json
-COPY --from=builder /app/public ./public
-EXPOSE 8080
-CMD ["npm", "start"]
-`, nodeVersion, installCmd, nodeVersion, nodeVersion)
-}
-
-func svelteDockerfile(installCmd string, buildCmd string, pm string, nodeVersion string) string {
-	return fmt.Sprintf(`FROM node:%s AS deps
-WORKDIR /app
-COPY package.json package-lock.json* pnpm-lock.yaml* yarn.lock* bun.lockb* ./
-RUN %s
-
-FROM node:%s AS builder
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
-COPY . .
-RUN %s
-
-FROM nginx:1.27-alpine AS runner
-RUN printf 'server { listen 8080; listen [::]:8080; root /usr/share/nginx/html; index index.html; location / { try_files $uri $uri/ /index.html; } }\n' > /etc/nginx/conf.d/default.conf
-COPY --from=builder /app/dist /usr/share/nginx/html
-EXPOSE 8080
-CMD ["nginx", "-g", "daemon off;"]
-`, nodeVersion, installCmd, nodeVersion, buildCmd)
-}
-
-func solidDockerfile(installCmd string, buildCmd string, pm string, nodeVersion string) string {
-	return fmt.Sprintf(`FROM node:%s AS deps
-WORKDIR /app
-COPY package.json package-lock.json* pnpm-lock.yaml* yarn.lock* bun.lockb* ./
-RUN %s
-
-FROM node:%s AS builder
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
-COPY . .
-RUN %s
-
-FROM nginx:1.27-alpine AS runner
-RUN printf 'server { listen 8080; listen [::]:8080; root /usr/share/nginx/html; index index.html; location / { try_files $uri $uri/ /index.html; } }\n' > /etc/nginx/conf.d/default.conf
-COPY --from=builder /app/dist /usr/share/nginx/html
-EXPOSE 8080
-CMD ["nginx", "-g", "daemon off;"]
-`, nodeVersion, installCmd, nodeVersion, buildCmd)
-}
-
-// ============================================================================
-// NODE START COMMAND
-// ============================================================================
-
 func nodeStartCommand(appPath string, pm string) string {
-	manifestPath := filepath.Join(appPath, "package.json")
-	data, err := os.ReadFile(manifestPath)
-	if err != nil {
+	if pm == "npm" {
 		return `["npm", "start"]`
 	}
-
-	var manifest packageManifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		return `["npm", "start"]`
-	}
-
-	if _, ok := manifest.Scripts["start"]; ok {
-		switch pm {
-		case "pnpm":
-			return `["pnpm", "start"]`
-		case "yarn":
-			return `["yarn", "start"]`
-		case "bun":
-			return `["bun", "start"]`
-		default:
-			return `["npm", "start"]`
-		}
-	}
-
-	if _, ok := manifest.Scripts["serve"]; ok {
-		switch pm {
-		case "pnpm":
-			return `["pnpm", "run", "serve"]`
-		case "yarn":
-			return `["yarn", "serve"]`
-		case "bun":
-			return `["bun", "run", "serve"]`
-		default:
-			return `["npm", "run", "serve"]`
-		}
-	}
-
-	if main := strings.TrimSpace(manifest.Main); main != "" {
-		return fmt.Sprintf(`["node", %q]`, main)
-	}
-
-	// Check for common entry files
-	entryFiles := []string{"index.js", "server.js", "app.js"}
-	for _, file := range entryFiles {
-		if _, err := os.Stat(filepath.Join(appPath, file)); err == nil {
-			return fmt.Sprintf(`["node", %q]`, file)
-		}
-	}
-
-	return `["npm", "start"]`
+	return fmt.Sprintf(`["%s", "start"]`, pm)
 }
-
-// ============================================================================
-// HEALTH CHECK
-// ============================================================================
 
 func addHealthCheckToDockerfile(dockerfilePath string, healthPath string) error {
-	content, err := os.ReadFile(dockerfilePath)
+	data, err := os.ReadFile(dockerfilePath)
 	if err != nil {
 		return err
 	}
-
-	healthCheck := fmt.Sprintf(`HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD curl -f http://localhost:8080%s || exit 1
-`, healthPath)
-
-	// Insert before EXPOSE or CMD
-	newContent := strings.Replace(string(content), "EXPOSE 8080", healthCheck+"EXPOSE 8080", 1)
-	if newContent == string(content) {
-		// If no EXPOSE, add before CMD
-		newContent = strings.Replace(string(content), "CMD", healthCheck+"CMD", 1)
+	content := string(data)
+	if strings.Contains(content, "HEALTHCHECK") {
+		return nil
 	}
+	healthcheck := fmt.Sprintf("\nHEALTHCHECK CMD curl -f http://localhost:8080%s || exit 1\n", healthPath)
+	return os.WriteFile(dockerfilePath, []byte(content+healthcheck), 0o644)
+}
 
-	return os.WriteFile(dockerfilePath, []byte(newContent), 0o644)
+func nuxtDockerfile(appPath string, installCmd string, pm string, nodeVersion string) string {
+	return nextJSDockerfile(appPath, installCmd, pm, nodeVersion)
+}
+
+func astroDockerfile(installCmd string, buildCmd string, pm string, nodeVersion string) string {
+	return viteDockerfile(installCmd, buildCmd, pm, nodeVersion)
+}
+
+func remixDockerfile(appPath string, installCmd string, pm string, nodeVersion string) string {
+	return nextJSDockerfile(appPath, installCmd, pm, nodeVersion)
+}
+
+func angularDockerfile(installCmd string, buildCmd string, pm string, nodeVersion string) string {
+	return viteDockerfile(installCmd, buildCmd, pm, nodeVersion)
+}
+
+func reactDockerfile(installCmd string, buildCmd string, pm string, nodeVersion string) string {
+	return viteDockerfile(installCmd, buildCmd, pm, nodeVersion)
+}
+
+func svelteDockerfile(installCmd string, buildCmd string, pm string, nodeVersion string) string {
+	return viteDockerfile(installCmd, buildCmd, pm, nodeVersion)
+}
+
+func solidDockerfile(installCmd string, buildCmd string, pm string, nodeVersion string) string {
+	return viteDockerfile(installCmd, buildCmd, pm, nodeVersion)
 }
 
 // ============================================================================
 // DOCKER BUILD
 // ============================================================================
-
-func runDockerBuild(appPath string, appName string, dockerfilePath string) error {
-	return runDockerBuildWithOptions(appPath, appName, dockerfilePath, BuildOptions{})
-}
 
 func runDockerBuildWithOptions(appPath string, appName string, dockerfilePath string, opts BuildOptions) error {
 	if _, err := exec.LookPath("docker"); err != nil {
@@ -827,6 +660,11 @@ func runDockerBuildWithOptions(appPath string, appName string, dockerfilePath st
 	// Add cache-from if image exists
 	if _, err := exec.Command("docker", "image", "inspect", appName).CombinedOutput(); err == nil {
 		args = append(args, "--cache-from", appName)
+	}
+
+	// Disable BuildKit if requested
+	if opts.DisableBuildKit {
+		args = append(args, "--disable-buildkit")
 	}
 
 	// Add path
@@ -931,68 +769,9 @@ func sanitizeFileToken(value string) string {
 	return b.String()
 }
 
-func dockerImageTag(appName string) string {
-	appName = strings.ToLower(strings.TrimSpace(appName))
-	if appName == "" {
-		return "gravyflow-app"
-	}
-	var b strings.Builder
-	for _, r := range appName {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' || r == '/' {
-			b.WriteRune(r)
-		} else {
-			b.WriteRune('-')
-		}
-	}
-	tag := strings.Trim(b.String(), "-./")
-	if tag == "" {
-		return "gravyflow-app"
-	}
-	return tag
-}
-
-// ============================================================================
-// ENVIRONMENT FUNCTIONS (Stubs - Implement based on your needs)
-// ============================================================================
-
-func dockerCommandEnv() []string {
-	return dockerCommandEnvWithBuildKit(true)
-}
-
-func dockerCommandEnvForceLegacyBuilder() []string {
-	return dockerCommandEnvWithBuildKit(false)
-}
-
-func dockerCommandEnvWithBuildKit(enabled bool) []string {
-	env := os.Environ()
-	env = withEnvVar(env, "DOCKER_BUILDKIT", "1")
-	if !enabled {
-		env = withEnvVar(env, "DOCKER_BUILDKIT", "0")
-	}
-	return env
-}
-
-func withEnvVar(env []string, key, value string) []string {
-	prefix := key + "="
-	out := make([]string, 0, len(env)+1)
-	for _, entry := range env {
-		if strings.HasPrefix(entry, prefix) {
-			continue
-		}
-		out = append(out, entry)
-	}
-	out = append(out, prefix+value)
-	return out
-}
-
-func isBuildKitMissingError(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "buildkit") &&
-		(strings.Contains(s, "buildx") || strings.Contains(s, "buildkit is enabled"))
-}
+// Note: dockerImageTag is now in build.go - DO NOT redeclare here
+// Note: dockerCommandEnv, dockerCommandEnvForceLegacyBuilder, isBuildKitMissingError, withEnvVar
+// are now in docker_env.go - DO NOT redeclare here
 
 // ============================================================================
 // USAGE EXAMPLES

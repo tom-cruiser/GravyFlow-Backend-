@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -178,11 +177,9 @@ func deployLogStreamHandler(c *gin.Context) {
 	// Get initial state
 	lastLineCount := 0
 	lastStatus := ""
-	var lastLines []deployLogLine
 	
 	// Send initial state
 	initialLines := formatDeployLogLinesEnhanced(deployment.StatusMessage, "deployment")
-	lastLines = initialLines
 	lastLineCount = len(initialLines)
 	lastStatus = deployment.Status
 	
@@ -248,7 +245,6 @@ func deployLogStreamHandler(c *gin.Context) {
 
 				lastLineCount = len(currentLines)
 				lastStatus = updatedDeployment.Status
-				lastLines = currentLines
 			}
 
 			// Send heartbeat to keep connection alive

@@ -91,51 +91,6 @@ type ResourceUpdate struct {
 }
 
 // ============================================================================
-// ENSURE RESOURCE ACCOUNTING
-// ============================================================================
-
-func (s *DeploymentStore) EnsureResourceAccounting(ctx context.Context, userID string) error {
-	if s == nil || s.pool == nil {
-		return fmt.Errorf("deployment store is not initialized")
-	}
-
-	userID = strings.TrimSpace(userID)
-	if userID == "" {
-		return fmt.Errorf("userID is required")
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, quotaCheckTimeout)
-	defer cancel()
-
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return fmt.Errorf("begin resource accounting transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	if _, err := tx.Exec(ctx, `
-INSERT INTO quotas (user_id, max_cpu, max_memory_mb, max_apps, max_storage_mb)
-VALUES ($1, $2, $3, $4, $5)
-ON CONFLICT (user_id) DO NOTHING
-`, userID, defaultMaxCPU, defaultMaxMemoryMB, defaultMaxApps, defaultMaxStorageMB); err != nil {
-		return fmt.Errorf("ensure quotas row: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `
-INSERT INTO resource_usage (user_id, current_cpu, current_memory_mb, current_apps, current_storage_mb)
-VALUES ($1, 0, 0, 0, 0)
-ON CONFLICT (user_id) DO NOTHING
-`, userID); err != nil {
-		return fmt.Errorf("ensure resource usage row: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit resource accounting transaction: %w", err)
-	}
-
-	return nil
-}
-
-// ============================================================================
 // QUOTA MANAGEMENT
 // ============================================================================
 
@@ -809,13 +764,6 @@ func estimateStorageUsageMB(path string) (int64, error) {
 
 	const bytesPerMB = 1024 * 1024
 	return (totalBytes + bytesPerMB - 1) / bytesPerMB, nil
-}
-
-func isRemoteRepoSource(path string) bool {
-	return strings.HasPrefix(path, "http://") ||
-		strings.HasPrefix(path, "https://") ||
-		strings.HasPrefix(path, "git@") ||
-		strings.HasPrefix(path, "ssh://")
 }
 
 // ============================================================================

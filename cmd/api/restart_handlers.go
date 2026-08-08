@@ -1,9 +1,9 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -25,23 +25,23 @@ const (
 // ============================================================================
 
 type RestartRequest struct {
-	Reason   string `json:"reason,omitempty"`
-	Force    bool   `json:"force,omitempty"`
-	WaitForReady bool `json:"waitForReady,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	Force        bool   `json:"force,omitempty"`
+	WaitForReady bool   `json:"waitForReady,omitempty"`
 }
 
 type RestartResponse struct {
-	Message      string    `json:"message"`
-	DeploymentID string    `json:"deploymentId"`
-	JobID        string    `json:"jobId"`
-	Status       string    `json:"status"`
-	RequestedAt  time.Time `json:"requestedAt"`
+	Message       string        `json:"message"`
+	DeploymentID  string        `json:"deploymentId"`
+	JobID         string        `json:"jobId"`
+	Status        string        `json:"status"`
+	RequestedAt   time.Time     `json:"requestedAt"`
 	EstimatedWait time.Duration `json:"estimatedWait,omitempty"`
 }
 
 type RestartCooldown struct {
-	LastRestartAt time.Time `json:"lastRestartAt"`
-	NextAllowedAt time.Time `json:"nextAllowedAt"`
+	LastRestartAt time.Time     `json:"lastRestartAt"`
+	NextAllowedAt time.Time     `json:"nextAllowedAt"`
 	Remaining     time.Duration `json:"remaining"`
 	Allowed       bool          `json:"allowed"`
 }
@@ -96,10 +96,10 @@ func restartAppHandler(c *gin.Context) {
 
 	if !cooldown.Allowed && !req.Force {
 		c.JSON(http.StatusTooManyRequests, gin.H{
-			"error":     "restart_rate_limit_exceeded",
-			"message":   "Please wait before requesting another restart",
-			"cooldown":  cooldown,
-			"retry_after": int(cooldown.Remaining.Seconds()),
+			"error":        "restart_rate_limit_exceeded",
+			"message":      "Please wait before requesting another restart",
+			"cooldown":     cooldown,
+			"retry_after":  int(cooldown.Remaining.Seconds()),
 		})
 		return
 	}
@@ -231,7 +231,6 @@ func validateDeploymentForRestart(deployment DeploymentRecord) error {
 func checkRestartCooldown(ctx context.Context, deploymentID string) (RestartCooldown, error) {
 	// Get last restart time from Redis or database
 	var lastRestart time.Time
-	var allowed bool
 
 	// Check if we have a last restart record
 	if deploymentStore != nil {
@@ -300,7 +299,7 @@ func checkResourceAvailability(ctx context.Context, userID string, deployment De
 	if summary.Available.MaxCPU < neededCPU {
 		return fmt.Errorf("insufficient CPU: available %.2f, needed %.2f", summary.Available.MaxCPU, neededCPU)
 	}
-	if summary.Available.MaxMemoryMB < neededMemory {
+	if summary.Available.MaxMemoryMB < int64(neededMemory) {
 		return fmt.Errorf("insufficient memory: available %d MB, needed %d MB", summary.Available.MaxMemoryMB, neededMemory)
 	}
 
@@ -444,7 +443,7 @@ func (m *DeploymentJobManager) ListPendingJobs(ctx context.Context, deploymentID
 	iter := m.redisClient.Scan(ctx, 0, pattern, 0).Iterator()
 	
 	for iter.Next(ctx) {
-		key := iter.Val()
+		_ = iter.Val()
 		// Check if this job is for this deployment
 		// This would need to parse the job status
 		// Simplified for example

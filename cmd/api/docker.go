@@ -9,6 +9,7 @@ import (
     "log"
     "math"
     "sort"
+    "strconv"
     "strings"
     "time"
 
@@ -16,6 +17,7 @@ import (
     "github.com/docker/docker/api/types/container"
     "github.com/docker/docker/api/types/filters"
     "github.com/docker/docker/api/types/image"
+    "github.com/docker/docker/api/types/events"
     "github.com/docker/docker/api/types/network"
     "github.com/docker/docker/api/types/volume"
     "github.com/docker/docker/client"
@@ -96,6 +98,65 @@ type BackupConfig struct {
 
 type ImageManager struct {
     client *client.Client
+}
+
+const (
+    managedByLabelKey   = "gravyflow.managed-by"
+    managedByLabelValue = "gravyflow"
+)
+
+type ConflictError struct {
+    Resource string
+    Value    string
+}
+
+func (e *ConflictError) Error() string {
+    return fmt.Sprintf("%s %q already exists", e.Resource, e.Value)
+}
+
+func parsePortMap(portMap string) (string, string, error) {
+    portMap = strings.TrimSpace(portMap)
+    if portMap == "" {
+        return "", "", fmt.Errorf("portMap is required")
+    }
+
+    parts := strings.Split(portMap, ":")
+    switch len(parts) {
+    case 1:
+        port := strings.TrimSpace(strings.TrimSuffix(parts[0], "/tcp"))
+        if _, err := strconv.Atoi(port); err != nil {
+            return "", "", fmt.Errorf("invalid port map %q", portMap)
+        }
+        return port, port, nil
+    case 2:
+        hostPort := strings.TrimSpace(strings.TrimSuffix(parts[0], "/tcp"))
+        containerPort := strings.TrimSpace(strings.TrimSuffix(parts[1], "/tcp"))
+        if _, err := strconv.Atoi(hostPort); err != nil {
+            return "", "", fmt.Errorf("invalid host port in %q", portMap)
+        }
+        if _, err := strconv.Atoi(containerPort); err != nil {
+            return "", "", fmt.Errorf("invalid container port in %q", portMap)
+        }
+        return hostPort, containerPort, nil
+    default:
+        return "", "", fmt.Errorf("invalid port map %q", portMap)
+    }
+}
+
+func normalizePortMap(portMap string) string {
+    portMap = strings.TrimSpace(portMap)
+    if portMap == "" {
+        return ""
+    }
+
+    hostPort, containerPort, err := parsePortMap(portMap)
+    if err != nil {
+        return portMap
+    }
+    if hostPort == "" || hostPort == containerPort {
+        return containerPort
+    }
+    return hostPort + ":" + containerPort
 }
 
 // ============================================================================
@@ -225,6 +286,80 @@ func CreateAndStartContainerWithHealthCheck(
     return resp.ID, nil
 }
 
+func CreateAndStartContainer(
+    imageName string,
+    containerName string,
+    deploymentID string,
+    portMap string,
+    envVars []string,
+    memoryMB int64,
+    cpus float64,
+) (string, error) {
+    return CreateAndStartContainerWithHealthCheck(imageName, containerName, deploymentID, portMap, envVars, memoryMB, cpus, HealthCheckConfig{})
+}
+
+func StopAndRemoveContainer(containerID string) error {
+    containerID = strings.TrimSpace(containerID)
+    if containerID == "" {
+        return fmt.Errorf("containerID is required")
+    }
+
+    dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+    if err != nil {
+        return fmt.Errorf("create docker client: %w", err)
+    }
+    defer dockerClient.Close()
+
+    ctx := context.Background()
+    if err := dockerClient.ContainerStop(ctx, containerID, container.StopOptions{}); err != nil {
+        if !strings.Contains(strings.ToLower(err.Error()), "not running") {
+            return fmt.Errorf("stop container %q: %w", containerID, err)
+        }
+    }
+
+    if err := dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); err != nil {
+        return fmt.Errorf("remove container %q: %w", containerID, err)
+    }
+
+    return nil
+}
+
+func RestartContainer(
+    containerID string,
+    imageName string,
+    containerName string,
+    deploymentID string,
+    portMap string,
+    envVars []string,
+    memoryMB int64,
+    cpus float64,
+) (string, error) {
+    if err := StopAndRemoveContainer(containerID); err != nil {
+        return "", err
+    }
+    return CreateAndStartContainer(imageName, containerName, deploymentID, portMap, envVars, memoryMB, cpus)
+}
+
+func removeContainerByName(ctx context.Context, dockerClient *client.Client, containerName string) error {
+    containerName = strings.TrimSpace(containerName)
+    if containerName == "" {
+        return nil
+    }
+
+    containers, err := dockerClient.ContainerList(ctx, container.ListOptions{All: true, Filters: filters.NewArgs(filters.Arg("name", containerName))})
+    if err != nil {
+        return fmt.Errorf("list containers by name %q: %w", containerName, err)
+    }
+
+    for _, c := range containers {
+        if err := dockerClient.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true}); err != nil {
+            return fmt.Errorf("remove container %q: %w", containerName, err)
+        }
+    }
+
+    return nil
+}
+
 // ============================================================================
 // CONTAINER LOGGING
 // ============================================================================
@@ -278,7 +413,7 @@ func GetContainerStats(ctx context.Context, containerID string) (*ContainerStats
     }
     defer stats.Body.Close()
 
-    var v types.StatsJSON
+    var v container.StatsResponse
     if err := json.NewDecoder(stats.Body).Decode(&v); err != nil {
         return nil, fmt.Errorf("decode stats: %w", err)
     }
@@ -295,16 +430,24 @@ func GetContainerStats(ctx context.Context, containerID string) (*ContainerStats
     memoryUsage := float64(v.MemoryStats.Usage)
     memoryLimit := float64(v.MemoryStats.Limit)
 
+    var networkIn uint64
+    var networkOut uint64
+    for _, networkStats := range v.Networks {
+        networkIn = networkStats.RxBytes
+        networkOut = networkStats.TxBytes
+        break
+    }
+
     return &ContainerStats{
         ContainerID: containerID,
         CPUUsage:    cpuPercent,
         MemoryUsage: memoryUsage,
         MemoryLimit: memoryLimit,
-        NetworkIn:   v.Networks.EthRxBytes,
-        NetworkOut:  v.Networks.EthTxBytes,
-        BlockRead:   v.BlkioStats.IoServiceBytesRecursive[0].Value,
-        BlockWrite:  v.BlkioStats.IoServiceBytesRecursive[1].Value,
-        PIDs:        v.PidsStats.Current,
+        NetworkIn:   int64(networkIn),
+        NetworkOut:  int64(networkOut),
+        BlockRead:   int64(v.BlkioStats.IoServiceBytesRecursive[0].Value),
+        BlockWrite:  int64(v.BlkioStats.IoServiceBytesRecursive[1].Value),
+        PIDs:        int(v.PidsStats.Current),
         Timestamp:   time.Now(),
     }, nil
 }
@@ -320,7 +463,7 @@ func EnsureNetwork(ctx context.Context, config NetworkConfig) (string, error) {
     }
     defer dockerClient.Close()
 
-    networks, err := dockerClient.NetworkList(ctx, types.NetworkListOptions{
+    networks, err := dockerClient.NetworkList(ctx, network.ListOptions{
         Filters: filters.NewArgs(filters.Arg("name", config.Name)),
     })
     if err != nil {
@@ -331,7 +474,7 @@ func EnsureNetwork(ctx context.Context, config NetworkConfig) (string, error) {
         return networks[0].ID, nil
     }
 
-    createOpts := types.NetworkCreate{
+    createOpts := network.CreateOptions{
         Driver: config.Driver,
         Options: map[string]string{},
         Labels: config.Labels,
@@ -450,7 +593,7 @@ func (im *ImageManager) PruneImages(ctx context.Context, keepLatest int) error {
         }
     }
 
-    for repo, imgs := range imageMap {
+    for _, imgs := range imageMap {
         if len(imgs) <= keepLatest {
             continue
         }
@@ -482,7 +625,7 @@ func MonitorContainerEvents(ctx context.Context, handler EventHandler) error {
     }
     defer dockerClient.Close()
 
-    events, errs := dockerClient.Events(ctx, types.EventsOptions{
+    eventStream, errs := dockerClient.Events(ctx, events.ListOptions{
         Filters: filters.NewArgs(
             filters.Arg("type", "container"),
             filters.Arg("label", managedByLabelKey+"="+managedByLabelValue),
@@ -495,10 +638,10 @@ func MonitorContainerEvents(ctx context.Context, handler EventHandler) error {
             return ctx.Err()
         case err := <-errs:
             return fmt.Errorf("events error: %w", err)
-        case event := <-events:
+        case event := <-eventStream:
             containerEvent := ContainerEvent{
-                Type:       event.Type,
-                Action:     event.Action,
+                Type:       string(event.Type),
+                Action:     string(event.Action),
                 ActorID:    event.Actor.ID,
                 Attributes: event.Actor.Attributes,
                 Timestamp:  time.Unix(event.Time, 0),

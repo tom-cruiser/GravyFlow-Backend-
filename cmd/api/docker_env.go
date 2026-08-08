@@ -353,7 +353,7 @@ func dockerCommandEnvForceLegacyBuilder() []string {
 
 func dockerCommandEnvWithConfig(config BuildKitConfig) []string {
 	env := withDockerBuildKit(os.Environ(), config.Enabled)
-	
+
 	// Add additional environment variables based on config
 	if config.CacheDir != "" {
 		env = withEnvVar(env, "BUILDKIT_CACHE_DIR", config.CacheDir)
@@ -364,7 +364,7 @@ func dockerCommandEnvWithConfig(config BuildKitConfig) []string {
 	if config.Insecure {
 		env = withEnvVar(env, "BUILDKIT_INSECURE", "1")
 	}
-	
+
 	logDockerEnvironment(env)
 	return env
 }
@@ -377,10 +377,10 @@ func logDockerEnvironment(env []string) {
 	if os.Getenv("GRAVYFLOW_DEBUG") != "1" {
 		return
 	}
-	
+
 	var logBuilder strings.Builder
 	logBuilder.WriteString("[DOCKER] Environment variables:\n")
-	
+
 	importantVars := []string{
 		"DOCKER_BUILDKIT",
 		"COMPOSE_DOCKER_CLI_BUILD",
@@ -391,7 +391,7 @@ func logDockerEnvironment(env []string) {
 		"BUILDKIT_MAX_PARALLELISM",
 		"BUILDKIT_INSECURE",
 	}
-	
+
 	for _, key := range importantVars {
 		for _, entry := range env {
 			if strings.HasPrefix(entry, key+"=") {
@@ -400,7 +400,7 @@ func logDockerEnvironment(env []string) {
 			}
 		}
 	}
-	
+
 	log.Print(logBuilder.String())
 }
 
@@ -418,6 +418,26 @@ func isBuildKitIncompatibleError(err error) bool {
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "buildkit") &&
 		(strings.Contains(s, "incompatible") || strings.Contains(s, "unsupported"))
+}
+
+func countEnv(env []string, key string) int {
+	prefix := key + "="
+	count := 0
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			count++
+		}
+	}
+	return count
+}
+
+func containsEnv(env []string, value string) bool {
+	for _, entry := range env {
+		if entry == value {
+			return true
+		}
+	}
+	return false
 }
 
 // ============================================================================
@@ -475,7 +495,7 @@ func init() {
 			log.Printf("[BUILDKIT] Not available")
 		}
 	}
-	
+
 	// Validate Docker environment
 	validation := validateDockerEnvironment()
 	if !validation.Valid {

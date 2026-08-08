@@ -991,7 +991,7 @@ func streamDeploymentHealthHandler(c *gin.Context) {
 }
 
 func setHealthAlertHandler(c *gin.Context) {
-	user, deployment, ok := currentUserDeployment(c)
+	_, deployment, ok := currentUserDeployment(c)
 	if !ok {
 		return
 	}

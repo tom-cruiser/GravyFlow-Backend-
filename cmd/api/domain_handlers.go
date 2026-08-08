@@ -4,6 +4,7 @@ import (
     "context"
     "crypto/tls"
     "fmt"
+    "log"
     "net"
     "net/http"
     "strconv"
@@ -66,6 +67,14 @@ func listAppDomainsHandler(c *gin.Context) {
         c.Request.Context(), user.ID, deployment.DeploymentID,
     )
     if err != nil {
+        lowerErr := strings.ToLower(err.Error())
+        if strings.Contains(lowerErr, "not found") || strings.Contains(lowerErr, "deployment store is not initialized") {
+            c.JSON(http.StatusNotFound, gin.H{
+                "error":   "deployment_not_found",
+                "details": err.Error(),
+            })
+            return
+        }
         c.JSON(http.StatusInternalServerError, gin.H{
             "error":   "failed_to_list_domains",
             "details": err.Error(),
@@ -73,26 +82,9 @@ func listAppDomainsHandler(c *gin.Context) {
         return
     }
 
-    // Add health status for each domain if verified
-    domainList := make([]map[string]interface{}, 0, len(domains))
-    for _, domain := range domains {
-        domainInfo := map[string]interface{}{
-            "domain": domain,
-        }
-
-        if domain.Status == "verified" {
-            health, err := checkDomainHealthQuick(domain.CustomDomain)
-            if err == nil {
-                domainInfo["health"] = health
-            }
-        }
-
-        domainList = append(domainList, domainInfo)
-    }
-
     c.JSON(http.StatusOK, gin.H{
-        "domains": domainList,
-        "count":   len(domainList),
+        "domains": domains,
+        "count":   len(domains),
     })
 }
 
@@ -124,7 +116,7 @@ func addAppDomainHandler(c *gin.Context) {
     }
 
     record, err := deploymentStore.UpsertDeploymentDomain(
-        c.Request.Context(), user.ID, deployment.DeploymentID, req.CustomDomain,
+        c.Request.Context(), user.ID, deployment.DeploymentID, req.CustomDomain, nil,
     )
     if err != nil {
         if strings.Contains(strings.ToLower(err.Error()), "already attached to another deployment") {
@@ -310,7 +302,7 @@ func bulkAddAppDomainsHandler(c *gin.Context) {
         }
 
         record, err := deploymentStore.UpsertDeploymentDomain(
-            c.Request.Context(), user.ID, deployment.DeploymentID, domain,
+            c.Request.Context(), user.ID, deployment.DeploymentID, domain, nil,
         )
         if err != nil {
             results = append(results, map[string]interface{}{
@@ -367,11 +359,11 @@ func domainVerificationStatusHandler(c *gin.Context) {
     // Check verification status
     status := map[string]interface{}{
         "domain":   record.CustomDomain,
-        "status":   record.Status,
-        "verified": record.Status == "verified",
+        "status":   map[bool]string{true: "verified", false: "pending"}[record.Verified],
+        "verified": record.Verified,
     }
 
-    if record.Status == "pending" {
+    if !record.Verified {
         // Check if DNS record exists
         exists, err := checkDNSRecord(customDomain, record.VerificationToken)
         if err == nil && exists {
@@ -388,7 +380,7 @@ func domainVerificationStatusHandler(c *gin.Context) {
         }
     }
 
-    if record.Status == "verified" {
+    if record.Verified {
         status["verifiedAt"] = record.VerifiedAt
         // Get health info
         health, err := checkDomainHealthQuick(customDomain)
@@ -421,7 +413,7 @@ func checkDomainHealthHandler(c *gin.Context) {
         return
     }
 
-    if record.Status != "verified" {
+    if !record.Verified {
         c.JSON(http.StatusBadRequest, gin.H{
             "error":  "domain_not_verified",
             "status": "pending",
@@ -514,7 +506,7 @@ func addDomainRedirectHandler(c *gin.Context) {
         return
     }
 
-    if fromRecord.Status != "verified" || toRecord.Status != "verified" {
+    if !fromRecord.Verified || !toRecord.Verified {
         c.JSON(http.StatusBadRequest, gin.H{
             "error": "both domains must be verified",
         })
@@ -601,7 +593,6 @@ func autoVerifyDomain(ctx context.Context, domain string, token string, config V
 func checkSSLCertificate(domain string) (SSLInfo, error) {
     conn, err := tls.Dial("tcp", fmt.Sprintf("%s:443", domain), &tls.Config{
         InsecureSkipVerify: true,
-        Timeout:            5 * time.Second,
     })
     if err != nil {
         return SSLInfo{}, err
@@ -641,10 +632,6 @@ func checkDomainHealthQuick(domain string) (map[string]interface{}, error) {
 
 func verifyTXTChallengeName(domain string) string {
     return fmt.Sprintf("_acme-challenge.%s", domain)
-}
-
-func normalizeCustomDomain(domain string) string {
-    return strings.ToLower(strings.TrimSpace(domain))
 }
 
 // ============================================================================

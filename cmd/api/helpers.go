@@ -17,6 +17,7 @@ import (
 
 const (
 	MinDiskSpaceGB = 1
+	minDiskSpaceGB = MinDiskSpaceGB
 )
 
 // ============================================================================
@@ -96,6 +97,17 @@ func isRetryableError(err error) bool {
 	return false
 }
 
+func isBuildKitMissingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "buildkit") || strings.Contains(s, "buildx")
+}
+
+func allocatePortMap(port string) string {
+	return normalizePortMap(port)
+}
 // ============================================================================
 // EXAMPLE USAGE (Removed - this should be in a separate test file)
 // ============================================================================

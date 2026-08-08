@@ -6,8 +6,6 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -20,8 +18,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // ============================================================================
@@ -150,6 +148,16 @@ type StoreError struct {
 	Code    string
 	Message string
 	Err     error
+}
+
+func (e *StoreError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Err != nil {
+		return fmt.Sprintf("%s: %s: %v", e.Type, e.Message, e.Err)
+	}
+	return fmt.Sprintf("%s: %s", e.Type, e.Message)
 }
 
 type PoolStats struct {
@@ -284,6 +292,10 @@ func NewDeploymentStore(ctx context.Context) (*DeploymentStore, error) {
 	}
 
 	return store, nil
+}
+
+func newDeploymentStore(ctx context.Context) (*DeploymentStore, error) {
+	return NewDeploymentStore(ctx)
 }
 
 func InitDeploymentStore(ctx context.Context) error {
@@ -469,7 +481,7 @@ func (l *QueryLogger) QueryRow(ctx context.Context, sql string, args ...interfac
 	return row
 }
 
-func (l *QueryLogger) Exec(ctx context.Context, sql string, args ...interface{}) (pgx.CommandTag, error) {
+func (l *QueryLogger) Exec(ctx context.Context, sql string, args ...interface{}) (pgconn.CommandTag, error) {
 	if !l.enabled {
 		return l.pool.Exec(ctx, sql, args...)
 	}
@@ -911,6 +923,7 @@ func (s *DeploymentStore) EnsureResourceAccounting(ctx context.Context, userID s
 		}
 	}
 
+	// 1. Ensure user_resource_accounting table entry
 	_, err := s.pool.Exec(ctx, `
 INSERT INTO user_resource_accounting (user_id, deployment_limit, api_key_limit, storage_limit)
 VALUES ($1, 10, 50, 1073741824) -- 10 deployments, 50 API keys, 1GB storage
@@ -924,8 +937,37 @@ ON CONFLICT (user_id) DO NOTHING
 		}
 	}
 
+	// 2. Ensure quotas table entry
+	_, err = s.pool.Exec(ctx, `
+INSERT INTO quotas (user_id)
+VALUES ($1)
+ON CONFLICT (user_id) DO NOTHING
+`, userID)
+	if err != nil {
+		return &StoreError{
+			Type:    ErrDatabase,
+			Message: "failed to ensure default user quota",
+			Err:     err,
+		}
+	}
+
+	// 3. Ensure resource_usage table entry
+	_, err = s.pool.Exec(ctx, `
+INSERT INTO resource_usage (user_id)
+VALUES ($1)
+ON CONFLICT (user_id) DO NOTHING
+`, userID)
+	if err != nil {
+		return &StoreError{
+			Type:    ErrDatabase,
+			Message: "failed to ensure default resource usage tracking",
+			Err:     err,
+		}
+	}
+
 	return nil
 }
+
 
 func (s *DeploymentStore) GetUserResourceLimits(ctx context.Context, userID string) (map[string]interface{}, error) {
 	var deploymentLimit, apiKeyLimit, storageLimit int64
@@ -1663,11 +1705,15 @@ WHERE d.owner_user_id = $1 AND d.id = $2 AND d.deleted_at IS NULL
 }
 
 func (s *DeploymentStore) ListDeploymentsForUser(ctx context.Context, userID string) ([]DeploymentRecord, error) {
-	return s.ListDeploymentsForUserWithPagination(ctx, userID, Pagination{
+	result, err := s.ListDeploymentsForUserWithPagination(ctx, userID, Pagination{
 		Limit:  100,
 		Offset: 0,
 		Order:  "created_at DESC",
 	})
+	if err != nil {
+		return nil, err
+	}
+	return result.Items, nil
 }
 
 func (s *DeploymentStore) ListDeploymentsForUserWithPagination(ctx context.Context, userID string, pagination Pagination) (PaginatedResult, error) {
@@ -2526,17 +2572,12 @@ func (s *DeploymentStore) GetPoolStats() PoolStats {
 	return PoolStats{
 		TotalConnections:   stat.TotalConns(),
 		IdleConnections:    stat.IdleConns(),
-		ActiveConnections:  stat.AcquireCount() - stat.IdleConns(),
+		ActiveConnections:  int32(stat.AcquiredConns()),
 		MaxConnections:     stat.MaxConns(),
 		AcquireCount:       stat.AcquireCount(),
-		HitCount:           stat.HitCount(),
-		MissCount:          stat.MissCount(),
-		TimeoutCount:       stat.TimeoutCount(),
-		TotalConns:         stat.TotalConns(),
 		NewConnsCount:      stat.NewConnsCount(),
-		DestroyCount:       stat.DestroyCount(),
 		MaxLifetimeDestroy: stat.MaxLifetimeDestroyCount(),
-		IdleDestroyCount:   stat.IdleDestroyCount(),
+		IdleDestroyCount:   stat.MaxIdleDestroyCount(),
 	}
 }
 
@@ -2713,13 +2754,21 @@ func (s *DeploymentStore) validateDeploymentInput(ownerUserID, appName, repoURL,
 // Note: hashToken, generateRandomToken, encryptEnvValue, decryptEnvValue,
 // slugifyName, and error helpers are now in helpers.go
 
-func encryptEnvValue(value string) ([]byte, []byte, error) {
-	// In production, use a proper encryption key from environment
-	key := []byte(os.Getenv("ENV_ENCRYPTION_KEY"))
-	if len(key) == 0 {
-		// Fallback to a derived key (not secure for production)
-		key = sha256.Sum256([]byte("default-encryption-key-change-me"))
+// envAESKey derives a valid 32-byte AES-256 key from the configured secret.
+// AES requires exactly 16, 24, or 32 bytes — using the raw env value directly
+// breaks if it isn't one of those lengths. We always SHA-256 hash it so the
+// output is always exactly 32 bytes regardless of the input length.
+func envAESKey() []byte {
+	raw := strings.TrimSpace(os.Getenv("ENV_ENCRYPTION_KEY"))
+	if raw == "" {
+		raw = "default-encryption-key-change-me"
 	}
+	sum := sha256.Sum256([]byte(raw))
+	return sum[:]
+}
+
+func encryptEnvValue(value string) ([]byte, []byte, error) {
+	key := envAESKey()
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -2741,11 +2790,7 @@ func encryptEnvValue(value string) ([]byte, []byte, error) {
 }
 
 func decryptEnvValue(encryptedValue []byte, nonce []byte) (string, error) {
-	key := []byte(os.Getenv("ENV_ENCRYPTION_KEY"))
-	if len(key) == 0 {
-		// Fallback to a derived key (not secure for production)
-		key = sha256.Sum256([]byte("default-encryption-key-change-me"))
-	}
+	key := envAESKey()
 
 	block, err := aes.NewCipher(key)
 	if err != nil {

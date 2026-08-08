@@ -20,19 +20,11 @@ import (
 )
 
 // ============================================================================
-// CONSTANTS
+// CONSTANTS - REMOVED (now in resources.go)
 // ============================================================================
 
-const (
-	deploymentJobTaskType   = "deployment:execute"
-	deploymentJobQueueName  = "deployments"
-	deploymentJobStatusKey  = "deployment:job:%s"
-	deploymentJobChannelKey = "deployment:job:%s:events"
-	
-	defaultDeployCPU      = 1.0
-	defaultDeployMemoryMB = 1024
-	defaultDeployApps     = 1
-)
+// Note: defaultDeployCPU, defaultDeployMemoryMB, defaultDeployApps
+// are now in resources.go - DO NOT redeclare here
 
 // ============================================================================
 // TYPES
@@ -159,6 +151,7 @@ type JobNotification struct {
 
 type DeploymentJobManager struct {
 	redisClient *redis.Client
+	redisOpt    asynq.RedisClientOpt
 	asynqClient *asynq.Client
 	asynqServer *asynq.Server
 	config      JobConfig
@@ -166,12 +159,17 @@ type DeploymentJobManager struct {
 	mu          sync.RWMutex
 }
 
+const (
+	deploymentJobQueueName  = "deployment-jobs"
+	deploymentJobTaskType   = "deployment:job"
+	deploymentJobStatusKey  = "deployment:job:%s:status"
+	deploymentJobChannelKey = "deployment:job:%s:channel"
+)
+
 // Note: deploymentJobs is now in globals.go
 // var deploymentJobs *DeploymentJobManager
 
-var logsWebsocketUpgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
+// Note: logsWebsocketUpgrader is now in logs.go - DO NOT redeclare here
 
 // ============================================================================
 // INITIALIZATION
@@ -191,7 +189,7 @@ func NewDeploymentJobManager(config JobConfig) (*DeploymentJobManager, error) {
 	})
 
 	asynqClient := asynq.NewClient(redisOpt)
-	
+
 	concurrency := intFromEnvOrDefault("ASYNQ_CONCURRENCY", 1)
 	asynqServer := asynq.NewServer(redisOpt, asynq.Config{
 		Concurrency: concurrency,
@@ -215,10 +213,22 @@ func NewDeploymentJobManager(config JobConfig) (*DeploymentJobManager, error) {
 
 	return &DeploymentJobManager{
 		redisClient: redisClient,
+		redisOpt:    redisOpt,
 		asynqClient: asynqClient,
 		asynqServer: asynqServer,
 		config:      config,
 	}, nil
+}
+
+func newDeploymentJobManager() (*DeploymentJobManager, error) {
+	config := JobConfig{
+		Timeout:          30 * time.Minute,
+		MaxRetries:       0,
+		RetryDelay:       5 * time.Second,
+		GracefulShutdown: 10 * time.Second,
+		Priority:         PriorityNormal,
+	}
+	return NewDeploymentJobManager(config)
 }
 
 func (m *DeploymentJobManager) Close() {
@@ -319,17 +329,17 @@ func (m *DeploymentJobManager) EnqueueDeploymentWithConfig(
 	}
 
 	task := asynq.NewTask(deploymentJobTaskType, payloadBytes)
-	
+
 	opts := []asynq.Option{
 		asynq.Queue(deploymentJobQueueName),
 		asynq.TaskID(jobID),
 		asynq.MaxRetry(config.MaxRetries),
 	}
-	
+
 	if config.Timeout > 0 {
 		opts = append(opts, asynq.ProcessAt(time.Now().Add(config.Timeout)))
 	}
-	
+
 	info, err := m.asynqClient.EnqueueContext(ctx, task, opts...)
 	if err != nil {
 		_ = m.redisClient.Del(ctx, m.statusKey(jobID)).Err()
@@ -402,7 +412,7 @@ func (m *DeploymentJobManager) CancelJob(ctx context.Context, jobID string, user
 	status.Stage = "cancelled"
 	status.Message = "Job cancelled by user"
 	status.Progress = 100
-	
+
 	now := time.Now().UTC()
 	status.CompletedAt = &now
 
@@ -411,7 +421,7 @@ func (m *DeploymentJobManager) CancelJob(ctx context.Context, jobID string, user
 	}
 
 	// Remove from queue
-	inspector := asynq.NewInspector(*m.asynqClient)
+	inspector := asynq.NewInspector(m.redisOpt)
 	if err := inspector.DeleteTask(deploymentJobQueueName, jobID); err != nil {
 		log.Printf("Failed to delete task from queue: %v", err)
 	}
@@ -463,7 +473,7 @@ func (m *DeploymentJobManager) saveStatus(ctx context.Context, status Deployment
 	pipe := m.redisClient.Pipeline()
 	pipe.Set(ctx, m.statusKey(status.JobID), data, 0)
 	pipe.Publish(ctx, m.channelKey(status.JobID), data)
-	
+
 	_, err = pipe.Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("save and publish job status: %w", err)
@@ -478,17 +488,17 @@ func (m *DeploymentJobManager) saveStatus(ctx context.Context, status Deployment
 
 func (m *DeploymentJobManager) SaveJobHistory(ctx context.Context, history JobHistory) error {
 	key := fmt.Sprintf("deployment:job:%s:history", history.JobID)
-	
+
 	data, err := json.Marshal(history)
 	if err != nil {
 		return err
 	}
-	
+
 	pipe := m.redisClient.Pipeline()
 	pipe.LPush(ctx, key, data)
 	pipe.LTrim(ctx, key, 0, 99)
 	pipe.Expire(ctx, key, 24*time.Hour)
-	
+
 	_, err = pipe.Exec(ctx)
 	return err
 }
@@ -497,13 +507,13 @@ func (m *DeploymentJobManager) GetJobHistory(ctx context.Context, jobID string, 
 	if limit <= 0 || limit > 100 {
 		limit = 100
 	}
-	
+
 	key := fmt.Sprintf("deployment:job:%s:history", jobID)
 	results, err := m.redisClient.LRange(ctx, key, 0, int64(limit-1)).Result()
 	if err != nil {
 		return nil, err
 	}
-	
+
 	history := make([]JobHistory, 0, len(results))
 	for _, result := range results {
 		var entry JobHistory
@@ -512,7 +522,7 @@ func (m *DeploymentJobManager) GetJobHistory(ctx context.Context, jobID string, 
 		}
 		history = append(history, entry)
 	}
-	
+
 	return history, nil
 }
 
@@ -525,17 +535,17 @@ func (m *DeploymentJobManager) IncrementMetrics(ctx context.Context, key string)
 }
 
 func (m *DeploymentJobManager) GetMetrics(ctx context.Context) (JobMetrics, error) {
-	inspector := asynq.NewInspector(*m.asynqClient)
-	
+	inspector := asynq.NewInspector(m.redisOpt)
+
 	queueInfo, err := inspector.GetQueueInfo(deploymentJobQueueName)
 	if err != nil {
 		return JobMetrics{}, err
 	}
-	
+
 	var metrics JobMetrics
-	metrics.QueuedJobs = queueInfo.Pending
-	metrics.ActiveJobs = queueInfo.Active
-	
+	metrics.QueuedJobs = int64(queueInfo.Pending)
+	metrics.ActiveJobs = int64(queueInfo.Active)
+
 	if val, err := m.redisClient.Get(ctx, "deployment:stats:total").Int64(); err == nil {
 		metrics.TotalJobs = val
 	}
@@ -548,11 +558,11 @@ func (m *DeploymentJobManager) GetMetrics(ctx context.Context) (JobMetrics, erro
 	if val, err := m.redisClient.Get(ctx, "deployment:stats:cancelled").Int64(); err == nil {
 		metrics.CancelledJobs = val
 	}
-	
+
 	if metrics.TotalJobs > 0 {
 		metrics.SuccessRate = float64(metrics.CompletedJobs) / float64(metrics.TotalJobs) * 100
 	}
-	
+
 	return metrics, nil
 }
 
@@ -562,16 +572,16 @@ func (m *DeploymentJobManager) GetMetrics(ctx context.Context) (JobMetrics, erro
 
 func (m *DeploymentJobManager) HealthCheck(ctx context.Context) (SystemHealth, error) {
 	health := SystemHealth{}
-	
+
 	// Check Redis
 	if err := m.redisClient.Ping(ctx).Err(); err != nil {
 		health.Status = "unhealthy"
 		return health, fmt.Errorf("redis unhealthy: %w", err)
 	}
 	health.Redis = true
-	
+
 	// Check Asynq
-	inspector := asynq.NewInspector(*m.asynqClient)
+	inspector := asynq.NewInspector(m.redisOpt)
 	info, err := inspector.GetQueueInfo(deploymentJobQueueName)
 	if err != nil {
 		health.Status = "unhealthy"
@@ -580,7 +590,7 @@ func (m *DeploymentJobManager) HealthCheck(ctx context.Context) (SystemHealth, e
 	health.Asynq = true
 	health.QueueLength = info.Pending + info.Active
 	health.Workers = intFromEnvOrDefault("ASYNQ_CONCURRENCY", 1)
-	
+
 	// Check Database (deploymentStore is now in globals.go)
 	if deploymentStore != nil {
 		if err := deploymentStore.HealthCheck(ctx); err != nil {
@@ -589,27 +599,23 @@ func (m *DeploymentJobManager) HealthCheck(ctx context.Context) (SystemHealth, e
 		}
 		health.Database = true
 	}
-	
-	// Check Docker - basic check
-	if err := checkDockerHealth(ctx); err != nil {
+
+	// Check Docker - using checkDockerHealth from main.go
+	if checkDockerHealth() != "healthy" {
 		health.Status = "degraded"
 		health.Docker = false
 	} else {
 		health.Docker = true
 	}
-	
+
 	if health.Status == "" {
 		health.Status = "healthy"
 	}
-	
+
 	return health, nil
 }
 
-func checkDockerHealth(ctx context.Context) error {
-	// Basic Docker health check
-	// Could check if docker daemon is running
-	return nil
-}
+// Note: checkDockerHealth is now in main.go - DO NOT redeclare here
 
 // ============================================================================
 // WORKER HANDLER
@@ -666,7 +672,7 @@ func (m *DeploymentJobManager) handleDeploymentJobTask(ctx context.Context, task
 		CreatedAt:    now,
 	})
 
-	// Run deployment workflow
+	// Run deployment workflow - uses prepareDeploymentSource and estimateStorageUsageMB from source.go and resources.go
 	deployedStatus, runErr := runDeploymentWorkflow(ctx, payload, func(stage string, progress int, message string) {
 		_ = m.updateStatus(ctx, status, func(s *DeploymentJobStatus) {
 			s.Status = JobStatusActive
@@ -675,7 +681,7 @@ func (m *DeploymentJobManager) handleDeploymentJobTask(ctx context.Context, task
 			s.Progress = progress
 		})
 	})
-	
+
 	if runErr != nil {
 		// Handle failure
 		if deploymentStore != nil {
@@ -702,13 +708,13 @@ func (m *DeploymentJobManager) handleDeploymentJobTask(ctx context.Context, task
 		status.UserID = payload.UserID
 		completeTime := time.Now().UTC()
 		status.CompletedAt = &completeTime
-		
+
 		if err := m.saveStatus(ctx, status); err != nil {
 			return asynq.SkipRetry
 		}
-		
+
 		_ = m.IncrementMetrics(ctx, "failed")
-		
+
 		_ = m.SaveJobHistory(ctx, JobHistory{
 			JobID:        jobID,
 			DeploymentID: payload.DeploymentID,
@@ -718,7 +724,7 @@ func (m *DeploymentJobManager) handleDeploymentJobTask(ctx context.Context, task
 			Message:      runErr.Error(),
 			CreatedAt:    completeTime,
 		})
-		
+
 		return asynq.SkipRetry
 	}
 
@@ -729,13 +735,13 @@ func (m *DeploymentJobManager) handleDeploymentJobTask(ctx context.Context, task
 	deployedStatus.UserID = payload.UserID
 	deployedStatus.Status = JobStatusCompleted
 	deployedStatus.CompletedAt = &completeTime
-	
+
 	if err := m.saveStatus(ctx, deployedStatus); err != nil {
 		return asynq.SkipRetry
 	}
-	
+
 	_ = m.IncrementMetrics(ctx, "completed")
-	
+
 	_ = m.SaveJobHistory(ctx, JobHistory{
 		JobID:        jobID,
 		DeploymentID: payload.DeploymentID,
@@ -764,6 +770,7 @@ func (m *DeploymentJobManager) streamJobStatus(c *gin.Context, currentUser UserR
 		return
 	}
 
+	// logsWebsocketUpgrader is now in logs.go
 	conn, err := logsWebsocketUpgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		return
@@ -824,6 +831,7 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 	imageName := strings.TrimSpace(deployment.ImageName)
 	fastRestart := !payload.RebuildImage && imageName != ""
 
+	// Note: defaultDeployCPU, defaultDeployMemoryMB, defaultDeployApps are in resources.go
 	requestedCPU := defaultDeployCPU
 	requestedMemoryMB := int64(defaultDeployMemoryMB)
 	requestedApps := int64(defaultDeployApps)
@@ -838,12 +846,14 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 			progress("cloning", 15, "cloning source repository")
 		}
 
+		// prepareDeploymentSource is now in source.go
 		localAppPath, err := prepareDeploymentSource(ctx, deployment)
 		if err != nil {
 			return DeploymentJobStatus{}, err
 		}
 		deployment.AppPath = localAppPath
 
+		// estimateStorageUsageMB is now in resources.go
 		requestedStorageMB, err = estimateStorageUsageMB(deployment.AppPath)
 		if err != nil {
 			return DeploymentJobStatus{}, err
@@ -901,12 +911,12 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 	}
 
 	containerID, err := CreateAndStartContainer(
-		imageName, 
-		deployment.AppName, 
-		deployment.DeploymentID, 
-		normalizePortMap(deployment.PortMap), 
-		loadDockerEnvList(envMap), 
-		requestedMemoryMB, 
+		imageName,
+		deployment.AppName,
+		deployment.DeploymentID,
+		normalizePortMap(deployment.PortMap),
+		loadDockerEnvList(envMap),
+		requestedMemoryMB,
 		requestedCPU,
 	)
 	if err != nil {
@@ -1097,9 +1107,9 @@ func deploymentDeployHandler(c *gin.Context) {
 	}
 
 	jobID, err := deploymentJobs.EnqueueDeploymentWithConfig(
-		c.Request.Context(), 
-		user.ID, 
-		deployment.DeploymentID, 
+		c.Request.Context(),
+		user.ID,
+		deployment.DeploymentID,
 		rebuildImage,
 		config,
 	)
@@ -1141,7 +1151,7 @@ func (m *DeploymentJobManager) ListJobsForUser(ctx context.Context, userID strin
 	// Scan for keys matching pattern
 	pattern := fmt.Sprintf("deployment:job:*")
 	var statuses []DeploymentJobStatus
-	
+
 	iter := m.redisClient.Scan(ctx, 0, pattern, 0).Iterator()
 	for iter.Next(ctx) {
 		key := iter.Val()
@@ -1149,21 +1159,21 @@ func (m *DeploymentJobManager) ListJobsForUser(ctx context.Context, userID strin
 		if err != nil {
 			continue
 		}
-		
+
 		var status DeploymentJobStatus
 		if err := json.Unmarshal(data, &status); err != nil {
 			continue
 		}
-		
+
 		if status.UserID == userID {
 			statuses = append(statuses, status)
 		}
 	}
-	
+
 	if err := iter.Err(); err != nil {
 		return nil, err
 	}
-	
+
 	return statuses, nil
 }
 
@@ -1185,46 +1195,16 @@ func SetupDeploymentJobRoutes(router *gin.Engine) {
 }
 
 // ============================================================================
-// MISSING FUNCTIONS (Stubs - Need Implementation)
+// NOTE: Missing functions are in other files
 // ============================================================================
 
-func prepareDeploymentSource(ctx context.Context, deployment DeploymentRecord) (string, error) {
-	// Clone/update source repository
-	return "/tmp/deployment", nil
-}
-
-func estimateStorageUsageMB(appPath string) (int64, error) {
-	// Estimate storage requirements
-	return 100, nil
-}
-
-func StopAndRemoveContainer(containerID string) error {
-	// Stop and remove Docker container
-	return nil
-}
-
-func CreateAndStartContainer(
-	imageName string,
-	appName string,
-	deploymentID string,
-	portMap map[string]string,
-	env []string,
-	memoryMB int64,
-	cpu float64,
-) (string, error) {
-	// Create and start Docker container
-	return "container-id", nil
-}
-
-func normalizePortMap(portMap string) map[string]string {
-	// Parse port mapping
-	return map[string]string{"8080": "80"}
-}
-
-func loadDockerEnvList(envMap map[string]string) []string {
-	// Convert map to []string for Docker
-	return []string{}
-}
+// Note: prepareDeploymentSource is now in source.go
+// Note: estimateStorageUsageMB is now in resources.go
+// Note: StopAndRemoveContainer is now in container.go
+// Note: CreateAndStartContainer is now in container.go
+// Note: normalizePortMap is now in container.go
+// Note: loadDockerEnvList is now in envs.go
+// Note: BuildCode is now in build.go or fastbuild.go
 
 // ============================================================================
 // BUILD HELPERS
@@ -1267,7 +1247,7 @@ func intFromEnvOrDefault(key string, fallback int) int {
 	return parsed
 }
 
-// Note: generateRandomToken is now in helpers.go (REMOVED from here)
+// Note: generateRandomToken is now in helpers.go - DO NOT redeclare here
 
 // ============================================================================
 // INITIALIZATION
@@ -1281,12 +1261,12 @@ func InitDeploymentJobManager() error {
 		GracefulShutdown: 10 * time.Second,
 		Priority:         PriorityNormal,
 	}
-	
+
 	manager, err := NewDeploymentJobManager(config)
 	if err != nil {
 		return err
 	}
-	
+
 	// deploymentJobs is now in globals.go
 	deploymentJobs = manager
 	return nil

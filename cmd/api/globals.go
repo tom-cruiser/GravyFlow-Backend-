@@ -1,5 +1,7 @@
 package main
 
+import "sync"
+
 // ============================================================================
 // GLOBAL VARIABLES
 // ============================================================================
@@ -7,6 +9,7 @@ package main
 var (
 	// deploymentStore is the global database store instance
 	deploymentStore *DeploymentStore
+	initStoreOnce   sync.Once
 	
 	// deploymentJobs is the global job manager instance
 	deploymentJobs *DeploymentJobManager

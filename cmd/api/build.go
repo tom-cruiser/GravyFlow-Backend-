@@ -10,9 +10,24 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"strings"
 	"time"
 )
+
+// ============================================================================
+// CUSTOM ERROR TYPES
+// ============================================================================
+
+type ValidationError struct {
+	Field   string
+	Code    string
+	Message string
+}
+
+func (e *ValidationError) Error() string {
+	return fmt.Sprintf("validation error [%s.%s]: %s", e.Field, e.Code, e.Message)
+}
 
 // ============================================================================
 // EMBEDDED FILES
@@ -22,22 +37,10 @@ import (
 var nodeDockerfileTemplate string
 
 // ============================================================================
-// TYPES AND CONSTANTS
+// TYPES AND CONSTANTS - MOVED TO fastbuild.go
 // ============================================================================
-
-type ProjectKind int
-
-const (
-	projectKindUnknown ProjectKind = iota
-	projectKindNode
-	projectKindVite
-	projectKindNextJS
-	projectKindReact
-	projectKindAngular
-	projectKindPython
-	projectKindGo
-	projectKindRust
-)
+// Note: ProjectKind, projectKind constants, and related types are now in fastbuild.go
+// DO NOT redeclare them here
 
 const (
 	defaultBuildTimeout = 30 * time.Minute
@@ -51,27 +54,27 @@ const (
 type BuildConfig struct {
 	// Cache directory for Nixpacks (empty = default)
 	NixpacksCacheDir string
-	
+
 	// Build timeout
 	Timeout time.Duration
-	
+
 	// Maximum retries on recoverable errors
 	MaxRetries int
-	
+
 	// Docker options
-	DockerHost       string
-	RegistryURL      string
-	PushAfterBuild   bool
-	DisableBuildKit  bool
-	
+	DockerHost      string
+	RegistryURL     string
+	PushAfterBuild  bool
+	DisableBuildKit bool
+
 	// Platform
-	TargetPlatform   string // e.g., "linux/amd64"
-	
+	TargetPlatform string // e.g., "linux/amd64"
+
 	// Build arguments
-	BuildArgs        map[string]string
-	
+	BuildArgs map[string]string
+
 	// Logging
-	Verbose          bool
+	Verbose bool
 }
 
 // DefaultConfig returns a sensible default configuration
@@ -162,16 +165,16 @@ func BuildCodeWithConfig(appPath string, appName string, config BuildConfig) (st
     error: %w`, err)
 	}
 
-	// Detect project type
+	// Detect project type - uses detectProjectKind from fastbuild.go
 	kind := detectProjectKind(absPath)
-	
+
 	// Fast path for Node.js projects
 	if kind != projectKindUnknown {
 		logger.Info("Using fast builder for %q (%s)", appName, projectKindLabel(kind))
-		
+
 		ctx, cancel := context.WithTimeout(context.Background(), config.Timeout)
 		defer cancel()
-		
+
 		if err := buildNodeDockerImageWithContext(ctx, absPath, appName, kind, config); err != nil {
 			return "", fmt.Errorf("docker build failed: %w", err)
 		}
@@ -180,7 +183,7 @@ func BuildCodeWithConfig(appPath string, appName string, config BuildConfig) (st
 
 	// Nixpacks path for all other projects
 	logger.Info("Using Nixpacks builder for %q", appName)
-	
+
 	return buildWithNixpacks(absPath, appName, config)
 }
 
@@ -254,8 +257,8 @@ func isValidDockerImageName(name string) bool {
 				return false
 			}
 		} else {
-			if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || 
-				 ch == '.' || ch == '_' || ch == '-') {
+			if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+				ch == '.' || ch == '_' || ch == '-') {
 				return false
 			}
 		}
@@ -287,210 +290,28 @@ func checkSystemResources() error {
 }
 
 // ============================================================================
-// PROJECT DETECTION
+// PROJECT DETECTION - DEPRECATED (use fastbuild.go version)
 // ============================================================================
-
-func detectProjectKind(absPath string) ProjectKind {
-	// Check for Node.js projects
-	packageJSON := filepath.Join(absPath, "package.json")
-	if _, err := os.Stat(packageJSON); err == nil {
-		// Read package.json to detect framework
-		content, err := os.ReadFile(packageJSON)
-		if err == nil {
-			// Check for Next.js
-			if strings.Contains(string(content), `"next"`) {
-				if hasNextConfig(absPath) {
-					return projectKindNextJS
-				}
-			}
-			// Check for Vite
-			if strings.Contains(string(content), `"vite"`) {
-				if hasViteConfig(absPath) {
-					return projectKindVite
-				}
-			}
-			// Check for React
-			if strings.Contains(string(content), `"react"`) {
-				return projectKindReact
-			}
-			// Check for Angular
-			if strings.Contains(string(content), `"@angular/core"`) {
-				return projectKindAngular
-			}
-		}
-		return projectKindNode
-	}
-
-	// Check for Python
-	if _, err := os.Stat(filepath.Join(absPath, "requirements.txt")); err == nil {
-		return projectKindPython
-	}
-	if _, err := os.Stat(filepath.Join(absPath, "pyproject.toml")); err == nil {
-		return projectKindPython
-	}
-
-	// Check for Go
-	if _, err := os.Stat(filepath.Join(absPath, "go.mod")); err == nil {
-		return projectKindGo
-	}
-
-	// Check for Rust
-	if _, err := os.Stat(filepath.Join(absPath, "Cargo.toml")); err == nil {
-		return projectKindRust
-	}
-
-	return projectKindUnknown
-}
-
-func hasNextConfig(absPath string) bool {
-	configs := []string{"next.config.js", "next.config.ts", "next.config.mjs", "next.config.cjs"}
-	for _, config := range configs {
-		if _, err := os.Stat(filepath.Join(absPath, config)); err == nil {
-			return true
-		}
-	}
-	return false
-}
-
-func hasViteConfig(absPath string) bool {
-	configs := []string{"vite.config.js", "vite.config.ts", "vite.config.mjs", "vite.config.cjs"}
-	for _, config := range configs {
-		if _, err := os.Stat(filepath.Join(absPath, config)); err == nil {
-			return true
-		}
-	}
-	return false
-}
-
-func projectKindLabel(kind ProjectKind) string {
-	switch kind {
-	case projectKindNode:
-		return "node"
-	case projectKindVite:
-		return "vite"
-	case projectKindNextJS:
-		return "nextjs"
-	case projectKindReact:
-		return "react"
-	case projectKindAngular:
-		return "angular"
-	case projectKindPython:
-		return "python"
-	case projectKindGo:
-		return "go"
-	case projectKindRust:
-		return "rust"
-	default:
-		return "unknown"
-	}
-}
+// Note: detectProjectKind, hasNextConfig, hasViteConfig, and projectKindLabel
+// are now in fastbuild.go with more comprehensive framework support.
+// DO NOT redeclare them here.
 
 // ============================================================================
 // NODE.JS DOCKER BUILDER (FAST PATH)
 // ============================================================================
 
-func buildNodeDockerImageWithContext(ctx context.Context, absPath string, appName string, kind ProjectKind, config BuildConfig) error {
-	// Create Dockerfile
-	dockerfilePath := filepath.Join(absPath, "Dockerfile.build")
-	if err := createNodeDockerfile(dockerfilePath, kind); err != nil {
-		return fmt.Errorf("create Dockerfile: %w", err)
-	}
-	defer os.Remove(dockerfilePath)
-
-	// Build Docker image
-	args := []string{
-		"build",
-		"-f", dockerfilePath,
-		"-t", dockerImageTag(appName, config.RegistryURL),
-		".",
+func buildNodeDockerImageWithContext(ctx context.Context, absPath string, appName string, kind projectKind, config BuildConfig) error {
+	// Use buildNodeDockerImageWithOptions from fastbuild.go
+	opts := BuildOptions{
+		Platform:        config.TargetPlatform,
+		BuildArgs:       config.BuildArgs,
+		Registry:        config.RegistryURL,
+		Push:            config.PushAfterBuild,
+		DisableBuildKit: config.DisableBuildKit,
+		Timeout:         config.Timeout,
 	}
 
-	// Add platform if specified
-	if config.TargetPlatform != "" {
-		args = append([]string{"build", "--platform", config.TargetPlatform}, args[1:]...)
-	}
-
-	// Add build arguments
-	for key, value := range config.BuildArgs {
-		args = append(args, "--build-arg", fmt.Sprintf("%s=%s", key, value))
-	}
-
-	// Disable BuildKit if requested
-	if config.DisableBuildKit {
-		args = append([]string{"build", "--disable-buildkit"}, args[1:]...)
-	}
-
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	cmd.Dir = absPath
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	logger.Debug("Running: docker %s", strings.Join(args, " "))
-	
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("docker build failed: %w", err)
-	}
-
-	// Push to registry if requested
-	if config.PushAfterBuild && config.RegistryURL != "" {
-		if err := pushDockerImage(ctx, appName, config.RegistryURL); err != nil {
-			return fmt.Errorf("push to registry failed: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func createNodeDockerfile(path string, kind ProjectKind) error {
-	var baseImage, buildCmd, startCmd, exposePort string
-	
-	switch kind {
-	case projectKindNextJS:
-		baseImage = "node:20-alpine"
-		buildCmd = `RUN npm ci && npm run build`
-		startCmd = `CMD ["npm", "start"]`
-		exposePort = "EXPOSE 3000"
-		
-	case projectKindVite:
-		baseImage = "node:20-alpine"
-		buildCmd = `RUN npm ci && npm run build`
-		startCmd = `CMD ["npm", "run", "preview", "--", "--host", "0.0.0.0"]`
-		exposePort = "EXPOSE 4173"
-		
-	case projectKindReact:
-		baseImage = "node:20-alpine"
-		buildCmd = `RUN npm ci && npm run build`
-		startCmd = `CMD ["npx", "serve", "-s", "build", "-l", "3000"]`
-		exposePort = "EXPOSE 3000"
-		
-	case projectKindAngular:
-		baseImage = "node:20-alpine"
-		buildCmd = `RUN npm ci && npm run build -- --output-path=dist`
-		startCmd = `CMD ["npx", "serve", "-s", "dist", "-l", "4200"]`
-		exposePort = "EXPOSE 4200"
-		
-	default: // Node
-		baseImage = "node:20-alpine"
-		buildCmd = `RUN npm ci --only=production`
-		startCmd = `CMD ["npm", "start"]`
-		exposePort = "EXPOSE 3000"
-	}
-
-	content := fmt.Sprintf(`# Auto-generated Dockerfile for Node.js application
-FROM %s AS builder
-WORKDIR /app
-COPY package*.json ./
-%s
-COPY . .
-
-FROM %s AS runner
-WORKDIR /app
-COPY --from=builder /app ./
-%s
-%s
-`, baseImage, buildCmd, baseImage, exposePort, startCmd)
-
-	return os.WriteFile(path, []byte(content), 0644)
+	return buildNodeDockerImageWithOptions(absPath, appName, kind, opts)
 }
 
 // ============================================================================
@@ -515,7 +336,7 @@ func buildWithNixpacks(absPath string, appName string, config BuildConfig) (stri
 	var lastErr error
 	for attempt := 1; attempt <= config.MaxRetries; attempt++ {
 		logger.Info("Nixpacks build attempt %d/%d", attempt, config.MaxRetries)
-		
+
 		var err error
 		if useCacheDir {
 			err = runNixpacksBuild(ctx, absPath, appName, cacheDir, config)
@@ -529,7 +350,7 @@ func buildWithNixpacks(absPath string, appName string, config BuildConfig) (stri
 		}
 
 		lastErr = err
-		
+
 		// Check if it's a retryable error - isRetryableError is now in helpers.go
 		if !isRetryableError(err) {
 			logger.Warn("Non-retryable error, stopping")
@@ -551,9 +372,10 @@ func buildWithNixpacks(absPath string, appName string, config BuildConfig) (stri
 }
 
 func runNixpacksBuild(ctx context.Context, absPath string, appName string, cacheDir string, config BuildConfig) error {
-	err := runNixpacksBuildWithEnv(ctx, absPath, appName, cacheDir, dockerCommandEnv(config))
-	
-	// isBuildKitMissingError is now in docker_env.go
+	// Use dockerCommandEnv from docker_env.go
+	err := runNixpacksBuildWithEnv(ctx, absPath, appName, cacheDir, dockerCommandEnv())
+
+	// isBuildKitMissingError is now in helpers.go
 	if err != nil && isBuildKitMissingError(err) {
 		logger.Warn("BuildKit unavailable, retrying with legacy docker builder")
 		if retryErr := runNixpacksBuildWithEnv(ctx, absPath, appName, cacheDir, dockerCommandEnvForceLegacyBuilder()); retryErr == nil {
@@ -563,7 +385,7 @@ func runNixpacksBuild(ctx context.Context, absPath string, appName string, cache
 
 	if err != nil && isUnsupportedCacheDirError(err) {
 		logger.Warn("--cache-dir unsupported, retrying with native cache")
-		if retryErr := runNixpacksBuildWithEnv(ctx, absPath, appName, "", dockerCommandEnv(config)); retryErr == nil {
+		if retryErr := runNixpacksBuildWithEnv(ctx, absPath, appName, "", dockerCommandEnv()); retryErr == nil {
 			return nil
 		}
 	}
@@ -571,13 +393,13 @@ func runNixpacksBuild(ctx context.Context, absPath string, appName string, cache
 	if err != nil && isBuildKitMissingError(err) {
 		return fmt.Errorf("%w (install docker-buildx or set DISABLE_BUILDKIT=1)", err)
 	}
-	
+
 	return err
 }
 
 func runNixpacksBuildWithEnv(ctx context.Context, absPath string, appName string, cacheDir string, env []string) error {
 	args := []string{"build", absPath, "--name", appName}
-	
+
 	if cacheDir != "" {
 		args = append(args, "--cache-dir", cacheDir)
 	}
@@ -594,7 +416,7 @@ func runNixpacksBuildWithEnv(ctx context.Context, absPath string, appName string
 	cmd.Env = env
 
 	logger.Debug("Running: nixpacks %s", strings.Join(args, " "))
-	
+
 	if err := cmd.Run(); err != nil {
 		if trimmed := strings.TrimSpace(stderr.String()); trimmed != "" {
 			return fmt.Errorf("%w: %s", err, trimmed)
@@ -617,41 +439,17 @@ func dockerImageTag(appName string, registryURL string) string {
 	return fmt.Sprintf("%s:latest", tag)
 }
 
-func dockerCommandEnv(config BuildConfig) []string {
-	env := os.Environ()
-	
-	// Filter out DISABLE_BUILDKIT if not requested
-	if !config.DisableBuildKit {
-		var filtered []string
-		for _, e := range env {
-			if !strings.HasPrefix(e, "DISABLE_BUILDKIT=") {
-				filtered = append(filtered, e)
-			}
-		}
-		env = filtered
-	}
-	
-	// Set DOCKER_HOST if specified
-	if config.DockerHost != "" {
-		env = append(env, fmt.Sprintf("DOCKER_HOST=%s", config.DockerHost))
-	}
-	
-	return env
-}
-
-func dockerCommandEnvForceLegacyBuilder() []string {
-	env := os.Environ()
-	return append(env, "DISABLE_BUILDKIT=1")
-}
+// Note: dockerCommandEnv and dockerCommandEnvForceLegacyBuilder are now in docker_env.go
+// DO NOT redeclare them here
 
 func pushDockerImage(ctx context.Context, appName string, registryURL string) error {
 	tag := dockerImageTag(appName, registryURL)
 	logger.Info("Pushing image: %s", tag)
-	
+
 	cmd := exec.CommandContext(ctx, "docker", "push", tag)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	
+
 	return cmd.Run()
 }
 
@@ -689,8 +487,7 @@ func isUnsupportedCacheDirError(err error) bool {
 	return false
 }
 
-// Note: isBuildKitMissingError is now in docker_env.go - DO NOT redeclare here
-// Note: ValidationError is now in helpers.go - DO NOT redeclare here
+// Note: isBuildKitMissingError is now in helpers.go - DO NOT redeclare here
 
 // ============================================================================
 // USAGE EXAMPLE - REMOVED (moved to example_test.go)

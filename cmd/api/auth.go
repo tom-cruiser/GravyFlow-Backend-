@@ -119,7 +119,7 @@ func issueToken(user UserRecord, tokenType string, ttl time.Duration) (string, t
 	secret := []byte(envOrDefault("AUTH_JWT_SECRET", "dev-auth-secret-change-me-in-production"))
 	now := time.Now().UTC()
 	expiresAt := now.Add(ttl)
-	
+
 	jti, err := generateRandomToken(24)
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("failed to generate token ID: %w", err)
@@ -149,14 +149,14 @@ func issueToken(user UserRecord, tokenType string, ttl time.Duration) (string, t
 // parseAndValidateToken parses and validates a JWT token
 func parseAndValidateToken(tokenString string, expectedType string) (*authClaims, error) {
 	secret := []byte(envOrDefault("AUTH_JWT_SECRET", "dev-auth-secret-change-me-in-production"))
-	
+
 	parsed, err := jwt.ParseWithClaims(tokenString, &authClaims{}, func(token *jwt.Token) (any, error) {
 		if token.Method != jwt.SigningMethodHS256 {
 			return nil, fmt.Errorf("unexpected signing method: %s", token.Method.Alg())
 		}
 		return secret, nil
 	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
-	
+
 	if err != nil {
 		return nil, fmt.Errorf("token validation failed: %w", err)
 	}
@@ -165,7 +165,7 @@ func parseAndValidateToken(tokenString string, expectedType string) (*authClaims
 	if !ok || !parsed.Valid {
 		return nil, errors.New("invalid token claims")
 	}
-	
+
 	if claims.TokenType != expectedType {
 		return nil, fmt.Errorf("unexpected token type: expected %s, got %s", expectedType, claims.TokenType)
 	}
@@ -184,7 +184,7 @@ func createAPIKeyForUser(ctx context.Context, userID string, name string) (strin
 	if err != nil {
 		return "", fmt.Errorf("failed to generate prefix: %w", err)
 	}
-	
+
 	secret, err := generateRandomToken(32)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate secret: %w", err)
@@ -192,7 +192,7 @@ func createAPIKeyForUser(ctx context.Context, userID string, name string) (strin
 
 	// Construct the full API key
 	apiKey := fmt.Sprintf("%s_%s_%s", apiKeyPrefix, prefix, secret)
-	
+
 	// Store the hashed version
 	hashedKey := hashToken(apiKey)
 	if err := deploymentStore.StoreAPIKey(ctx, userID, name, prefix, hashedKey, nil); err != nil {
@@ -218,18 +218,18 @@ func registerHandler(c *gin.Context) {
 	email := strings.ToLower(strings.TrimSpace(req.Email))
 	password := strings.TrimSpace(req.Password)
 	displayName := strings.TrimSpace(req.DisplayName)
-	
+
 	if email == "" || password == "" {
 		sendBadRequest(c, "email and password are required", nil)
 		return
 	}
-	
+
 	// Password strength validation
 	if len(password) < 8 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "password_must_be_at_least_8_characters"})
 		return
 	}
-	
+
 	if displayName == "" {
 		displayName = strings.Split(email, "@")[0]
 	}
@@ -265,7 +265,7 @@ func registerHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_issue_refresh_token", "details": err.Error()})
 		return
 	}
-	
+
 	if err := deploymentStore.StoreRefreshToken(c.Request.Context(), user.ID, hashToken(refreshToken), refreshExpiry); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_store_refresh_token", "details": err.Error()})
 		return
@@ -276,7 +276,7 @@ func registerHandler(c *gin.Context) {
 	if apiKeyName == "" {
 		apiKeyName = "initial-access"
 	}
-	
+
 	apiKey, err := createAPIKeyForUser(c.Request.Context(), user.ID, apiKeyName)
 	if err != nil {
 		// Log error but don't fail registration if API key creation fails
@@ -307,7 +307,7 @@ func loginHandler(c *gin.Context) {
 
 	email := strings.ToLower(strings.TrimSpace(req.Email))
 	password := strings.TrimSpace(req.Password)
-	
+
 	if email == "" || password == "" {
 		sendBadRequest(c, "email and password are required", nil)
 		return
@@ -320,7 +320,7 @@ func loginHandler(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_credentials"})
 		return
 	}
-	
+
 	// Verify password
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_credentials"})
@@ -339,7 +339,7 @@ func loginHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_issue_refresh_token", "details": err.Error()})
 		return
 	}
-	
+
 	if err := deploymentStore.StoreRefreshToken(c.Request.Context(), user.ID, hashToken(refreshToken), refreshExpiry); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_store_refresh_token", "details": err.Error()})
 		return
@@ -382,13 +382,9 @@ func refreshHandler(c *gin.Context) {
 
 	// ATOMIC: Consume old refresh token first
 	// This prevents reuse attacks
-	consumed, err := deploymentStore.ConsumeRefreshToken(c.Request.Context(), req.RefreshToken, "", time.Time{})
+	_, err = deploymentStore.ConsumeRefreshToken(c.Request.Context(), req.RefreshToken, "", time.Time{})
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_refresh_token", "details": err.Error()})
-		return
-	}
-	if !consumed {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "refresh_token_already_used"})
 		return
 	}
 
@@ -404,7 +400,7 @@ func refreshHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_issue_refresh_token", "details": err.Error()})
 		return
 	}
-	
+
 	// Store the new refresh token
 	if err := deploymentStore.StoreRefreshToken(c.Request.Context(), user.ID, hashToken(newRefreshToken), refreshExpiry); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_store_refresh_token", "details": err.Error()})
@@ -592,7 +588,7 @@ func logoutHandler(c *gin.Context) {
 	}
 
 	// Parse token to get user ID
-	claims, err := parseAndValidateToken(req.RefreshToken, tokenTypeRefresh)
+	_, err := parseAndValidateToken(req.RefreshToken, tokenTypeRefresh)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_refresh_token"})
 		return
@@ -619,7 +615,7 @@ func setupAuthRoutes(router *gin.Engine) {
 		auth.POST("/login", loginHandler)
 		auth.POST("/refresh", refreshHandler)
 		auth.POST("/logout", AuthMiddleware(false), logoutHandler)
-		
+
 		// Protected routes
 		protected := auth.Group("/")
 		protected.Use(AuthMiddleware(false))

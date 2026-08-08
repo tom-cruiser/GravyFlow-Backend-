@@ -8,13 +8,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/prometheus/client_golang/prometheus"
+	dockerclient "github.com/docker/docker/client"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/time/rate"
 )
@@ -142,7 +143,7 @@ func getDurationEnv(key string, fallback time.Duration) time.Duration {
 
 func getIntEnv(key string, fallback int) int {
 	if val := os.Getenv(key); val != "" {
-		if i, err := fmt.Sscanf(val, "%d", &i); err == nil && i == 1 {
+		if i, err := strconv.Atoi(val); err == nil {
 			return i
 		}
 	}
@@ -151,7 +152,7 @@ func getIntEnv(key string, fallback int) int {
 
 func getFloatEnv(key string, fallback float64) float64 {
 	if val := os.Getenv(key); val != "" {
-		if f, err := fmt.ParseFloat(val, 64); err == nil {
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
 			return f
 		}
 	}
@@ -248,6 +249,7 @@ func setupRouter(config ServerConfig) *gin.Engine {
 			protected.GET("/apps", listAppsHandler)
 			protected.POST("/apps", createAppHandler)
 			protected.POST("/apps/:id/deploy", deploymentDeployHandler)
+			// restartAppHandler is now in restart_handlers.go
 			protected.POST("/apps/:id/restart", restartAppHandler)
 			protected.GET("/apps/:id/logs", streamAppLogsHandler)
 			protected.GET("/apps/:id/deploy-log", deployLogHandler)
@@ -612,29 +614,8 @@ func quotaSummaryHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, summary)
 }
 
-func restartAppHandler(c *gin.Context) {
-	user, deployment, ok := currentUserDeployment(c)
-	if !ok {
-		return
-	}
-
-	// Trigger restart via job
-	jobID, err := deploymentJobs.EnqueueDeployment(c.Request.Context(), user.ID, deployment.DeploymentID, false)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error":   "failed_to_restart_app",
-			"details": err.Error(),
-			"request_id": c.GetString("requestID"),
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message":      "restart queued",
-		"deploymentId": deployment.DeploymentID,
-		"jobId":        jobID,
-	})
-}
+// Note: restartAppHandler is now in restart_handlers.go
+// The duplicate in main.go has been removed
 
 // ============================================================================
 // UTILITY FUNCTIONS

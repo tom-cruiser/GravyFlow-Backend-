@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
@@ -360,14 +361,12 @@ func BenchmarkCountEnv(b *testing.B) {
 // Note: These tests are skipped by default, run with -tags=integration
 // go test -tags=integration -v
 
-// +build integration
-
 func TestIntegration_WithDockerBuildKit_RealEnvironment(t *testing.T) {
 	t.Skip("Integration tests require Docker daemon running")
 	
 	// This would test the actual withDockerBuildKit function
 	// against a real environment
-	env := withDockerBuildKit(os.Environ(), false)
+	_ = withDockerBuildKit(os.Environ(), false)
 	
 	// Verify Docker commands work with the modified environment
 	// cmd := exec.Command("docker", "build", "--no-cache", ".")

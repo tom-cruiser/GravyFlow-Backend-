@@ -245,6 +245,20 @@ func bulkAddAppEnvHandler(c *gin.Context) {
 			continue
 		}
 
+		// Validate key/value the same way the single-add handler does, so
+		// malformed entries (containing "=", spaces, etc.) can't slip in via
+		// the bulk path.
+		validation := validateEnvVar(key, env.Value)
+		if !validation.Valid {
+			results = append(results, map[string]interface{}{
+				"key":        key,
+				"status":     "error",
+				"error":      "validation_failed",
+				"validation": validation,
+			})
+			continue
+		}
+
 		// Check if exists
 		exists, _ := deploymentStore.DeploymentEnvVarExists(
 			c.Request.Context(), deployment.DeploymentID, key,
@@ -368,8 +382,15 @@ func exportEnvHandler(c *gin.Context) {
 		return
 	}
 
-	envRecords, err := deploymentStore.ListDeploymentEnvVars(
-		c.Request.Context(), user.ID, deployment.DeploymentID,
+	// currentUserDeployment already verified that this user owns/may access
+	// this deployment, which is the same authorization gate used by the
+	// other sensitive env operations in this file (add/delete/bulk/import).
+	// That's what makes it safe to fetch real values here instead of the
+	// always-redacted "****" placeholders from ListDeploymentEnvVars.
+	showSensitive := c.DefaultQuery("showSensitive", "false") == "true"
+
+	envRecords, err := deploymentStore.ListDeploymentEnvVarsWithValues(
+		c.Request.Context(), user.ID, deployment.DeploymentID, showSensitive,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -379,16 +400,12 @@ func exportEnvHandler(c *gin.Context) {
 		return
 	}
 
-	// Remove sensitive values if not authorized
-	showSensitive := c.DefaultQuery("showSensitive", "false") == "true"
-
+	// ListDeploymentEnvVarsWithValues already redacts sensitive values to
+	// "***REDACTED***" when showSensitive is false; non-sensitive values are
+	// returned in full.
 	envVars := make(map[string]string, len(envRecords))
 	for _, record := range envRecords {
-		value := record.Value
-		if !showSensitive && isSensitiveKey(record.Key) {
-			value = "***REDACTED***"
-		}
-		envVars[record.Key] = value
+		envVars[record.Key] = record.Value
 	}
 
 	format := c.DefaultQuery("format", "json")
@@ -443,6 +460,20 @@ func importEnvHandler(c *gin.Context) {
 	for key, value := range importData {
 		key = normalizeEnvKey(key)
 		if key == "" {
+			continue
+		}
+
+		// Validate key/value the same way the single-add handler does, so
+		// malformed entries (containing "=", spaces, etc.) can't slip in via
+		// import.
+		validation := validateEnvVar(key, value)
+		if !validation.Valid {
+			results = append(results, map[string]interface{}{
+				"key":        key,
+				"status":     "error",
+				"error":      "validation_failed",
+				"validation": validation,
+			})
 			continue
 		}
 

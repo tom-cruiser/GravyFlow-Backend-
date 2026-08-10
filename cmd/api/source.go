@@ -237,16 +237,13 @@ func runGitClone(ctx context.Context, repoURL string, dest string, opts GitClone
 		args = append(args, "--sparse")
 	}
 
-	args = append(args, repoURL, dest)
-
 	// Add authentication
 	cloneURL, err := addAuthentication(repoURL, opts)
 	if err != nil {
 		return err
 	}
 
-	// Use authenticated URL
-	args[1] = cloneURL
+	args = append(args, cloneURL, dest)
 
 	// Setup environment
 	env := os.Environ()

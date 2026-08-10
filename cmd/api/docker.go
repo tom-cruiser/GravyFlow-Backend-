@@ -438,6 +438,8 @@ func GetContainerStats(ctx context.Context, containerID string) (*ContainerStats
         break
     }
 
+    blockRead, blockWrite := blockIOReadWrite(v.BlkioStats.IoServiceBytesRecursive)
+
     return &ContainerStats{
         ContainerID: containerID,
         CPUUsage:    cpuPercent,
@@ -445,11 +447,27 @@ func GetContainerStats(ctx context.Context, containerID string) (*ContainerStats
         MemoryLimit: memoryLimit,
         NetworkIn:   int64(networkIn),
         NetworkOut:  int64(networkOut),
-        BlockRead:   int64(v.BlkioStats.IoServiceBytesRecursive[0].Value),
-        BlockWrite:  int64(v.BlkioStats.IoServiceBytesRecursive[1].Value),
+        BlockRead:   blockRead,
+        BlockWrite:  blockWrite,
         PIDs:        int(v.PidsStats.Current),
         Timestamp:   time.Now(),
     }, nil
+}
+
+// blockIOReadWrite sums block I/O bytes by operation type. On cgroups v2
+// hosts (and in some other configurations) IoServiceBytesRecursive can be
+// empty, so entries are matched by their "Op" field rather than assumed to
+// be present at fixed indices; missing values default to zero.
+func blockIOReadWrite(entries []container.BlkioStatEntry) (read int64, write int64) {
+    for _, entry := range entries {
+        switch strings.ToLower(entry.Op) {
+        case "read":
+            read += int64(entry.Value)
+        case "write":
+            write += int64(entry.Value)
+        }
+    }
+    return read, write
 }
 
 // ============================================================================

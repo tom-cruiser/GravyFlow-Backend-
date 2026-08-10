@@ -531,10 +531,16 @@ func (m *DeploymentJobManager) GetJobHistory(ctx context.Context, jobID string, 
 // ============================================================================
 
 func (m *DeploymentJobManager) IncrementMetrics(ctx context.Context, key string) error {
+	if m == nil || m.redisClient == nil {
+		return fmt.Errorf("deployment job manager is not initialized")
+	}
 	return m.redisClient.Incr(ctx, "deployment:stats:"+key).Err()
 }
 
 func (m *DeploymentJobManager) GetMetrics(ctx context.Context) (JobMetrics, error) {
+	if m == nil || m.redisClient == nil {
+		return JobMetrics{}, fmt.Errorf("deployment job manager is not initialized")
+	}
 	inspector := asynq.NewInspector(m.redisOpt)
 
 	queueInfo, err := inspector.GetQueueInfo(deploymentJobQueueName)
@@ -571,6 +577,9 @@ func (m *DeploymentJobManager) GetMetrics(ctx context.Context) (JobMetrics, erro
 // ============================================================================
 
 func (m *DeploymentJobManager) HealthCheck(ctx context.Context) (SystemHealth, error) {
+	if m == nil || m.redisClient == nil {
+		return SystemHealth{}, fmt.Errorf("deployment job manager is not initialized")
+	}
 	health := SystemHealth{}
 
 	// Check Redis
@@ -685,7 +694,7 @@ func (m *DeploymentJobManager) handleDeploymentJobTask(ctx context.Context, task
 	if runErr != nil {
 		// Handle failure
 		if deploymentStore != nil {
-			if markErr := deploymentStore.MarkDeploymentFailed(ctx, payload.DeploymentID, runErr); markErr != nil {
+			if markErr := deploymentStore.MarkDeploymentFailed(ctx, payload.DeploymentID, runErr, payload.UserID); markErr != nil {
 				_ = m.updateStatus(ctx, status, func(s *DeploymentJobStatus) {
 					s.Message = fmt.Sprintf("deployment failed: %v; failed to update database: %v", runErr, markErr)
 					s.Error = runErr.Error()
@@ -926,7 +935,7 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 		return DeploymentJobStatus{}, err
 	}
 
-	if err := deploymentStore.MarkDeploymentDeployed(ctx, deployment.DeploymentID, containerID, deployment.AppName, imageName); err != nil {
+	if err := deploymentStore.MarkDeploymentDeployed(ctx, deployment.DeploymentID, containerID, deployment.AppName, imageName, payload.UserID); err != nil {
 		return DeploymentJobStatus{}, err
 	}
 
@@ -1148,6 +1157,9 @@ func deploymentJobListHandler(c *gin.Context) {
 }
 
 func (m *DeploymentJobManager) ListJobsForUser(ctx context.Context, userID string) ([]DeploymentJobStatus, error) {
+	if m == nil || m.redisClient == nil {
+		return nil, fmt.Errorf("deployment job manager is not initialized")
+	}
 	// Scan for keys matching pattern
 	pattern := fmt.Sprintf("deployment:job:*")
 	var statuses []DeploymentJobStatus

@@ -119,6 +119,14 @@ func addAppDomainHandler(c *gin.Context) {
         c.Request.Context(), user.ID, deployment.DeploymentID, req.CustomDomain, nil,
     )
     if err != nil {
+        lowerErr := strings.ToLower(err.Error())
+        if strings.Contains(lowerErr, "not found") || strings.Contains(lowerErr, "deployment store is not initialized") {
+            c.JSON(http.StatusNotFound, gin.H{
+                "error":   "deployment_not_found",
+                "details": err.Error(),
+            })
+            return
+        }
         if strings.Contains(strings.ToLower(err.Error()), "already attached to another deployment") {
             c.JSON(http.StatusConflict, gin.H{
                 "error":   "domain_already_in_use",
@@ -212,6 +220,14 @@ func verifyAppDomainHandler(c *gin.Context) {
         c.Request.Context(), user.ID, deployment.DeploymentID, customDomain,
     )
     if err != nil {
+        lowerErr := strings.ToLower(err.Error())
+        if strings.Contains(lowerErr, "not found") {
+            c.JSON(http.StatusNotFound, gin.H{
+                "error":   "domain_not_found",
+                "details": err.Error(),
+            })
+            return
+        }
         c.JSON(http.StatusBadRequest, gin.H{
             "error":   "domain_not_verified",
             "details": err.Error(),
@@ -248,6 +264,13 @@ func deleteAppDomainHandler(c *gin.Context) {
     if err := deploymentStore.DeleteDeploymentDomain(
         c.Request.Context(), user.ID, deployment.DeploymentID, customDomain,
     ); err != nil {
+        if strings.Contains(strings.ToLower(err.Error()), "not found") {
+            c.JSON(http.StatusNotFound, gin.H{
+                "error":   "domain_not_found",
+                "details": err.Error(),
+            })
+            return
+        }
         c.JSON(http.StatusInternalServerError, gin.H{
             "error":   "failed_to_delete_domain",
             "details": err.Error(),
@@ -494,7 +517,7 @@ func addDomainRedirectHandler(c *gin.Context) {
         c.Request.Context(), user.ID, deployment.DeploymentID, req.FromDomain,
     )
     if err != nil {
-        c.JSON(http.StatusNotFound, gin.H{"error": "source_domain_not_found"})
+        c.JSON(http.StatusNotFound, gin.H{"error": "source_domain_not_found", "details": err.Error()})
         return
     }
 
@@ -502,7 +525,7 @@ func addDomainRedirectHandler(c *gin.Context) {
         c.Request.Context(), user.ID, deployment.DeploymentID, req.ToDomain,
     )
     if err != nil {
-        c.JSON(http.StatusNotFound, gin.H{"error": "target_domain_not_found"})
+        c.JSON(http.StatusNotFound, gin.H{"error": "target_domain_not_found", "details": err.Error()})
         return
     }
 

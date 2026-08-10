@@ -335,6 +335,7 @@ CREATE TABLE IF NOT EXISTS domains (
     verified BOOLEAN NOT NULL DEFAULT FALSE,
     verification_token TEXT NOT NULL DEFAULT '',
     verified_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

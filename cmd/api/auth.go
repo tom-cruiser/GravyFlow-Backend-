@@ -382,7 +382,7 @@ func refreshHandler(c *gin.Context) {
 
 	// ATOMIC: Consume old refresh token first
 	// This prevents reuse attacks
-	_, err = deploymentStore.ConsumeRefreshToken(c.Request.Context(), req.RefreshToken, "", time.Time{})
+	_, err = deploymentStore.ConsumeRefreshToken(c.Request.Context(), req.RefreshToken)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_refresh_token", "details": err.Error()})
 		return
@@ -595,7 +595,7 @@ func logoutHandler(c *gin.Context) {
 	}
 
 	// Invalidate the refresh token
-	if _, err := deploymentStore.ConsumeRefreshToken(c.Request.Context(), req.RefreshToken, "", time.Time{}); err != nil {
+	if _, err := deploymentStore.ConsumeRefreshToken(c.Request.Context(), req.RefreshToken); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_logout", "details": err.Error()})
 		return
 	}

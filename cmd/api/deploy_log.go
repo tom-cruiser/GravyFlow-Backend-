@@ -97,6 +97,16 @@ func deployLogHandler(c *gin.Context) {
 		return
 	}
 
+	// Validate pagination parameters before they're used in slice operations.
+	if filter.Offset < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "offset must be >= 0"})
+		return
+	}
+	if filter.Limit < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "limit must be >= 0"})
+		return
+	}
+
 	// Set defaults
 	if filter.Limit == 0 {
 		filter.Limit = defaultLogLimit
@@ -107,22 +117,26 @@ func deployLogHandler(c *gin.Context) {
 
 	// Get enhanced logs
 	lines := getEnhancedLogs(deployment, filter)
-	
+
 	// Calculate total before truncation
 	total := len(lines)
-	
+
 	// Truncate if needed
 	if len(lines) > maxLogLines {
 		lines = truncateLogs(lines)
 	}
 
-	// Apply pagination
+	// Apply pagination, clamping to the available range so an offset beyond
+	// the end of the log simply yields an empty page instead of panicking.
 	start := filter.Offset
+	if start > len(lines) {
+		start = len(lines)
+	}
 	end := start + filter.Limit
 	if end > len(lines) {
 		end = len(lines)
 	}
-	
+
 	paginatedLines := lines[start:end]
 	hasMore := end < len(lines)
 
@@ -374,10 +388,15 @@ func deployLogTailHandler(c *gin.Context) {
 
 	tail := 100
 	if t := c.Query("tail"); t != "" {
-		if parsed, err := fmt.Sscanf(t, "%d", &tail); err == nil && parsed == 1 {
-			if tail > 10000 {
-				tail = 10000
-			}
+		parsedTail := 0
+		parsed, err := fmt.Sscanf(t, "%d", &parsedTail)
+		if err != nil || parsed != 1 || parsedTail < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "tail must be a non-negative integer"})
+			return
+		}
+		tail = parsedTail
+		if tail > 10000 {
+			tail = 10000
 		}
 	}
 

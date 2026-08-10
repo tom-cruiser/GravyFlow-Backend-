@@ -635,6 +635,17 @@ CREATE TABLE IF NOT EXISTS deployment_changes (
     changed_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
 )`},
+		// domains is created out-of-band by db/schema.sql on initial provisioning
+		// (not by an earlier numbered migration here), so it may already exist
+		// without expires_at on environments provisioned before that column was
+		// added. Guarded so it's a no-op if the table doesn't exist yet either.
+		{12, `
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'domains') THEN
+        ALTER TABLE domains ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP WITH TIME ZONE;
+    END IF;
+END $$`},
 	}
 
 	for _, migration := range migrations {
@@ -1033,7 +1044,11 @@ VALUES ($1, $2, $3)
 	return nil
 }
 
-func (s *DeploymentStore) ConsumeRefreshToken(ctx context.Context, rawToken string, newTokenHash string, newExpiresAt time.Time) (string, error) {
+// ConsumeRefreshToken atomically marks the refresh token identified by rawToken
+// as revoked/used, returning the associated user ID. It does NOT issue or store
+// a replacement token — callers that need to rotate the token must separately
+// call StoreRefreshToken with a freshly generated hash after this succeeds.
+func (s *DeploymentStore) ConsumeRefreshToken(ctx context.Context, rawToken string) (string, error) {
 	if s == nil || s.pool == nil {
 		return "", &StoreError{
 			Type:    ErrDatabase,
@@ -1042,11 +1057,10 @@ func (s *DeploymentStore) ConsumeRefreshToken(ctx context.Context, rawToken stri
 	}
 
 	rawToken = strings.TrimSpace(rawToken)
-	newTokenHash = strings.TrimSpace(newTokenHash)
-	if rawToken == "" || newTokenHash == "" {
+	if rawToken == "" {
 		return "", &StoreError{
 			Type:    ErrInvalidInput,
-			Message: "rawToken and newTokenHash are required",
+			Message: "rawToken is required",
 		}
 	}
 
@@ -1099,17 +1113,6 @@ WHERE token_hash = $1
 		return "", &StoreError{
 			Type:    ErrDatabase,
 			Message: "failed to revoke refresh token",
-			Err:     err,
-		}
-	}
-
-	if _, err := tx.Exec(ctx, `
-INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
-VALUES ($1, $2, $3)
-`, userID, newTokenHash, newExpiresAt); err != nil {
-		return "", &StoreError{
-			Type:    ErrDatabase,
-			Message: "failed to store rotated refresh token",
 			Err:     err,
 		}
 	}
@@ -1506,7 +1509,7 @@ RETURNING id::text
 	return deploymentID, nil
 }
 
-func (s *DeploymentStore) UpdateDeploymentStatus(ctx context.Context, deploymentID string, status DeploymentStatus, statusMessage string, containerID string, containerName string, imageName string) error {
+func (s *DeploymentStore) UpdateDeploymentStatus(ctx context.Context, deploymentID string, status DeploymentStatus, statusMessage string, containerID string, containerName string, imageName string, changedBy string) error {
 	if s == nil || s.pool == nil {
 		return &StoreError{
 			Type:    ErrDatabase,
@@ -1572,7 +1575,7 @@ WHERE id = $1
 
 	// Track change if status changed
 	if oldStatus != string(status) {
-		if err := s.TrackDeploymentChange(ctx, deploymentID, "status", oldStatus, string(status), ""); err != nil {
+		if err := s.TrackDeploymentChange(ctx, deploymentID, "status", oldStatus, string(status), changedBy); err != nil {
 			log.Printf("Warning: failed to track status change: %v", err)
 		}
 	}
@@ -1619,15 +1622,15 @@ WHERE id = $1
 	return nil
 }
 
-func (s *DeploymentStore) MarkDeploymentFailed(ctx context.Context, deploymentID string, cause error) error {
+func (s *DeploymentStore) MarkDeploymentFailed(ctx context.Context, deploymentID string, cause error, changedBy string) error {
 	if cause == nil {
 		cause = fmt.Errorf("deployment failed")
 	}
-	return s.UpdateDeploymentStatus(ctx, deploymentID, DeploymentStatusFailed, cause.Error(), "", "", "")
+	return s.UpdateDeploymentStatus(ctx, deploymentID, DeploymentStatusFailed, cause.Error(), "", "", "", changedBy)
 }
 
-func (s *DeploymentStore) MarkDeploymentDeployed(ctx context.Context, deploymentID string, containerID string, containerName string, imageName string) error {
-	return s.UpdateDeploymentStatus(ctx, deploymentID, DeploymentStatusRunning, "deployment completed successfully", containerID, containerName, imageName)
+func (s *DeploymentStore) MarkDeploymentDeployed(ctx context.Context, deploymentID string, containerID string, containerName string, imageName string, changedBy string) error {
+	return s.UpdateDeploymentStatus(ctx, deploymentID, DeploymentStatusRunning, "deployment completed successfully", containerID, containerName, imageName, changedBy)
 }
 
 func (s *DeploymentStore) GetDeploymentForUser(ctx context.Context, userID string, deploymentID string) (DeploymentRecord, error) {

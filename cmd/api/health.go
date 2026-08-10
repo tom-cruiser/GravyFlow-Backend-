@@ -480,7 +480,7 @@ func (m *DeploymentHealthManager) handleMaxRestartsReached(ctx context.Context, 
 
 	_ = deploymentStore.RecordDeploymentRestartAudit(ctx, target.DeploymentID, "restart", "alerted", alertMessage, target.ContainerID, "")
 	
-	if err := deploymentStore.MarkDeploymentFailed(ctx, target.DeploymentID, errors.New(alertMessage)); err != nil {
+	if err := deploymentStore.MarkDeploymentFailed(ctx, target.DeploymentID, errors.New(alertMessage), target.OwnerUserID); err != nil {
 		log.Printf("Health checker: mark failed for %s: %v", target.DeploymentID, err)
 	}
 
@@ -552,7 +552,7 @@ func (m *DeploymentHealthManager) attemptRestart(ctx context.Context, target Run
 func (m *DeploymentHealthManager) handleRestartSuccess(ctx context.Context, target RunningDeploymentHealthTarget, restartedContainerID string, reason string) {
 	_ = deploymentStore.RecordDeploymentRestartAudit(ctx, target.DeploymentID, "restart", "succeeded", reason, target.ContainerID, restartedContainerID)
 	
-	if err := deploymentStore.MarkDeploymentDeployed(ctx, target.DeploymentID, restartedContainerID, target.AppName, target.ImageName); err != nil {
+	if err := deploymentStore.MarkDeploymentDeployed(ctx, target.DeploymentID, restartedContainerID, target.AppName, target.ImageName, target.OwnerUserID); err != nil {
 		log.Printf("Health checker: update running deployment for %s: %v", target.DeploymentID, err)
 	}
 
@@ -573,7 +573,7 @@ func (m *DeploymentHealthManager) handleRestartSuccess(ctx context.Context, targ
 func (m *DeploymentHealthManager) handleRestartFailure(ctx context.Context, target RunningDeploymentHealthTarget, err error) {
 	_ = deploymentStore.RecordDeploymentRestartAudit(ctx, target.DeploymentID, "restart", "failed", err.Error(), target.ContainerID, "")
 	
-	if markErr := deploymentStore.MarkDeploymentFailed(ctx, target.DeploymentID, err); markErr != nil {
+	if markErr := deploymentStore.MarkDeploymentFailed(ctx, target.DeploymentID, err, target.OwnerUserID); markErr != nil {
 		log.Printf("Health checker: mark failed after restart error for %s: %v", target.DeploymentID, markErr)
 	}
 

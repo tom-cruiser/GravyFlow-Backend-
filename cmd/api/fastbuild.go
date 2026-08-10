@@ -521,6 +521,17 @@ func nextJSDockerfile(appPath string, installCmd string, pm string, nodeVersion 
 		publicCopy = "COPY --from=builder /app/public ./public\n"
 	}
 
+	// next.config.js (and its .mjs/.ts/.cjs variants) is optional. Docker's COPY
+	// instruction has no shell, so we can't use "|| true" / redirection to make
+	// it conditional at build time — instead only emit the COPY line when we
+	// know (from the host source tree) that the file actually exists.
+	nextConfigCopy := ""
+	for _, name := range []string{"next.config.js", "next.config.mjs", "next.config.ts", "next.config.cjs"} {
+		if _, err := os.Stat(filepath.Join(appPath, name)); err == nil {
+			nextConfigCopy += fmt.Sprintf("COPY --from=builder /app/%s ./%s\n", name, name)
+		}
+	}
+
 	return fmt.Sprintf(`FROM node:%s AS deps
 WORKDIR /app
 COPY package.json package-lock.json* pnpm-lock.yaml* yarn.lock* bun.lockb* ./
@@ -542,10 +553,9 @@ ENV HOSTNAME=0.0.0.0
 %sCOPY --from=builder /app/.next ./.next
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package.json ./package.json
-COPY --from=builder /app/next.config.js ./next.config.js 2>/dev/null || true
-EXPOSE 8080
+%sEXPOSE 8080
 CMD %s
-`, nodeVersion, installCmd, nodeVersion, nodeVersion, publicCopy, startCmd)
+`, nodeVersion, installCmd, nodeVersion, nodeVersion, publicCopy, nextConfigCopy, startCmd)
 }
 
 func viteDockerfile(installCmd string, buildCmd string, pm string, nodeVersion string) string {
@@ -662,11 +672,6 @@ func runDockerBuildWithOptions(appPath string, appName string, dockerfilePath st
 		args = append(args, "--cache-from", appName)
 	}
 
-	// Disable BuildKit if requested
-	if opts.DisableBuildKit {
-		args = append(args, "--disable-buildkit")
-	}
-
 	// Add path
 	args = append(args, appPath)
 
@@ -678,11 +683,13 @@ func runDockerBuildWithOptions(appPath string, appName string, dockerfilePath st
 		defer cancel()
 	}
 
-	// Run build with retry
-	return runDockerBuildWithRetry(ctx, args, 3)
+	// BuildKit is disabled via the DOCKER_BUILDKIT=0 environment variable, not
+	// a docker CLI flag ("--disable-buildkit" is not a real flag and would
+	// make every build fail).
+	return runDockerBuildWithRetry(ctx, args, 3, opts.DisableBuildKit)
 }
 
-func runDockerBuildWithRetry(ctx context.Context, args []string, maxRetries int) error {
+func runDockerBuildWithRetry(ctx context.Context, args []string, maxRetries int, forceLegacyBuilder bool) error {
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -691,7 +698,7 @@ func runDockerBuildWithRetry(ctx context.Context, args []string, maxRetries int)
 			time.Sleep(2 * time.Second)
 		}
 
-		err := runDockerBuildCmd(ctx, args)
+		err := runDockerBuildCmd(ctx, args, forceLegacyBuilder)
 		if err == nil {
 			return nil
 		}
@@ -707,12 +714,21 @@ func runDockerBuildWithRetry(ctx context.Context, args []string, maxRetries int)
 	return fmt.Errorf("build failed after %d attempts: %w", maxRetries, lastErr)
 }
 
-func runDockerBuildCmd(ctx context.Context, args []string) error {
+// runDockerBuildCmd runs `docker build` with the given args. If forceLegacyBuilder
+// is false and the build fails because BuildKit is unavailable, it retries exactly
+// once with BuildKit disabled via DOCKER_BUILDKIT=0 (never a CLI flag). The retry
+// itself always passes forceLegacyBuilder=true, so this can only recurse one level
+// deep.
+func runDockerBuildCmd(ctx context.Context, args []string, forceLegacyBuilder bool) error {
 	var stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
-	cmd.Env = dockerCommandEnv()
+	if forceLegacyBuilder {
+		cmd.Env = dockerCommandEnvForceLegacyBuilder()
+	} else {
+		cmd.Env = dockerCommandEnv()
+	}
 
 	log.Printf("Running: docker %s", strings.Join(args, " "))
 
@@ -720,9 +736,9 @@ func runDockerBuildCmd(ctx context.Context, args []string) error {
 		if trimmed := strings.TrimSpace(stderr.String()); trimmed != "" {
 			err = fmt.Errorf("%w: %s", err, trimmed)
 		}
-		if isBuildKitMissingError(err) {
-			log.Printf("BuildKit unavailable, retrying with legacy builder")
-			return runDockerBuildCmd(ctx, append([]string{"build", "--disable-buildkit"}, args[1:]...))
+		if !forceLegacyBuilder && isBuildKitMissingError(err) {
+			log.Printf("BuildKit unavailable, retrying once with legacy builder (DOCKER_BUILDKIT=0)")
+			return runDockerBuildCmd(ctx, args, true)
 		}
 		return err
 	}

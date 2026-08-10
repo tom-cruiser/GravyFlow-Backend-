@@ -17,6 +17,10 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/client"
 )
 
 // ============================================================================
@@ -568,7 +572,7 @@ func cleanupCaddyCertificatesForDomain(customDomain string) {
 		if err != nil {
 			return nil
 		}
-		if !strings.Contains(strings.ToLower(path), customDomain) {
+		if !certificatePathMatchesDomain(path, customDomain) {
 			return nil
 		}
 		if entry.IsDir() {
@@ -579,15 +583,95 @@ func cleanupCaddyCertificatesForDomain(customDomain string) {
 	})
 }
 
+// certificatePathMatchesDomain reports whether path belongs exclusively to
+// domain, using exact path-component comparison rather than a substring
+// match. A substring match would (for example) treat "a.com" as matching a
+// path for "banana.com", causing cross-tenant certificate deletion.
+func certificatePathMatchesDomain(path string, domain string) bool {
+	if domain == "" {
+		return false
+	}
+	for _, part := range strings.Split(strings.ToLower(path), string(filepath.Separator)) {
+		if part == domain {
+			return true
+		}
+		// Certificate files are typically named "<domain>.crt", "<domain>.key",
+		// "<domain>.json", etc. - compare the exact name with its extension
+		// stripped so "banana.com.crt" doesn't match domain "a.com".
+		if ext := filepath.Ext(part); ext != "" && strings.TrimSuffix(part, ext) == domain {
+			return true
+		}
+	}
+	return false
+}
+
 func normalizeCustomDomain(domain string) string {
 	return strings.ToLower(strings.TrimSpace(domain))
 }
 
 // ============================================================================
-// MISSING FUNCTIONS (Need Implementation)
+// CONTAINER DISCOVERY
 // ============================================================================
 
+// ListRunningManagedContainers returns every currently-running container that
+// this application manages (i.e. tagged with the gravyflow.managed-by label),
+// so that Caddy routes can be synced to reflect what's actually deployed.
 func ListRunningManagedContainers() ([]ContainerInfo, error) {
-	// Implementation needed
-	return nil, nil
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return nil, fmt.Errorf("create docker client: %w", err)
+	}
+	defer dockerClient.Close()
+
+	args := filters.NewArgs(
+		filters.Arg("label", managedByLabelKey+"="+managedByLabelValue),
+		filters.Arg("status", "running"),
+	)
+
+	containers, err := dockerClient.ContainerList(ctx, container.ListOptions{
+		Filters: args,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list containers: %w", err)
+	}
+
+	result := make([]ContainerInfo, 0, len(containers))
+	for _, c := range containers {
+		name := strings.TrimPrefix(firstOrEmpty(c.Names), "/")
+		if appName := c.Labels["gravyflow.app-name"]; appName != "" {
+			name = appName
+		}
+
+		internalIP := ""
+		if c.NetworkSettings != nil {
+			for _, ep := range c.NetworkSettings.Networks {
+				if ep != nil && ep.IPAddress != "" {
+					internalIP = ep.IPAddress
+					break
+				}
+			}
+		}
+
+		result = append(result, ContainerInfo{
+			ContainerName: name,
+			InternalIP:    internalIP,
+			InternalPort:  c.Labels["gravyflow.internal-port"],
+			DeploymentID:  c.Labels["gravyflow.deployment-id"],
+			Labels:        c.Labels,
+			HealthStatus:  c.Status,
+			StartedAt:     time.Unix(c.Created, 0),
+		})
+	}
+
+	return result, nil
+}
+
+func firstOrEmpty(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
 }

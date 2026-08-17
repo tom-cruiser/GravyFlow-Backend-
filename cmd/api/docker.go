@@ -298,7 +298,13 @@ func CreateAndStartContainer(
     return CreateAndStartContainerWithHealthCheck(imageName, containerName, deploymentID, portMap, envVars, memoryMB, cpus, HealthCheckConfig{})
 }
 
-func StopAndRemoveContainer(containerID string) error {
+// removeVolumes controls whether anonymous/named volumes attached to the
+// container are removed along with it. It's false at every call site except
+// AdminHardDeleteUser (Admin Control Panel, Module A) — the spec's hard-delete
+// workflow explicitly calls for purging storage volumes, while every other
+// caller (force-stop, risk-alert isolate, restart, routine deployment
+// cleanup) only ever needs the container itself torn down.
+func StopAndRemoveContainer(containerID string, removeVolumes bool) error {
     containerID = strings.TrimSpace(containerID)
     if containerID == "" {
         return fmt.Errorf("containerID is required")
@@ -317,7 +323,7 @@ func StopAndRemoveContainer(containerID string) error {
         }
     }
 
-    if err := dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); err != nil {
+    if err := dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true, RemoveVolumes: removeVolumes}); err != nil {
         return fmt.Errorf("remove container %q: %w", containerID, err)
     }
 
@@ -334,7 +340,7 @@ func RestartContainer(
     memoryMB int64,
     cpus float64,
 ) (string, error) {
-    if err := StopAndRemoveContainer(containerID); err != nil {
+    if err := StopAndRemoveContainer(containerID, false); err != nil {
         return "", err
     }
     return CreateAndStartContainer(imageName, containerName, deploymentID, portMap, envVars, memoryMB, cpus)
@@ -452,6 +458,34 @@ func GetContainerStats(ctx context.Context, containerID string) (*ContainerStats
         PIDs:        int(v.PidsStats.Current),
         Timestamp:   time.Now(),
     }, nil
+}
+
+// GetClusterDiskUsage reports total disk space consumed by Docker images and
+// volumes, the "docker system df" equivalent. Unlike GetContainerStats (which
+// is sampled per-container), this is a single cluster-wide Engine API call —
+// image layers and volumes aren't scoped to one container, so there's nothing
+// to fan out per deployment.
+func GetClusterDiskUsage(ctx context.Context) (float64, error) {
+    dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+    if err != nil {
+        return 0, fmt.Errorf("create docker client: %w", err)
+    }
+    defer dockerClient.Close()
+
+    usage, err := dockerClient.DiskUsage(ctx, types.DiskUsageOptions{
+        Types: []types.DiskUsageObject{types.ImageObject, types.VolumeObject},
+    })
+    if err != nil {
+        return 0, fmt.Errorf("get disk usage: %w", err)
+    }
+
+    total := float64(usage.LayersSize)
+    for _, v := range usage.Volumes {
+        if v != nil && v.UsageData != nil && v.UsageData.Size > 0 {
+            total += float64(v.UsageData.Size)
+        }
+    }
+    return total, nil
 }
 
 // blockIOReadWrite sums block I/O bytes by operation type. On cgroups v2

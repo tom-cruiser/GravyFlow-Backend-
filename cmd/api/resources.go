@@ -20,10 +20,11 @@ const (
 	defaultMaxMemoryMB    = 1024
 	defaultMaxApps        = 3
 	defaultMaxStorageMB   = 2048
+	defaultMaxBandwidthGB = 100
 	defaultDeployCPU      = 0.50
 	defaultDeployMemoryMB = 512
 	defaultDeployApps     = 1
-	
+
 	quotaCheckTimeout = 10 * time.Second
 	quotaAlertThreshold = 0.8 // 80% usage triggers alert
 )
@@ -33,13 +34,14 @@ const (
 // ============================================================================
 
 type QuotaRecord struct {
-	UserID       string    `json:"userId"`
-	MaxCPU       float64   `json:"maxCpu"`
-	MaxMemoryMB  int64     `json:"maxMemoryMb"`
-	MaxApps      int64     `json:"maxApps"`
-	MaxStorageMB int64     `json:"maxStorageMb"`
-	CreatedAt    time.Time `json:"createdAt"`
-	UpdatedAt    time.Time `json:"updatedAt"`
+	UserID         string    `json:"userId"`
+	MaxCPU         float64   `json:"maxCpu"`
+	MaxMemoryMB    int64     `json:"maxMemoryMb"`
+	MaxApps        int64     `json:"maxApps"`
+	MaxStorageMB   int64     `json:"maxStorageMb"`
+	MaxBandwidthGB int64     `json:"maxBandwidthGb"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
 type ResourceUsageRecord struct {
@@ -101,6 +103,7 @@ func (s *DeploymentStore) UpdateQuota(
 	maxMemoryMB *int64,
 	maxApps *int64,
 	maxStorageMB *int64,
+	maxBandwidthGB *int64,
 	changedBy string,
 ) (QuotaRecord, error) {
 	if s == nil || s.pool == nil {
@@ -152,6 +155,11 @@ func (s *DeploymentStore) UpdateQuota(
 		args = append(args, *maxStorageMB)
 		argIndex++
 	}
+	if maxBandwidthGB != nil && *maxBandwidthGB >= 0 {
+		updates = append(updates, fmt.Sprintf("max_bandwidth_gb = $%d", argIndex))
+		args = append(args, *maxBandwidthGB)
+		argIndex++
+	}
 
 	if len(updates) == 0 {
 		return QuotaRecord{}, fmt.Errorf("no fields to update")
@@ -162,7 +170,7 @@ func (s *DeploymentStore) UpdateQuota(
 UPDATE quotas
 SET %s
 WHERE user_id = $1
-RETURNING user_id::text, max_cpu, max_memory_mb, max_apps, max_storage_mb, created_at, updated_at
+RETURNING user_id::text, max_cpu, max_memory_mb, max_apps, max_storage_mb, max_bandwidth_gb, created_at, updated_at
 `, strings.Join(updates, ", "))
 
 	var record QuotaRecord
@@ -172,6 +180,7 @@ RETURNING user_id::text, max_cpu, max_memory_mb, max_apps, max_storage_mb, creat
 		&record.MaxMemoryMB,
 		&record.MaxApps,
 		&record.MaxStorageMB,
+		&record.MaxBandwidthGB,
 		&record.CreatedAt,
 		&record.UpdatedAt,
 	); err != nil {
@@ -201,7 +210,7 @@ func (s *DeploymentStore) GetQuota(ctx context.Context, userID string) (QuotaRec
 
 	var record QuotaRecord
 	err := s.pool.QueryRow(ctx, `
-SELECT user_id::text, max_cpu, max_memory_mb, max_apps, max_storage_mb, created_at, updated_at
+SELECT user_id::text, max_cpu, max_memory_mb, max_apps, max_storage_mb, max_bandwidth_gb, created_at, updated_at
 FROM quotas
 WHERE user_id = $1
 `, userID).Scan(
@@ -210,6 +219,7 @@ WHERE user_id = $1
 		&record.MaxMemoryMB,
 		&record.MaxApps,
 		&record.MaxStorageMB,
+		&record.MaxBandwidthGB,
 		&record.CreatedAt,
 		&record.UpdatedAt,
 	)
@@ -240,6 +250,7 @@ func (s *DeploymentStore) recordQuotaHistory(
 		{"max_memory_mb", fmt.Sprintf("%d", old.MaxMemoryMB), fmt.Sprintf("%d", new.MaxMemoryMB)},
 		{"max_apps", fmt.Sprintf("%d", old.MaxApps), fmt.Sprintf("%d", new.MaxApps)},
 		{"max_storage_mb", fmt.Sprintf("%d", old.MaxStorageMB), fmt.Sprintf("%d", new.MaxStorageMB)},
+		{"max_bandwidth_gb", fmt.Sprintf("%d", old.MaxBandwidthGB), fmt.Sprintf("%d", new.MaxBandwidthGB)},
 	}
 
 	for _, change := range changes {
@@ -787,6 +798,15 @@ CREATE TABLE IF NOT EXISTS quotas (
 	updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
 )`)
 	if err != nil {
+		return err
+	}
+
+	// Admin Control Panel (Module C): bandwidth quota override. On a database
+	// provisioned via db/schema.sql this column already exists, making this a
+	// no-op; on one provisioned only through this function (CREATE TABLE IF
+	// NOT EXISTS above predates the column and won't add it to an existing
+	// table), this ALTER is what actually gets it there.
+	if _, err := s.pool.Exec(ctx, `ALTER TABLE quotas ADD COLUMN IF NOT EXISTS max_bandwidth_gb INTEGER NOT NULL DEFAULT 100`); err != nil {
 		return err
 	}
 

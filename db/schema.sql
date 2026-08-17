@@ -40,7 +40,18 @@ CREATE TABLE IF NOT EXISTS users (
     display_name TEXT NOT NULL,
     avatar_url TEXT,
     is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Account Status Management (Admin Control Panel, Module A): active,
+    -- suspended, flagged, or deleted. is_active predates this and is kept
+    -- only so nothing relying on it directly breaks; the Go API reads/writes
+    -- status exclusively (see cmd/api/db.go UserRecord).
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    status TEXT NOT NULL DEFAULT 'active',
+    deleted_reason TEXT,
+    mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    mfa_totp_secret TEXT,
+    -- Admin Control Panel (Module A): search/filter by GitHub handle. No
+    -- OAuth/GitHub-linking flow exists yet, so this is a plain nullable field.
+    github_handle TEXT,
     last_login_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -134,7 +145,9 @@ CREATE TABLE IF NOT EXISTS quota_history (
     field TEXT NOT NULL,
     old_value TEXT,
     new_value TEXT,
-    changed_by UUID NOT NULL REFERENCES users(id),
+    -- Nullable + SET NULL, not RESTRICT: an admin who changed someone else's
+    -- quota must still be hard-deletable (Admin Control Panel, Module A).
+    changed_by UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -515,14 +528,30 @@ CREATE INDEX IF NOT EXISTS idx_deployment_metrics_recorded_at ON deployment_metr
 -- AUDIT LOGS
 -- ============================================================================
 
+-- Admin Control Panel, Module D. actor_user_id/actor_email/target_type/
+-- target_id are what cmd/api/admin_audit.go's RecordAuditLog actually writes;
+-- user_id/resource_type/resource_id/user_agent predate that and are kept
+-- only for backward compatibility with anything still reading them directly.
 CREATE TABLE IF NOT EXISTS audit_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    -- No REFERENCES: the BEFORE UPDATE immutability trigger below rejects
+    -- Postgres's own ON DELETE SET NULL cascade just like it rejects any
+    -- other UPDATE, so a real FK here would make AdminHardDeleteUser fail for
+    -- any user who ever appears as an actor. actor_email is the durable,
+    -- human-readable identifier that's expected to outlive the actor's row.
+    actor_user_id UUID,
+    actor_email TEXT,
     action TEXT NOT NULL,
-    resource_type TEXT NOT NULL,
+    resource_type TEXT, -- legacy alias for target_type; RecordAuditLog doesn't populate it
     resource_id UUID,
+    target_type TEXT,
+    target_id TEXT,
     details JSONB,
-    ip_address INET,
+    -- TEXT, not INET: RecordAuditLog (cmd/api/admin_audit.go) always writes
+    -- c.ClientIP() as plain text and an empty/masked value would fail INET's
+    -- validation on insert.
+    ip_address TEXT,
     user_agent TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -530,6 +559,77 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs (user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_resource ON audit_logs (resource_type, resource_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_actor ON audit_logs (actor_user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_target ON audit_logs (target_type, target_id);
+
+-- Immutable Log Enforcement: reject any UPDATE/DELETE at the database level,
+-- not just by omitting those endpoints from the API.
+CREATE OR REPLACE FUNCTION prevent_audit_log_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_logs is immutable: % is not permitted', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS audit_logs_no_update ON audit_logs;
+CREATE TRIGGER audit_logs_no_update BEFORE UPDATE ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION prevent_audit_log_mutation();
+
+DROP TRIGGER IF EXISTS audit_logs_no_delete ON audit_logs;
+CREATE TRIGGER audit_logs_no_delete BEFORE DELETE ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION prevent_audit_log_mutation();
+
+-- ============================================================================
+-- CREDIT LEDGER (Admin Control Panel, Module C)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS credit_ledger (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    amount_cents BIGINT NOT NULL,
+    entry_type TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    -- Nullable + SET NULL, not RESTRICT: an admin who issued someone else
+    -- credit must still be hard-deletable.
+    issued_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_credit_ledger_user_id ON credit_ledger (user_id);
+
+-- ============================================================================
+-- RISK ALERTS (Admin Control Panel, Module C: Fraud & Abuse System)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS risk_alerts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    deployment_id UUID REFERENCES deployments(id) ON DELETE CASCADE,
+    risk_score INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    resolved_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    resolved_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_risk_alerts_status ON risk_alerts (status);
+CREATE INDEX IF NOT EXISTS idx_risk_alerts_user_id ON risk_alerts (user_id);
+
+-- ============================================================================
+-- IMPERSONATION GRANTS (Admin Control Panel, Module A: Impersonation Mode)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS impersonation_grants (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    admin_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    target_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    reason TEXT,
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_impersonation_grants_target ON impersonation_grants (target_user_id);
 
 -- ============================================================================
 -- MIGRATION HELPER FUNCTIONS

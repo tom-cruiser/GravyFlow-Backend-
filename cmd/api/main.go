@@ -237,14 +237,18 @@ func setupRouter(config ServerConfig) *gin.Engine {
 		api.POST("/auth/register", registerHandler)
 		api.POST("/auth/login", loginHandler)
 		api.POST("/auth/refresh", refreshHandler)
+		api.POST("/auth/mfa/verify", mfaVerifyHandler)
 
 		// Protected routes
 		protected := api.Group("/")
 		protected.Use(AuthMiddleware(false))
+		protected.Use(ImpersonationReadOnlyMiddleware())
 		{
 			// Auth
 			protected.POST("/auth/api-keys", AuthMiddleware(true), createAPIKeyHandler)
-			
+			protected.POST("/auth/mfa/enroll", mfaEnrollHandler)
+			protected.POST("/auth/mfa/enable", mfaEnableHandler)
+
 			// Apps
 			protected.GET("/apps", listAppsHandler)
 			protected.POST("/apps", createAppHandler)
@@ -271,6 +275,41 @@ func setupRouter(config ServerConfig) *gin.Engine {
 
 			// Quota
 			protected.GET("/users/:id/quota", quotaSummaryHandler)
+
+			// Admin Control Panel — internal System Administrators / SREs only.
+			admin := protected.Group("/admin")
+			admin.Use(AdminMiddleware())
+			{
+				// Module A: User & Team Administration
+				admin.GET("/users", adminListUsersHandler)
+				admin.GET("/users/:id", adminGetUserHandler)
+				admin.PATCH("/users/:id/status", adminSetUserStatusHandler)
+				admin.POST("/users/:id/delete", adminDeleteUserHandler)
+				admin.POST("/users/:id/impersonate", adminImpersonateHandler)
+
+				// Module B: Infrastructure & Deployment Management
+				admin.GET("/cluster/overview", adminClusterOverviewHandler)
+				admin.GET("/deployments", adminListDeploymentsHandler)
+				admin.POST("/deployments/:id/restart", adminRestartServiceHandler)
+				admin.POST("/deployments/:id/force-stop", adminForceStopHandler)
+				admin.POST("/deployments/:id/purge-cache", adminPurgeCacheHandler)
+				admin.GET("/deployments/:id/env", adminGetDeploymentEnvHandler)
+
+				// Module C: Billing, Quotas & Abuse Control
+				admin.PATCH("/users/:id/quota", adminUpdateQuotaHandler)
+				admin.POST("/users/:id/quota/restore-defaults", adminRestoreDefaultQuotaHandler)
+				admin.POST("/users/:id/quota/reset-usage", adminResetQuotaHandler)
+				admin.GET("/users/:id/quota/history", adminGetQuotaHistoryHandler)
+				admin.GET("/users/:id/credits", adminGetCreditBalanceHandler)
+				admin.POST("/users/:id/credits/issue", adminIssueCreditHandler)
+				admin.POST("/users/:id/credits/revoke", adminRevokeCreditHandler)
+				admin.GET("/risk-alerts", adminListRiskAlertsHandler)
+				admin.POST("/risk-alerts/:id/isolate", adminIsolateServiceHandler)
+
+				// Module D: System Audit Logs (insert-only; no update/delete route
+				// exists for audit_logs, and the DB trigger rejects it even so)
+				admin.GET("/audit-logs", adminListAuditLogsHandler)
+			}
 		}
 	}
 

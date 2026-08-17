@@ -50,12 +50,37 @@ const (
 // ============================================================================
 
 type UserRecord struct {
-	ID           string
-	Email        string
-	DisplayName  string
-	PasswordHash string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID            string
+	Email         string
+	DisplayName   string
+	PasswordHash  string
+	IsAdmin       bool
+	Status        string
+	DeletedAt     *time.Time
+	DeletedReason string
+	MFAEnabled    bool
+	MFATOTPSecret string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+// Account status values for Module A (User & Team Administration). Stored in
+// users.status as plain TEXT (no DB-level CHECK constraint, consistent with
+// deployments.status elsewhere in this schema) and validated in Go.
+const (
+	UserStatusActive    = "active"
+	UserStatusSuspended = "suspended"
+	UserStatusFlagged   = "flagged"
+	UserStatusDeleted   = "deleted"
+)
+
+func isValidUserStatus(status string) bool {
+	switch status {
+	case UserStatusActive, UserStatusSuspended, UserStatusFlagged, UserStatusDeleted:
+		return true
+	default:
+		return false
+	}
 }
 
 type ProjectRecord struct {
@@ -287,6 +312,25 @@ func NewDeploymentStore(ctx context.Context) (*DeploymentStore, error) {
 
 	// Run migrations
 	if err := store.CreateTablesIfNotExists(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+
+	// These were previously defined but never invoked at startup, so the
+	// quotas/resource_usage/quota_history/quota_alerts and deployment env var
+	// tables they guard were only ever created on a fresh docker-entrypoint
+	// initdb run (via db/schema.sql), never on an existing database. Wiring
+	// them in here is required for Module C (quota overrides) to work at all.
+	if err := store.CreateQuotaTablesIfNotExists(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	if err := store.CreateEnvTablesIfNotExists(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+
+	if err := store.BootstrapAdminUsers(ctx); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -646,6 +690,156 @@ BEGIN
         ALTER TABLE domains ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP WITH TIME ZONE;
     END IF;
 END $$`},
+		// Admin Control Panel (Module A): account status/role columns on users.
+		{13, `
+DO $$
+BEGIN
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_reason TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP WITH TIME ZONE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_totp_secret TEXT;
+
+    -- deployment_env_vars was created by migration 8 without these columns;
+    -- envs.go's ListDeploymentEnvVarsWithValues (used by both the self-service
+    -- env manager and the admin secret inspector) has always selected them, so
+    -- on any database provisioned before this migration that query 500s. Add
+    -- them here so it actually works instead of only on a fresh install.
+    ALTER TABLE deployment_env_vars ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'general';
+    ALTER TABLE deployment_env_vars ADD COLUMN IF NOT EXISTS sensitive BOOLEAN DEFAULT FALSE;
+    ALTER TABLE deployment_env_vars ADD COLUMN IF NOT EXISTS description TEXT;
+END $$`},
+		// Admin Control Panel (Module D): immutable audit log. A BEFORE
+		// UPDATE/DELETE trigger enforces immutability at the database level, not
+		// just by omitting update/delete endpoints in the API.
+		//
+		// db/schema.sql (fresh-install path only, see the CreateTablesIfNotExists
+		// doc comment) already defines an older audit_logs shape
+		// (user_id/resource_type/resource_id/user_agent) that predates this
+		// migration. Rather than CREATE TABLE IF NOT EXISTS — a no-op against
+		// that older shape — this ALTERs it onto parity with what RecordAuditLog
+		// in admin_audit.go actually writes, on both a fresh install and an
+		// existing database that never had audit_logs at all. The added columns
+		// are nullable at the DB level (Go always populates them) so this is
+		// safe to run even if legacy rows already exist.
+		{14, `
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS actor_email TEXT;
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS action TEXT;
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS target_type TEXT;
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS target_id TEXT;
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS details JSONB;
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS ip_address TEXT;
+-- db/schema.sql's fresh-install shape declares resource_type NOT NULL;
+-- RecordAuditLog never populates it (it writes target_type instead), so an
+-- unrelaxed constraint would reject every insert on a database provisioned
+-- from that file.
+ALTER TABLE audit_logs ALTER COLUMN resource_type DROP NOT NULL;
+-- db/schema.sql's fresh-install shape declares ip_address INET; RecordAuditLog
+-- always writes c.ClientIP() as plain text, and an empty/malformed value (no
+-- client IP in a test context, a masked value, etc.) fails Postgres's inet
+-- validation on insert. Widen unconditionally to TEXT — a no-op if it's
+-- already TEXT, a safe conversion if it's still INET from schema.sql.
+ALTER TABLE audit_logs ALTER COLUMN ip_address TYPE TEXT USING ip_address::text;
+
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_actor ON audit_logs(actor_user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_target ON audit_logs(target_type, target_id);
+
+CREATE OR REPLACE FUNCTION prevent_audit_log_mutation() RETURNS trigger AS $body$
+BEGIN
+    RAISE EXCEPTION 'audit_logs is immutable: % is not permitted', TG_OP;
+END;
+$body$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS audit_logs_no_update ON audit_logs;
+CREATE TRIGGER audit_logs_no_update BEFORE UPDATE ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION prevent_audit_log_mutation();
+
+DROP TRIGGER IF EXISTS audit_logs_no_delete ON audit_logs;
+CREATE TRIGGER audit_logs_no_delete BEFORE DELETE ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION prevent_audit_log_mutation()`},
+		// Admin Control Panel (Module C): credit ledger + fraud/abuse risk alerts,
+		// and (Module A) short-lived read-only impersonation grants.
+		{15, `
+CREATE TABLE IF NOT EXISTS credit_ledger (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    amount_cents BIGINT NOT NULL,
+    entry_type TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    issued_by UUID NOT NULL REFERENCES users(id),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_credit_ledger_user_id ON credit_ledger(user_id);
+
+CREATE TABLE IF NOT EXISTS risk_alerts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    deployment_id UUID REFERENCES deployments(id) ON DELETE CASCADE,
+    risk_score INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    resolved_by UUID REFERENCES users(id),
+    resolved_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_risk_alerts_status ON risk_alerts(status);
+CREATE INDEX IF NOT EXISTS idx_risk_alerts_user_id ON risk_alerts(user_id);
+
+CREATE TABLE IF NOT EXISTS impersonation_grants (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    admin_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    target_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    reason TEXT,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    revoked_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+)`},
+		// AdminHardDeleteUser (Module A) must be able to delete an admin who
+		// has ever acted on someone ELSE's records — e.g. changed another
+		// user's quota or issued them credit. quota_history.changed_by and
+		// credit_ledger.issued_by were both NOT NULL REFERENCES users(id) with
+		// no ON DELETE clause (defaults to RESTRICT), which blocks deleting
+		// that admin entirely as long as the history row exists. Widen both to
+		// nullable + ON DELETE SET NULL, the same pattern already used by
+		// audit_logs.actor_user_id, so the target's own quota/credit rows
+		// still cascade-delete via user_id, but a now-gone actor just leaves a
+		// null "changed_by" instead of blocking deletion.
+		{16, `
+ALTER TABLE quota_history ALTER COLUMN changed_by DROP NOT NULL;
+ALTER TABLE quota_history DROP CONSTRAINT IF EXISTS quota_history_changed_by_fkey;
+ALTER TABLE quota_history ADD CONSTRAINT quota_history_changed_by_fkey FOREIGN KEY (changed_by) REFERENCES users(id) ON DELETE SET NULL;
+
+ALTER TABLE credit_ledger ALTER COLUMN issued_by DROP NOT NULL;
+ALTER TABLE credit_ledger DROP CONSTRAINT IF EXISTS credit_ledger_issued_by_fkey;
+ALTER TABLE credit_ledger ADD CONSTRAINT credit_ledger_issued_by_fkey FOREIGN KEY (issued_by) REFERENCES users(id) ON DELETE SET NULL;
+
+ALTER TABLE risk_alerts DROP CONSTRAINT IF EXISTS risk_alerts_resolved_by_fkey;
+ALTER TABLE risk_alerts ADD CONSTRAINT risk_alerts_resolved_by_fkey FOREIGN KEY (resolved_by) REFERENCES users(id) ON DELETE SET NULL;
+
+-- audit_logs.actor_user_id was declared ON DELETE SET NULL, but Postgres
+-- implements that as an UPDATE against audit_logs, and the BEFORE UPDATE
+-- immutability trigger (migration 14) unconditionally rejects every UPDATE —
+-- including this system-generated one. That makes AdminHardDeleteUser fail
+-- for any user who ever appears as an actor in the audit log, i.e. almost
+-- every admin. The fix is to drop the FK outright: an immutable log must
+-- survive the actor being deleted unchanged, not have it nulled out, and
+-- actor_email is already stored as the durable, human-readable identifier
+-- for exactly this reason.
+ALTER TABLE audit_logs DROP CONSTRAINT IF EXISTS audit_logs_actor_user_id_fkey`},
+		// Admin Control Panel (Module A): user search/filtering also needs to
+		// match by GitHub handle, alongside the existing email/user-id/workspace
+		// filters in AdminListUsers. There is no OAuth/GitHub-linking flow in
+		// this codebase yet, so the column is a plain nullable TEXT an operator
+		// (or a future linking flow) can populate directly.
+		{17, `ALTER TABLE users ADD COLUMN IF NOT EXISTS github_handle TEXT`},
 	}
 
 	for _, migration := range migrations {
@@ -745,10 +939,11 @@ func (s *DeploymentStore) CreateUser(ctx context.Context, email string, displayN
 	err := s.pool.QueryRow(ctx, `
 INSERT INTO users (email, password_hash, display_name)
 VALUES ($1, $2, $3)
-RETURNING id::text, email, display_name, password_hash, created_at, updated_at
+RETURNING id::text, email, display_name, password_hash, is_admin, status, deleted_at, COALESCE(deleted_reason, ''), mfa_enabled, COALESCE(mfa_totp_secret, ''), created_at, updated_at
 `, email, passwordHash, displayName).Scan(
-		&user.ID, &user.Email, &user.DisplayName,
-		&user.PasswordHash, &user.CreatedAt, &user.UpdatedAt,
+		&user.ID, &user.Email, &user.DisplayName, &user.PasswordHash,
+		&user.IsAdmin, &user.Status, &user.DeletedAt, &user.DeletedReason,
+		&user.MFAEnabled, &user.MFATOTPSecret, &user.CreatedAt, &user.UpdatedAt,
 	)
 	if err != nil {
 		return UserRecord{}, &StoreError{
@@ -783,10 +978,14 @@ func (s *DeploymentStore) GetUserByEmail(ctx context.Context, email string) (Use
 
 	var user UserRecord
 	err := s.pool.QueryRow(ctx, `
-SELECT id::text, email, display_name, password_hash, created_at, updated_at
+SELECT id::text, email, display_name, password_hash, is_admin, status, deleted_at, COALESCE(deleted_reason, ''), mfa_enabled, COALESCE(mfa_totp_secret, ''), created_at, updated_at
 FROM users
 WHERE email = $1
-`, email).Scan(&user.ID, &user.Email, &user.DisplayName, &user.PasswordHash, &user.CreatedAt, &user.UpdatedAt)
+`, email).Scan(
+		&user.ID, &user.Email, &user.DisplayName, &user.PasswordHash,
+		&user.IsAdmin, &user.Status, &user.DeletedAt, &user.DeletedReason,
+		&user.MFAEnabled, &user.MFATOTPSecret, &user.CreatedAt, &user.UpdatedAt,
+	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return UserRecord{}, &StoreError{
@@ -822,10 +1021,14 @@ func (s *DeploymentStore) GetUserByID(ctx context.Context, userID string) (UserR
 
 	var user UserRecord
 	err := s.pool.QueryRow(ctx, `
-SELECT id::text, email, display_name, password_hash, created_at, updated_at
+SELECT id::text, email, display_name, password_hash, is_admin, status, deleted_at, COALESCE(deleted_reason, ''), mfa_enabled, COALESCE(mfa_totp_secret, ''), created_at, updated_at
 FROM users
 WHERE id = $1
-`, userID).Scan(&user.ID, &user.Email, &user.DisplayName, &user.PasswordHash, &user.CreatedAt, &user.UpdatedAt)
+`, userID).Scan(
+		&user.ID, &user.Email, &user.DisplayName, &user.PasswordHash,
+		&user.IsAdmin, &user.Status, &user.DeletedAt, &user.DeletedReason,
+		&user.MFAEnabled, &user.MFATOTPSecret, &user.CreatedAt, &user.UpdatedAt,
+	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return UserRecord{}, &StoreError{
@@ -841,6 +1044,16 @@ WHERE id = $1
 	}
 
 	return user, nil
+}
+
+// UpdateLastLogin stamps last_login_at on a successful login. Best-effort:
+// callers should log rather than fail the login request if this errors.
+func (s *DeploymentStore) UpdateLastLogin(ctx context.Context, userID string) error {
+	if s == nil || s.pool == nil {
+		return &StoreError{Type: ErrDatabase, Message: "deployment store is not initialized"}
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE users SET last_login_at = now() WHERE id = $1`, userID)
+	return err
 }
 
 func (s *DeploymentStore) UpdateUser(ctx context.Context, userID string, displayName string) error {

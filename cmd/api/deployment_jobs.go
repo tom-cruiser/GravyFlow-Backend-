@@ -882,7 +882,7 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 		if progress != nil {
 			progress("stopping", 35, "stopping existing container")
 		}
-		if err := StopAndRemoveContainer(deployment.ContainerID); err != nil {
+		if err := StopAndRemoveContainer(deployment.ContainerID, false); err != nil {
 			return DeploymentJobStatus{}, err
 		}
 	}

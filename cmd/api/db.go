@@ -840,6 +840,14 @@ ALTER TABLE audit_logs DROP CONSTRAINT IF EXISTS audit_logs_actor_user_id_fkey`}
 		// this codebase yet, so the column is a plain nullable TEXT an operator
 		// (or a future linking flow) can populate directly.
 		{17, `ALTER TABLE users ADD COLUMN IF NOT EXISTS github_handle TEXT`},
+		// Admin Control Panel (Module E: Admin Profile & Credentials
+		// Management). password_changed_at is a plain audit/UX timestamp,
+		// not an enforcement mechanism (there is no forced-rotation policy
+		// reading it yet). mfa_recovery_codes stores SHA-256 hashes only —
+		// see cmd/api/admin_profile.go's SetMFARecoveryCodes.
+		{18, `
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_recovery_codes TEXT[]`},
 	}
 
 	for _, migration := range migrations {

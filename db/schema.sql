@@ -49,6 +49,12 @@ CREATE TABLE IF NOT EXISTS users (
     deleted_reason TEXT,
     mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE,
     mfa_totp_secret TEXT,
+    -- Admin Control Panel (Module E: Admin Profile & Credentials
+    -- Management). Hashed (SHA-256) one-time MFA fallback codes — see
+    -- cmd/api/admin_profile.go's SetMFARecoveryCodes. password_changed_at is
+    -- an audit/UX timestamp only; no forced-rotation policy reads it yet.
+    mfa_recovery_codes TEXT[],
+    password_changed_at TIMESTAMPTZ,
     -- Admin Control Panel (Module A): search/filter by GitHub handle. No
     -- OAuth/GitHub-linking flow exists yet, so this is a plain nullable field.
     github_handle TEXT,

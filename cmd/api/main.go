@@ -309,6 +309,13 @@ func setupRouter(config ServerConfig) *gin.Engine {
 				// Module D: System Audit Logs (insert-only; no update/delete route
 				// exists for audit_logs, and the DB trigger rejects it even so)
 				admin.GET("/audit-logs", adminListAuditLogsHandler)
+
+				// Module E: Admin Profile & Credentials Management — the
+				// admin/SRE managing their OWN account, distinct from every
+				// route above which acts on another user's account.
+				admin.POST("/profile/password", adminChangePasswordHandler)
+				admin.POST("/profile/mfa/disable", adminMFADisableHandler)
+				admin.POST("/profile/mfa/recovery-codes/regenerate", adminRegenerateRecoveryCodesHandler)
 			}
 		}
 	}

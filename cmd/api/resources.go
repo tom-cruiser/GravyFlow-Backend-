@@ -40,8 +40,15 @@ type QuotaRecord struct {
 	MaxApps        int64     `json:"maxApps"`
 	MaxStorageMB   int64     `json:"maxStorageMb"`
 	MaxBandwidthGB int64     `json:"maxBandwidthGb"`
-	CreatedAt      time.Time `json:"createdAt"`
-	UpdatedAt      time.Time `json:"updatedAt"`
+	// Plan is a display/bookkeeping label ("free"/"pro"/"business", see
+	// billing_plans.go) — it does not itself enforce anything; the numeric
+	// Max* fields above are what's actually checked. An admin overriding a
+	// user's quota directly (admin_billing.go) leaves Plan unchanged, so it
+	// can drift from the numbers if that happens — same tradeoff as any
+	// "current tier" label next to admin-overridable limits.
+	Plan      string    `json:"plan"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 type ResourceUsageRecord struct {
@@ -170,7 +177,7 @@ func (s *DeploymentStore) UpdateQuota(
 UPDATE quotas
 SET %s
 WHERE user_id = $1
-RETURNING user_id::text, max_cpu, max_memory_mb, max_apps, max_storage_mb, max_bandwidth_gb, created_at, updated_at
+RETURNING user_id::text, max_cpu, max_memory_mb, max_apps, max_storage_mb, max_bandwidth_gb, plan, created_at, updated_at
 `, strings.Join(updates, ", "))
 
 	var record QuotaRecord
@@ -181,6 +188,7 @@ RETURNING user_id::text, max_cpu, max_memory_mb, max_apps, max_storage_mb, max_b
 		&record.MaxApps,
 		&record.MaxStorageMB,
 		&record.MaxBandwidthGB,
+		&record.Plan,
 		&record.CreatedAt,
 		&record.UpdatedAt,
 	); err != nil {
@@ -210,7 +218,7 @@ func (s *DeploymentStore) GetQuota(ctx context.Context, userID string) (QuotaRec
 
 	var record QuotaRecord
 	err := s.pool.QueryRow(ctx, `
-SELECT user_id::text, max_cpu, max_memory_mb, max_apps, max_storage_mb, max_bandwidth_gb, created_at, updated_at
+SELECT user_id::text, max_cpu, max_memory_mb, max_apps, max_storage_mb, max_bandwidth_gb, plan, created_at, updated_at
 FROM quotas
 WHERE user_id = $1
 `, userID).Scan(
@@ -220,6 +228,7 @@ WHERE user_id = $1
 		&record.MaxApps,
 		&record.MaxStorageMB,
 		&record.MaxBandwidthGB,
+		&record.Plan,
 		&record.CreatedAt,
 		&record.UpdatedAt,
 	)
@@ -227,6 +236,19 @@ WHERE user_id = $1
 		return QuotaRecord{}, fmt.Errorf("get quota: %w", err)
 	}
 	return record, nil
+}
+
+// SetQuotaPlan updates only the display/bookkeeping plan label — see the
+// comment on QuotaRecord.Plan. Split out from UpdateQuota (rather than
+// folded into its dynamic SET clause) so admin_billing.go's callers, which
+// have no notion of "plan," don't have to pass a value through for a field
+// they don't know about.
+func (s *DeploymentStore) SetQuotaPlan(ctx context.Context, userID string, plan string) error {
+	if s == nil || s.pool == nil {
+		return fmt.Errorf("deployment store is not initialized")
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE quotas SET plan = $1, updated_at = now() WHERE user_id = $2`, plan, userID)
+	return err
 }
 
 // ============================================================================
@@ -253,16 +275,32 @@ func (s *DeploymentStore) recordQuotaHistory(
 		{"max_bandwidth_gb", fmt.Sprintf("%d", old.MaxBandwidthGB), fmt.Sprintf("%d", new.MaxBandwidthGB)},
 	}
 
+	// Batched into a single multi-row INSERT instead of one round trip per
+	// changed field: against a local Postgres the difference is noise, but
+	// against a remote/pooled database (e.g. Neon) each round trip carries
+	// real network latency, and billing_plans.go's plan switcher routinely
+	// changes all 5 fields at once — that was 5 sequential round trips (plus
+	// BeginTx/UPDATE/Commit around them) for one plan switch, measured at
+	// ~9s end-to-end before this change.
+	args := make([]any, 0, len(changes)*5)
+	placeholders := make([]string, 0, len(changes))
+	argIndex := 1
 	for _, change := range changes {
-		if change.oldValue != change.newValue {
-			_, err := tx.Exec(ctx, `
-INSERT INTO quota_history (user_id, field, old_value, new_value, changed_by)
-VALUES ($1, $2, $3, $4, $5)
-`, userID, change.field, change.oldValue, change.newValue, changedBy)
-			if err != nil {
-				return fmt.Errorf("record quota history: %w", err)
-			}
+		if change.oldValue == change.newValue {
+			continue
 		}
+		placeholders = append(placeholders, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d)", argIndex, argIndex+1, argIndex+2, argIndex+3, argIndex+4))
+		args = append(args, userID, change.field, change.oldValue, change.newValue, changedBy)
+		argIndex += 5
+	}
+
+	if len(placeholders) == 0 {
+		return nil
+	}
+
+	query := "INSERT INTO quota_history (user_id, field, old_value, new_value, changed_by) VALUES " + strings.Join(placeholders, ", ")
+	if _, err := tx.Exec(ctx, query, args...); err != nil {
+		return fmt.Errorf("record quota history: %w", err)
 	}
 
 	return nil
@@ -332,6 +370,7 @@ SELECT
 	q.max_memory_mb,
 	q.max_apps,
 	q.max_storage_mb,
+	q.plan,
 	ru.current_cpu,
 	ru.current_memory_mb,
 	ru.current_apps,
@@ -345,6 +384,7 @@ WHERE q.user_id = $1
 		&summary.Quota.MaxMemoryMB,
 		&summary.Quota.MaxApps,
 		&summary.Quota.MaxStorageMB,
+		&summary.Quota.Plan,
 		&summary.Usage.CurrentCPU,
 		&summary.Usage.CurrentMemoryMB,
 		&summary.Usage.CurrentApps,
@@ -810,6 +850,13 @@ CREATE TABLE IF NOT EXISTS quotas (
 		return err
 	}
 
+	// Self-service subscription plans (billing_plans.go). Same idempotency
+	// reasoning as max_bandwidth_gb above — this is a no-op if migration 21
+	// (db.go) already added the column on a schema.sql-provisioned database.
+	if _, err := s.pool.Exec(ctx, `ALTER TABLE quotas ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'free'`); err != nil {
+		return err
+	}
+
 	// Create resource_usage table
 	_, err = s.pool.Exec(ctx, `
 CREATE TABLE IF NOT EXISTS resource_usage (
@@ -825,7 +872,13 @@ CREATE TABLE IF NOT EXISTS resource_usage (
 		return err
 	}
 
-	// Create quota_history table
+	// Create quota_history table. changed_by is nullable with ON DELETE SET
+	// NULL (not NOT NULL / RESTRICT) so AdminHardDeleteUser (Module A) can
+	// still hard-delete an admin who once changed someone else's quota — see
+	// the matching db/schema.sql definition and db.go migration 16, which
+	// widens this same column on a database that was instead bootstrapped
+	// from schema.sql and so already had a (stricter) quota_history table by
+	// the time this function runs.
 	_, err = s.pool.Exec(ctx, `
 CREATE TABLE IF NOT EXISTS quota_history (
 	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -833,7 +886,7 @@ CREATE TABLE IF NOT EXISTS quota_history (
 	field TEXT NOT NULL,
 	old_value TEXT,
 	new_value TEXT,
-	changed_by UUID NOT NULL REFERENCES users(id),
+	changed_by UUID REFERENCES users(id) ON DELETE SET NULL,
 	created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
 )`)
 	if err != nil {

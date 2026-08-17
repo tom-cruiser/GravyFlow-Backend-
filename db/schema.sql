@@ -119,6 +119,9 @@ CREATE TABLE IF NOT EXISTS quotas (
     max_apps INTEGER NOT NULL DEFAULT 3,
     max_storage_mb INTEGER NOT NULL DEFAULT 2048,
     max_bandwidth_gb INTEGER NOT NULL DEFAULT 100,
+    -- Self-service subscription plans (cmd/api/billing_plans.go): a
+    -- display/bookkeeping label alongside the numeric limits above.
+    plan TEXT NOT NULL DEFAULT 'free',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

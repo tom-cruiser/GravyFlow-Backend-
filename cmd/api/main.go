@@ -276,6 +276,24 @@ func setupRouter(config ServerConfig) *gin.Engine {
 			// Quota
 			protected.GET("/users/:id/quota", quotaSummaryHandler)
 
+			// Self-service subscription plans (billing_plans.go) — any
+			// authenticated user, acting only on their own quota/plan. See
+			// that file's header for why this is a quota-tier switcher, not
+			// a real checkout (no payment processor is wired in).
+			protected.GET("/billing/plans", listBillingPlansHandler)
+			protected.POST("/billing/plan", upgradeBillingPlanHandler)
+
+			// Profile & Credentials Management — any authenticated user
+			// managing their OWN account (password, MFA). Handlers live in
+			// admin_profile.go/admin_mfa.go for historical reasons (this
+			// started as an admin-only feature) but never actually checked
+			// IsAdmin — they only ever act on currentAuthUser(c), so an
+			// ordinary signed-up user gets the exact same self-service
+			// password/MFA management as an admin, at the same handlers.
+			protected.POST("/profile/password", adminChangePasswordHandler)
+			protected.POST("/profile/mfa/disable", adminMFADisableHandler)
+			protected.POST("/profile/mfa/recovery-codes/regenerate", adminRegenerateRecoveryCodesHandler)
+
 			// Admin Control Panel — internal System Administrators / SREs only.
 			admin := protected.Group("/admin")
 			admin.Use(AdminMiddleware())
@@ -309,13 +327,6 @@ func setupRouter(config ServerConfig) *gin.Engine {
 				// Module D: System Audit Logs (insert-only; no update/delete route
 				// exists for audit_logs, and the DB trigger rejects it even so)
 				admin.GET("/audit-logs", adminListAuditLogsHandler)
-
-				// Module E: Admin Profile & Credentials Management — the
-				// admin/SRE managing their OWN account, distinct from every
-				// route above which acts on another user's account.
-				admin.POST("/profile/password", adminChangePasswordHandler)
-				admin.POST("/profile/mfa/disable", adminMFADisableHandler)
-				admin.POST("/profile/mfa/recovery-codes/regenerate", adminRegenerateRecoveryCodesHandler)
 			}
 		}
 	}

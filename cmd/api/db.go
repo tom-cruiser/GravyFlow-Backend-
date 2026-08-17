@@ -736,10 +736,14 @@ ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS target_type TEXT;
 ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS target_id TEXT;
 ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS details JSONB;
 ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS ip_address TEXT;
--- db/schema.sql's fresh-install shape declares resource_type NOT NULL;
--- RecordAuditLog never populates it (it writes target_type instead), so an
--- unrelaxed constraint would reject every insert on a database provisioned
--- from that file.
+-- db/schema.sql's fresh-install shape declares resource_type NOT NULL, but a
+-- database that only ever went through these Go migrations (never had
+-- schema.sql applied, e.g. a fresh Neon/managed Postgres instance) never had
+-- this column at all — hence the ADD COLUMN IF NOT EXISTS before relaxing
+-- it. RecordAuditLog never populates it (it writes target_type instead), so
+-- an unrelaxed NOT NULL would reject every insert regardless of which path
+-- created the table.
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS resource_type TEXT;
 ALTER TABLE audit_logs ALTER COLUMN resource_type DROP NOT NULL;
 -- db/schema.sql's fresh-install shape declares ip_address INET; RecordAuditLog
 -- always writes c.ClientIP() as plain text, and an empty/malformed value (no
@@ -813,9 +817,17 @@ CREATE TABLE IF NOT EXISTS impersonation_grants (
 		// still cascade-delete via user_id, but a now-gone actor just leaves a
 		// null "changed_by" instead of blocking deletion.
 		{16, `
-ALTER TABLE quota_history ALTER COLUMN changed_by DROP NOT NULL;
-ALTER TABLE quota_history DROP CONSTRAINT IF EXISTS quota_history_changed_by_fkey;
-ALTER TABLE quota_history ADD CONSTRAINT quota_history_changed_by_fkey FOREIGN KEY (changed_by) REFERENCES users(id) ON DELETE SET NULL;
+-- IF EXISTS: quota_history is created by CreateQuotaTablesIfNotExists
+-- (resources.go), which runs AFTER this migration function returns — so on a
+-- database that never went through db/schema.sql (e.g. a fresh Neon/managed
+-- Postgres instance, as opposed to the local docker-entrypoint-initdb.d
+-- path), this table doesn't exist yet at this point. That function's own
+-- CREATE TABLE already declares changed_by nullable + ON DELETE SET NULL, so
+-- this becomes a no-op there and only does real work on a pre-existing
+-- schema.sql-provisioned table.
+ALTER TABLE IF EXISTS quota_history ALTER COLUMN changed_by DROP NOT NULL;
+ALTER TABLE IF EXISTS quota_history DROP CONSTRAINT IF EXISTS quota_history_changed_by_fkey;
+ALTER TABLE IF EXISTS quota_history ADD CONSTRAINT quota_history_changed_by_fkey FOREIGN KEY (changed_by) REFERENCES users(id) ON DELETE SET NULL;
 
 ALTER TABLE credit_ledger ALTER COLUMN issued_by DROP NOT NULL;
 ALTER TABLE credit_ledger DROP CONSTRAINT IF EXISTS credit_ledger_issued_by_fkey;
@@ -848,6 +860,132 @@ ALTER TABLE audit_logs DROP CONSTRAINT IF EXISTS audit_logs_actor_user_id_fkey`}
 		{18, `
 ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_recovery_codes TEXT[]`},
+		// teams/team_members existed only in db/schema.sql (the local
+		// docker-entrypoint-initdb.d fresh-install path) with no equivalent
+		// Go migration — same class of gap as audit_logs.resource_type
+		// (migration 14) and quota_history (migration 16): a database that
+		// only ever went through these Go migrations (e.g. a fresh Neon
+		// instance) never had these tables, and AdminListUsers (admin.go)
+		// joins against team_members unconditionally, so every call to
+		// GET /admin/users failed with "relation team_members does not
+		// exist" on such a database.
+		{19, `
+CREATE TABLE IF NOT EXISTS teams (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL UNIQUE,
+    owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_teams_slug ON teams (slug);
+CREATE INDEX IF NOT EXISTS idx_teams_owner_id ON teams (owner_id);
+
+CREATE TABLE IF NOT EXISTS team_members (
+    team_id UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL DEFAULT 'member',
+    joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (team_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_team_members_user_id ON team_members (user_id)`},
+		// Same gap as migration 19, for the domain-management feature
+		// (domains.go, domain_handlers.go — 64 references total) and the
+		// deployment-jobs feature (deployment_jobs.go — 18 references):
+		// db/schema.sql declares these five tables, but no Go migration
+		// ever created them, so every domain/job operation failed with
+		// "relation does not exist" on a database that only went through
+		// these Go migrations.
+		{20, `
+CREATE TABLE IF NOT EXISTS domains (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    deployment_id UUID NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+    app_id UUID REFERENCES deployments(id) ON DELETE CASCADE,
+    custom_domain TEXT NOT NULL UNIQUE,
+    verified BOOLEAN NOT NULL DEFAULT FALSE,
+    verification_token TEXT NOT NULL DEFAULT '',
+    verified_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_domains_project_id ON domains (project_id);
+CREATE INDEX IF NOT EXISTS idx_domains_deployment_id ON domains (deployment_id);
+CREATE INDEX IF NOT EXISTS idx_domains_app_id ON domains (app_id);
+CREATE INDEX IF NOT EXISTS idx_domains_custom_domain ON domains (custom_domain);
+CREATE INDEX IF NOT EXISTS idx_domains_verified ON domains (verified);
+
+CREATE TABLE IF NOT EXISTS domain_verification_history (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    domain_id UUID NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_domain_verification_history_domain_id ON domain_verification_history (domain_id);
+
+CREATE TABLE IF NOT EXISTS domain_redirects (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    deployment_id UUID NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+    from_domain TEXT NOT NULL UNIQUE,
+    to_domain TEXT NOT NULL,
+    permanent BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_domain_redirects_from_domain ON domain_redirects (from_domain);
+CREATE INDEX IF NOT EXISTS idx_domain_redirects_deployment_id ON domain_redirects (deployment_id);
+
+CREATE TABLE IF NOT EXISTS ssl_certificates (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    domain_id UUID NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+    issuer TEXT NOT NULL,
+    valid_from TIMESTAMPTZ NOT NULL,
+    valid_to TIMESTAMPTZ NOT NULL,
+    serial TEXT NOT NULL,
+    status TEXT DEFAULT 'active',
+    last_checked TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(domain_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ssl_certificates_valid_to ON ssl_certificates (valid_to);
+CREATE INDEX IF NOT EXISTS idx_ssl_certificates_status ON ssl_certificates (status);
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    deployment_id UUID NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    progress INTEGER DEFAULT 0,
+    message TEXT,
+    error TEXT,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_deployment_id ON jobs (deployment_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_user_id ON jobs (user_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status);
+CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs (created_at DESC)`},
+		// Self-service subscription plans (billing_plans.go): a display/
+		// bookkeeping label alongside the numeric limits quotas already had.
+		// NOT NULL DEFAULT 'free' backfills every existing row so nothing
+		// reading QuotaRecord.Plan ever sees an empty string.
+		//
+		// IF EXISTS: quotas is created by CreateQuotaTablesIfNotExists
+		// (resources.go), which runs AFTER this migration function returns
+		// — same gap as migrations 16/19/20. On a fresh (e.g. Neon)
+		// database this is a no-op, and that function's own CREATE TABLE
+		// already declares the column; on a schema.sql-provisioned
+		// database, quotas already exists before any Go migration runs, so
+		// this is where the column actually gets added.
+		{21, `ALTER TABLE IF EXISTS quotas ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'free'`},
 	}
 
 	for _, migration := range migrations {

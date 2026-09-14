@@ -261,6 +261,10 @@ func setupRouter(config ServerConfig) *gin.Engine {
 			// Environment variables
 			protected.GET("/apps/:id/env", listAppEnvHandler)
 			protected.POST("/apps/:id/env", addAppEnvHandler)
+			// Bulk upsert backs the ".env file import" flow in the UI: the
+			// client parses the pasted/uploaded file and posts the normalised
+			// pairs here in batches instead of one request per variable.
+			protected.POST("/apps/:id/env/bulk", bulkAddAppEnvHandler)
 			protected.DELETE("/apps/:id/env/:key", deleteAppEnvHandler)
 
 			// Custom domains

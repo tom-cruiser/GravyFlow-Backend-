@@ -336,8 +336,14 @@ func (m *DeploymentJobManager) EnqueueDeploymentWithConfig(
 		asynq.MaxRetry(config.MaxRetries),
 	}
 
+	// config.Timeout is a ceiling on how long the WORKER may spend processing
+	// this task (asynq.Timeout) — not a delay before the worker is allowed to
+	// start it. asynq.ProcessAt(time.Now().Add(config.Timeout)) was scheduling
+	// every deployment to begin only after its own timeout had already
+	// elapsed (e.g. 30 minutes from now with the current config), so jobs sat
+	// in the "scheduled" set doing nothing before a worker ever touched them.
 	if config.Timeout > 0 {
-		opts = append(opts, asynq.ProcessAt(time.Now().Add(config.Timeout)))
+		opts = append(opts, asynq.Timeout(config.Timeout))
 	}
 
 	info, err := m.asynqClient.EnqueueContext(ctx, task, opts...)

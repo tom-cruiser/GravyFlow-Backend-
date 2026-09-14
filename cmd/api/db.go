@@ -109,6 +109,32 @@ type DeploymentRecord struct {
 	FinishedAt    *time.Time
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
+	// URL is computed, not stored — see computeDeploymentURL. Empty until
+	// the deployment actually has a running container.
+	URL string
+}
+
+// computeDeploymentURL returns the URL a deployment is reachable at, or ""
+// if it isn't currently serving traffic. Every container this app manages
+// gets a "<containerName>.localhost" host in Caddy automatically —
+// containerName is always set to the app's name (see CreateAndStartContainer
+// call site in runDeploymentWorkflow) — so the default URL only needs the
+// app name; RouteManager.buildHosts in caddy.go is the source of truth this
+// mirrors. Users can also point their own domain at a deployment (GET/POST
+// /apps/:id/domains), which layers additional hosts on top of this one
+// rather than replacing it, so this always stays the right thing to show as
+// "the" link even once custom domains exist.
+func computeDeploymentURL(appName string, status string, containerID string) string {
+	appName = strings.TrimSpace(appName)
+	if appName == "" || strings.TrimSpace(containerID) == "" {
+		return ""
+	}
+	switch DeploymentStatus(status) {
+	case DeploymentStatusRunning, DeploymentStatusDeployed:
+		return fmt.Sprintf("http://%s.localhost", appName)
+	default:
+		return ""
+	}
 }
 
 type DeploymentHealthConfigRecord struct {
@@ -986,6 +1012,20 @@ CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs (created_at DESC)`},
 		// database, quotas already exists before any Go migration runs, so
 		// this is where the column actually gets added.
 		{21, `ALTER TABLE IF EXISTS quotas ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'free'`},
+		// deployments' CREATE TABLE (migration 3) already declares
+		// deleted_at/deleted_reason, but that's a no-op on any database
+		// where the table was created before those columns were added to
+		// this statement — exactly the case here (SoftDeleteDeployment /
+		// RestoreDeployment reference deleted_reason but it was never
+		// backfilled onto an existing deployments table). Add them
+		// explicitly so the self-service delete-app endpoint can actually
+		// write to them.
+		{22, `
+DO $$
+BEGIN
+    ALTER TABLE deployments ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE;
+    ALTER TABLE deployments ADD COLUMN IF NOT EXISTS deleted_reason TEXT;
+END $$`},
 	}
 
 	for _, migration := range migrations {
@@ -1903,6 +1943,22 @@ func (s *DeploymentStore) UpdateDeploymentStatus(ctx context.Context, deployment
 		}
 	}
 
+	// $2 was reused for two type-conflicting purposes: assigned straight to
+	// `status` (the deployment_status enum on any schema.sql-provisioned
+	// database — this local dev Postgres included) AND compared against a
+	// bare IN-list of string literals (text/unknown) in the finished_at
+	// CASE below. An unfixed parameter unifies with whatever concrete type
+	// it's compared against, but two different types across its two usages
+	// is exactly "inconsistent types deduced for parameter $2" (SQLSTATE
+	// 42P08). Casting $2 itself in either usage only swaps which two types
+	// conflict; casting the literals to the enum by name would fix this
+	// database but break one where `status` really is plain TEXT (no such
+	// type to cast to — e.g. a database that only ever ran the Go migrations
+	// below, never db/schema.sql). The schema-agnostic fix is to stop
+	// reusing $2: pass the same Go value again under its own parameter ($7),
+	// so each occurrence has exactly one usage and infers its type — enum or
+	// text, whichever the real column is — independently, with nothing to
+	// conflict with.
 	result, err := s.pool.Exec(ctx, `
 UPDATE deployments
 SET status = $2,
@@ -1912,12 +1968,12 @@ SET status = $2,
 	image_name = CASE WHEN $6 <> '' THEN $6 ELSE image_name END,
 	started_at = COALESCE(started_at, now()),
 	finished_at = CASE
-		WHEN $2 IN ('DEPLOYED', 'FAILED', 'RUNNING') THEN COALESCE(finished_at, now())
+		WHEN $7 IN ('DEPLOYED', 'FAILED', 'RUNNING') THEN COALESCE(finished_at, now())
 		ELSE finished_at
 	END,
 	updated_at = now()
 WHERE id = $1
-`, deploymentID, string(status), statusMessage, containerID, containerName, imageName)
+`, deploymentID, string(status), statusMessage, containerID, containerName, imageName, string(status))
 	if err != nil {
 		return &StoreError{
 			Type:    ErrDatabase,
@@ -2062,6 +2118,7 @@ WHERE d.owner_user_id = $1 AND d.id = $2 AND d.deleted_at IS NULL
 	}
 	deployment.StartedAt = startedAt
 	deployment.FinishedAt = finishedAt
+	deployment.URL = computeDeploymentURL(deployment.AppName, deployment.Status, deployment.ContainerID)
 
 	return deployment, nil
 }
@@ -2174,6 +2231,7 @@ LIMIT $2 OFFSET $3
 		}
 		deployment.StartedAt = startedAt
 		deployment.FinishedAt = finishedAt
+		deployment.URL = computeDeploymentURL(deployment.AppName, deployment.Status, deployment.ContainerID)
 		deployments = append(deployments, deployment)
 	}
 
@@ -2276,6 +2334,7 @@ WHERE d.owner_user_id = $1 AND d.status IN ('RUNNING', 'DEPLOYED') AND d.deleted
 		}
 		deployment.StartedAt = startedAt
 		deployment.FinishedAt = finishedAt
+		deployment.URL = computeDeploymentURL(deployment.AppName, deployment.Status, deployment.ContainerID)
 		deployments = append(deployments, deployment)
 	}
 

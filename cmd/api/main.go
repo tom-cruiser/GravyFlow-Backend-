@@ -252,6 +252,7 @@ func setupRouter(config ServerConfig) *gin.Engine {
 			// Apps
 			protected.GET("/apps", listAppsHandler)
 			protected.POST("/apps", createAppHandler)
+			protected.DELETE("/apps/:id", deleteAppHandler)
 			protected.POST("/apps/:id/deploy", deploymentDeployHandler)
 			// restartAppHandler is now in restart_handlers.go
 			protected.POST("/apps/:id/restart", restartAppHandler)
@@ -639,6 +640,58 @@ func listAppsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"apps":  deployments,
 		"count": len(deployments),
+	})
+}
+
+// deleteAppHandler lets a user delete their own hosted app/service. It soft-
+// deletes the deployment row (deleted_at/deleted_reason — same mechanism as
+// SoftDeleteDeployment/RestoreDeployment), which immediately drops it out of
+// GetDeploymentForUser/ListDeploymentsForUser (both already filter on
+// deleted_at IS NULL), then best-effort tears down the running container and
+// releases the reserved quota.
+//
+// The DB soft-delete happens first and is the only step that can fail the
+// request: unlike a hard delete, the deployment row (and its container_id)
+// survives afterward, so a failed teardown leaves a recoverable orphan
+// rather than an unrecoverable one — unlike AdminHardDeleteUser, where the
+// container must be torn down before the row disappears for good.
+func deleteAppHandler(c *gin.Context) {
+	user, deployment, ok := currentUserDeployment(c)
+	if !ok {
+		return
+	}
+
+	reason := strings.TrimSpace(c.Query("reason"))
+	if reason == "" {
+		reason = "deleted by user"
+	}
+
+	if err := deploymentStore.SoftDeleteDeployment(c.Request.Context(), deployment.DeploymentID, reason); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "failed_to_delete_app",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	if containerID := strings.TrimSpace(deployment.ContainerID); containerID != "" {
+		if err := StopAndRemoveContainer(containerID, true); err != nil {
+			// Best-effort: the deployment is already gone from the user's
+			// list, so a stale/already-removed container shouldn't block
+			// the delete they explicitly asked for.
+			log.Printf("[WARN] delete app: failed to remove container %q for deployment %q: %v", containerID, deployment.DeploymentID, err)
+		}
+	}
+
+	if err := deploymentStore.ReleaseDeploymentResources(
+		c.Request.Context(), user.ID, defaultDeployCPU, defaultDeployMemoryMB, defaultDeployApps, 0,
+	); err != nil {
+		log.Printf("[WARN] delete app: failed to release quota for user %q, deployment %q: %v", user.ID, deployment.DeploymentID, err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":      "app deleted",
+		"deploymentId": deployment.DeploymentID,
 	})
 }
 

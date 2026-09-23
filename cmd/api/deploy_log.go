@@ -151,11 +151,28 @@ func deployLogHandler(c *gin.Context) {
 		HasMore:       hasMore,
 	}
 
-	// Add job status if present
+	// Add job status if present. Without a jobId, use the deployment's
+	// latest job so a reloaded dashboard still gets the build log.
 	jobID := strings.TrimSpace(c.Query("jobId"))
+	if jobID == "" && deploymentJobs != nil {
+		jobID = deploymentJobs.LastJobID(c.Request.Context(), deployment.DeploymentID)
+	}
 	if jobID != "" && deploymentJobs != nil {
-		if jobStatus, found, err := deploymentJobs.GetStatus(c.Request.Context(), jobID); err == nil && found && jobStatus.UserID == user.ID {
+		if jobStatus, found, err := deploymentJobs.GetStatus(c.Request.Context(), jobID); err == nil && found && jobStatus.UserID == user.ID && jobStatus.DeploymentID == deployment.DeploymentID {
 			response.Job = jobStatus
+
+			// The tail of the build output is usually where the actual
+			// failure is (a compiler or npm error).
+			if backlog, err := deploymentJobs.JobLogBacklog(c.Request.Context(), jobID, failureLogTailLines); err == nil {
+				for _, line := range backlog {
+					response.Lines = append(response.Lines, deployLogLine{
+						Text:   line.Line,
+						Stream: "stdout",
+						Source: "build",
+						Time:   line.Time,
+					})
+				}
+			}
 			
 			// Append job logs if not already included
 			if strings.TrimSpace(jobStatus.Error) != "" {

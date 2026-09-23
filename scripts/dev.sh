@@ -32,7 +32,10 @@ APPS_NETWORK="${GRAVYFLOW_APPS_NETWORK:-gravyflow-apps}"
 # Ports
 POSTGRES_HOST_PORT="${POSTGRES_PORT:-5433}"
 POSTGRES_CONTAINER_PORT="5432"
-REDIS_HOST_PORT="${REDIS_PORT:-6379}"
+# 6380, not 6379: other local projects' Redis commonly holds 6379, and when
+# two containers want the same host port the one that loses comes up with no
+# port at all, silently sending GravyFlow's job queue to the other Redis.
+REDIS_HOST_PORT="${REDIS_PORT:-6380}"
 REDIS_CONTAINER_PORT="6379"
 
 # ============================================================================
@@ -292,7 +295,8 @@ setup_redis() {
     print_header "Setting up Redis"
     
     local volume="$REDIS_CONTAINER-data:/data"
-    local port_mapping="$REDIS_HOST_PORT:$REDIS_CONTAINER_PORT"
+    # Loopback only: this Redis has no password.
+    local port_mapping="127.0.0.1:$REDIS_HOST_PORT:$REDIS_CONTAINER_PORT"
     local env_vars=""
     local extra_args=""
     
@@ -500,7 +504,7 @@ Commands:
 
 Environment Variables:
     POSTGRES_PORT       PostgreSQL host port (default: 5433)
-    REDIS_PORT          Redis host port (default: 6379)
+    REDIS_PORT          Redis host port (default: 6380)
     POSTGRES_DB         Database name (default: gravyflow)
     POSTGRES_USER       Database user (default: postgres)
     POSTGRES_PASSWORD   Database password (default: blackey333Vi@32)

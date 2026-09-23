@@ -72,6 +72,10 @@ type BuildConfig struct {
 
 	// Logging
 	Verbose bool
+
+	// LogWriter receives the builder's output (the user-facing build log);
+	// nil discards it. Output always also goes to the API's own stdout/stderr.
+	LogWriter io.Writer
 }
 
 // DefaultConfig returns a sensible default configuration
@@ -128,6 +132,13 @@ func BuildCode(appPath string, appName string) (string, error) {
 	return BuildCodeWithConfig(appPath, appName, DefaultConfig())
 }
 
+// BuildCodeWithLogs is BuildCode with the build output also written to logs.
+func BuildCodeWithLogs(appPath string, appName string, logs io.Writer) (string, error) {
+	config := DefaultConfig()
+	config.LogWriter = logs
+	return BuildCodeWithConfig(appPath, appName, config)
+}
+
 // BuildCodeWithConfig builds with custom configuration
 func BuildCodeWithConfig(appPath string, appName string, config BuildConfig) (string, error) {
 	// Set global logger verbosity
@@ -172,6 +183,7 @@ func BuildCodeWithConfig(appPath string, appName string, config BuildConfig) (st
 	// fast builder only has Node Dockerfiles, so those go through Nixpacks.
 	if isNodeProjectKind(kind) {
 		logger.Info("Using fast builder for %q (%s)", appName, projectKindLabel(kind))
+		fmt.Fprintf(logSink(config.LogWriter), "==> Detected a %s project; building with a generated Dockerfile\n", projectKindLabel(kind))
 
 		ctx, cancel := context.WithTimeout(context.Background(), config.Timeout)
 		defer cancel()
@@ -184,6 +196,7 @@ func BuildCodeWithConfig(appPath string, appName string, config BuildConfig) (st
 
 	// Nixpacks path for all other projects
 	logger.Info("Using Nixpacks builder for %q", appName)
+	fmt.Fprintf(logSink(config.LogWriter), "==> Building with Nixpacks (it detects the language itself)\n")
 
 	return buildWithNixpacks(absPath, appName, config)
 }
@@ -346,6 +359,7 @@ func buildNodeDockerImageWithContext(ctx context.Context, absPath string, appNam
 		Push:            config.PushAfterBuild,
 		DisableBuildKit: config.DisableBuildKit,
 		Timeout:         config.Timeout,
+		LogWriter:       config.LogWriter,
 	}
 
 	return buildNodeDockerImageWithOptions(absPath, appName, kind, opts)
@@ -363,7 +377,7 @@ func buildWithNixpacks(absPath string, appName string, config BuildConfig) (stri
 	for attempt := 1; attempt <= config.MaxRetries; attempt++ {
 		logger.Info("Nixpacks build attempt %d/%d", attempt, config.MaxRetries)
 
-		err := runNixpacksBuild(ctx, absPath, appName)
+		err := runNixpacksBuild(ctx, absPath, appName, config.LogWriter)
 
 		if err == nil {
 			logger.Info("Nixpacks build completed successfully")
@@ -396,16 +410,16 @@ func buildWithNixpacks(absPath string, appName string, config BuildConfig) (stri
 // (only --cache-key/--cache-from/--no-cache); its layer cache lives in the
 // Docker daemon and is keyed by the source path, which is stable per
 // deployment, so no extra flag is needed.
-func runNixpacksBuild(ctx context.Context, absPath string, appName string) error {
+func runNixpacksBuild(ctx context.Context, absPath string, appName string, logs io.Writer) error {
 	// Use dockerCommandEnv from docker_env.go
-	err := runNixpacksBuildWithEnv(ctx, absPath, appName, dockerCommandEnv())
+	err := runNixpacksBuildWithEnv(ctx, absPath, appName, dockerCommandEnv(), logs)
 
 	// isBuildKitMissingError is now in helpers.go
 	if err != nil && isBuildKitMissingError(err) {
 		logger.Warn("BuildKit unavailable, retrying with legacy docker builder")
 		// Report the retry's own error: the first one only says BuildKit is
 		// missing, which is no longer the reason the build failed.
-		if err = runNixpacksBuildWithEnv(ctx, absPath, appName, dockerCommandEnvForceLegacyBuilder()); err == nil {
+		if err = runNixpacksBuildWithEnv(ctx, absPath, appName, dockerCommandEnvForceLegacyBuilder(), logs); err == nil {
 			return nil
 		}
 		if isBuildKitMissingError(err) {
@@ -416,7 +430,7 @@ func runNixpacksBuild(ctx context.Context, absPath string, appName string) error
 	return err
 }
 
-func runNixpacksBuildWithEnv(ctx context.Context, absPath string, appName string, env []string) error {
+func runNixpacksBuildWithEnv(ctx context.Context, absPath string, appName string, env []string, logs io.Writer) error {
 	args := []string{"build", absPath, "--name", appName}
 
 	// Add verbose flag if configured
@@ -426,8 +440,8 @@ func runNixpacksBuildWithEnv(ctx context.Context, absPath string, appName string
 
 	var stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, "nixpacks", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
+	cmd.Stdout = io.MultiWriter(os.Stdout, logSink(logs))
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr, logSink(logs))
 	cmd.Env = env
 
 	logger.Debug("Running: nixpacks %s", strings.Join(args, " "))

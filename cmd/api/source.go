@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,6 +42,9 @@ type GitCloneOptions struct {
 	Username    string
 	Password    string
 	Token       string
+	// GitHubApp marks Token as a GitHub App installation token, for error
+	// hints (see withGitAuthHint).
+	GitHubApp bool
 }
 
 type GitStatus struct {
@@ -116,7 +121,26 @@ func resolveRepoURL(deployment DeploymentRecord) string {
 // prepareDeploymentSource ensures deployment.AppPath points at a local checkout.
 // Remote repo URLs are shallow-cloned into GRAVYFLOW_APPS_DIR/{deploymentId}.
 func prepareDeploymentSource(ctx context.Context, deployment DeploymentRecord) (string, error) {
-	return prepareDeploymentSourceWithOptions(ctx, deployment, GitCloneOptions{})
+	var opts GitCloneOptions
+	if deploymentStore != nil && isRemoteRepoSource(resolveRepoURL(deployment)) {
+		// Services picked through the GitHub App get a fresh installation
+		// token, scoped to their repository, for every clone.
+		appToken, viaApp, err := githubCloneToken(ctx, deployment.DeploymentID)
+		if err != nil {
+			return "", err
+		}
+		if viaApp {
+			opts.Token = appToken
+			opts.GitHubApp = true
+		} else {
+			token, err := deploymentStore.GetDeploymentGitToken(ctx, deployment.DeploymentID)
+			if err != nil {
+				return "", err
+			}
+			opts.Token = token
+		}
+	}
+	return prepareDeploymentSourceWithOptions(ctx, deployment, opts)
 }
 
 func prepareDeploymentSourceWithOptions(ctx context.Context, deployment DeploymentRecord, opts GitCloneOptions) (string, error) {
@@ -159,7 +183,7 @@ func prepareDeploymentSourceWithOptions(ctx context.Context, deployment Deployme
 	if _, err := os.Stat(filepath.Join(dest, ".git")); err == nil {
 		// Existing repo - sync
 		if err := runGitSync(ctx, dest, repoURL, opts); err != nil {
-			return "", err
+			return "", withGitAuthHint(err, opts)
 		}
 	} else {
 		// New clone - remove any existing directory
@@ -167,7 +191,7 @@ func prepareDeploymentSourceWithOptions(ctx context.Context, deployment Deployme
 			return "", fmt.Errorf("reset app checkout directory: %w", err)
 		}
 		if err := runGitClone(ctx, repoURL, dest, opts); err != nil {
-			return "", err
+			return "", withGitAuthHint(err, opts)
 		}
 	}
 
@@ -177,6 +201,22 @@ func prepareDeploymentSourceWithOptions(ctx context.Context, deployment Deployme
 	}
 
 	return dest, nil
+}
+
+// withGitAuthHint adds what to do next when a clone/fetch failed on
+// authentication, since git's own message ("could not read Username") doesn't
+// say the repo is private.
+func withGitAuthHint(err error, opts GitCloneOptions) error {
+	if !isGitAuthError(err) {
+		return err
+	}
+	if opts.GitHubApp {
+		return fmt.Errorf("GitHub rejected the GitHub App's installation token for this repository (was it renamed, moved, or removed from the app's repository access?): %w", err)
+	}
+	if opts.Token != "" {
+		return fmt.Errorf("the repository rejected this app's access token (expired, revoked, or missing read access to the repo): %w", err)
+	}
+	return fmt.Errorf("the repository is private or doesn't exist; add an access token with read access to it in the app's Source settings: %w", err)
 }
 
 // ============================================================================
@@ -235,19 +275,18 @@ func runGitClone(ctx context.Context, repoURL string, dest string, opts GitClone
 		args = append(args, "--sparse")
 	}
 
-	// Add authentication
-	cloneURL, err := addAuthentication(repoURL, opts)
-	if err != nil {
-		return err
-	}
-
-	args = append(args, cloneURL, dest)
+	args = append(args, repoURL, dest)
 
 	// Setup environment
 	env := os.Environ()
 	if opts.SSHKeyPath != "" {
 		env = append(env, fmt.Sprintf("GIT_SSH_COMMAND=ssh -i %s -o StrictHostKeyChecking=accept-new", opts.SSHKeyPath))
 	}
+	authEnv, err := gitAuthEnv(repoURL, opts)
+	if err != nil {
+		return err
+	}
+	env = append(env, authEnv...)
 
 	// Retry on failure
 	var lastErr error
@@ -312,14 +351,15 @@ func runGitSync(ctx context.Context, dest string, repoURL string, opts GitCloneO
 		env = append(env, fmt.Sprintf("GIT_SSH_COMMAND=ssh -i %s -o StrictHostKeyChecking=accept-new", opts.SSHKeyPath))
 	}
 
-	// Add authentication
-	cloneURL, err := addAuthentication(repoURL, opts)
+	authEnv, err := gitAuthEnv(repoURL, opts)
 	if err != nil {
 		return err
 	}
+	env = append(env, authEnv...)
 
-	// Update remote URL
-	if err := runGitCommand(ctx, env, "-C", dest, "remote", "set-url", "origin", cloneURL); err != nil {
+	// Update remote URL. Always the plain URL: this also scrubs credentials
+	// from checkouts made when tokens were still embedded in the URL.
+	if err := runGitCommand(ctx, env, "-C", dest, "remote", "set-url", "origin", repoURL); err != nil {
 		return err
 	}
 
@@ -404,34 +444,68 @@ func setupSparseCheckout(ctx context.Context, dest string, patterns []string) er
 // AUTHENTICATION
 // ============================================================================
 
-func addAuthentication(repoURL string, opts GitCloneOptions) (string, error) {
-	if opts.Token != "" {
-		return addTokenAuth(repoURL, opts.Token), nil
+// gitAuthEnv returns environment variables that make git authenticate to the
+// repository's host, or nil when no credentials are configured.
+//
+// Credentials go in an HTTP header set through GIT_CONFIG_COUNT/KEY/VALUE
+// (git >= 2.31) rather than in the URL: a URL like
+// https://x-access-token:TOKEN@github.com/... is written into .git/config,
+// and shows up in the command line, in `ps`, and in every git error message,
+// which ends up in the deployment's status message and the dashboard. The
+// header is scoped to the repository's scheme+host, so it's never sent to
+// another host (e.g. a submodule elsewhere or a redirect).
+//
+// GIT_TERMINAL_PROMPT=0 is set unconditionally so a private repo without
+// credentials fails immediately instead of waiting for a username.
+func gitAuthEnv(repoURL string, opts GitCloneOptions) ([]string, error) {
+	env := []string{"GIT_TERMINAL_PROMPT=0"}
+
+	username, password := "", ""
+	switch {
+	case opts.Token != "":
+		// GitHub expects this username for tokens; GitLab and Bitbucket
+		// accept any username alongside an access token.
+		username, password = "x-access-token", opts.Token
+	case opts.Username != "" && opts.Password != "":
+		username, password = opts.Username, opts.Password
+	default:
+		return env, nil
 	}
-	if opts.Username != "" && opts.Password != "" {
-		return addBasicAuth(repoURL, opts.Username, opts.Password), nil
+
+	parsed, err := url.Parse(repoURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return nil, fmt.Errorf("an access token can only be used with an https:// repository URL")
 	}
-	return repoURL, nil
+
+	credentials := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+	return append(env,
+		"GIT_CONFIG_COUNT=1",
+		fmt.Sprintf("GIT_CONFIG_KEY_0=http.%s://%s/.extraHeader", parsed.Scheme, parsed.Host),
+		"GIT_CONFIG_VALUE_0=Authorization: Basic "+credentials,
+	), nil
 }
 
-func addTokenAuth(repoURL, token string) string {
-	if strings.HasPrefix(repoURL, "https://") {
-		parts := strings.SplitN(repoURL, "://", 2)
-		if len(parts) == 2 {
-			return fmt.Sprintf("https://x-access-token:%s@%s", token, parts[1])
+// isGitAuthError reports whether git failed because the repository needs
+// credentials (or they were wrong). GitHub answers "Repository not found" for
+// private repos when unauthenticated, rather than revealing they exist.
+func isGitAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"could not read username",
+		"terminal prompts disabled",
+		"authentication failed",
+		"repository not found",
+		"invalid username or password",
+		"403",
+	} {
+		if strings.Contains(s, marker) {
+			return true
 		}
 	}
-	return repoURL
-}
-
-func addBasicAuth(repoURL, username, password string) string {
-	if strings.HasPrefix(repoURL, "https://") {
-		parts := strings.SplitN(repoURL, "://", 2)
-		if len(parts) == 2 {
-			return fmt.Sprintf("https://%s:%s@%s", username, password, parts[1])
-		}
-	}
-	return repoURL
+	return false
 }
 
 // ============================================================================

@@ -159,7 +159,9 @@ services:
     volumes:
       - redis-data:/data
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      # Host access is for local tooling only; the API uses redis:6379 on the
+      # compose network. Loopback, since Redis has no password here.
+      - "127.0.0.1:${REDIS_PORT:-6380}:6379"
     networks:
       - gravyflow-network
     healthcheck:

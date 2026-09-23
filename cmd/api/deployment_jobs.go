@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -164,6 +165,7 @@ const (
 	deploymentJobTaskType   = "deployment:job"
 	deploymentJobStatusKey  = "deployment:job:%s:status"
 	deploymentJobChannelKey = "deployment:job:%s:channel"
+	deploymentLastJobKey    = "deployment:%s:last-job"
 )
 
 // Note: deploymentJobs is now in globals.go
@@ -355,7 +357,23 @@ func (m *DeploymentJobManager) EnqueueDeploymentWithConfig(
 	// Increment metrics
 	_ = m.IncrementMetrics(ctx, "total")
 
+	// Remember the app's latest job, so its build log can be found without
+	// the job ID (a reloaded dashboard only knows the deployment).
+	_ = m.redisClient.Set(ctx, fmt.Sprintf(deploymentLastJobKey, deploymentID), info.ID, jobLogRetention).Err()
+
 	return info.ID, nil
+}
+
+// LastJobID returns the most recent job enqueued for a deployment, or "".
+func (m *DeploymentJobManager) LastJobID(ctx context.Context, deploymentID string) string {
+	if m == nil || m.redisClient == nil {
+		return ""
+	}
+	jobID, err := m.redisClient.Get(ctx, fmt.Sprintf(deploymentLastJobKey, strings.TrimSpace(deploymentID))).Result()
+	if err != nil {
+		return ""
+	}
+	return jobID
 }
 
 // ============================================================================
@@ -687,17 +705,24 @@ func (m *DeploymentJobManager) handleDeploymentJobTask(ctx context.Context, task
 		CreatedAt:    now,
 	})
 
+	// Build log streamed to the dashboard (build_log.go). Stage changes are
+	// mirrored into it as "==>" headers so the log reads top to bottom.
+	logs := m.newJobLogWriter(jobID, payload.UserID)
+	defer logs.Close()
+
 	// Run deployment workflow - uses prepareDeploymentSource and estimateStorageUsageMB from source.go and resources.go
 	deployedStatus, runErr := runDeploymentWorkflow(ctx, payload, func(stage string, progress int, message string) {
+		logs.Printf("==> %s", message)
 		_ = m.updateStatus(ctx, status, func(s *DeploymentJobStatus) {
 			s.Status = JobStatusActive
 			s.Stage = stage
 			s.Message = message
 			s.Progress = progress
 		})
-	})
+	}, logs)
 
 	if runErr != nil {
+		logs.Printf("==> Deployment failed: %v", runErr)
 		// Handle failure
 		if deploymentStore != nil {
 			if markErr := deploymentStore.MarkDeploymentFailed(ctx, payload.DeploymentID, runErr, payload.UserID); markErr != nil {
@@ -900,9 +925,26 @@ func (m *DeploymentJobManager) streamJobStatus(c *gin.Context, currentUser UserR
 		return
 	}
 
-	// Subscribe to updates
+	// Subscribe to updates before reading the log backlog, so no line falls
+	// in the gap between the two; lines seen in both are dropped by Seq.
 	pubsub := m.redisClient.Subscribe(c.Request.Context(), m.channelKey(initial.JobID))
 	defer pubsub.Close()
+	if _, err := pubsub.Receive(c.Request.Context()); err != nil {
+		return
+	}
+
+	var lastSeq int64
+	if backlog, err := m.JobLogBacklog(c.Request.Context(), initial.JobID, 0); err == nil {
+		for _, line := range backlog {
+			if line.UserID != currentUser.ID {
+				return
+			}
+			if err := conn.WriteJSON(line); err != nil {
+				return
+			}
+			lastSeq = line.Seq
+		}
+	}
 
 	ch := pubsub.Channel()
 	for {
@@ -913,12 +955,32 @@ func (m *DeploymentJobManager) streamJobStatus(c *gin.Context, currentUser UserR
 			if !ok {
 				return
 			}
+			// The channel carries both job status updates and build log
+			// lines (build_log.go); only log lines have a "type".
+			var envelope struct {
+				Type   string `json:"type"`
+				UserID string `json:"userId"`
+				Seq    int64  `json:"seq"`
+			}
+			if err := json.Unmarshal([]byte(msg.Payload), &envelope); err != nil {
+				continue
+			}
+			if envelope.UserID != currentUser.ID {
+				return
+			}
+			if envelope.Type == jobLogMessageType {
+				if envelope.Seq <= lastSeq {
+					continue
+				}
+				lastSeq = envelope.Seq
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(msg.Payload)); err != nil {
+					return
+				}
+				continue
+			}
 			var status DeploymentJobStatus
 			if err := json.Unmarshal([]byte(msg.Payload), &status); err != nil {
 				continue
-			}
-			if status.UserID != currentUser.ID {
-				return
 			}
 			if err := conn.WriteJSON(status); err != nil {
 				return
@@ -931,7 +993,8 @@ func (m *DeploymentJobManager) streamJobStatus(c *gin.Context, currentUser UserR
 // DEPLOYMENT WORKFLOW
 // ============================================================================
 
-func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, progress func(stage string, progress int, message string)) (DeploymentJobStatus, error) {
+// logs receives the user-facing build output; nil discards it.
+func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, progress func(stage string, progress int, message string), logs io.Writer) (DeploymentJobStatus, error) {
 	// deploymentStore is now in globals.go
 	if deploymentStore == nil {
 		return DeploymentJobStatus{}, fmt.Errorf("deployment store is not initialized")
@@ -993,7 +1056,7 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 		if progress != nil {
 			progress("building", 50, "building application image")
 		}
-		imageName, err = BuildCode(deployment.AppPath, deployment.AppName)
+		imageName, err = BuildCodeWithLogs(deployment.AppPath, deployment.AppName, logs)
 		if err != nil {
 			if shouldReleaseOnError {
 				_ = deploymentStore.ReleaseDeploymentResources(ctx, payload.UserID, requestedCPU, requestedMemoryMB, requestedApps, requestedStorageMB)
@@ -1055,6 +1118,9 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 
 	if progress != nil {
 		progress("completed", 100, "deployment completed successfully")
+	}
+	if url := computeDeploymentURL(deployment.AppName, string(DeploymentStatusRunning), containerID); url != "" {
+		fmt.Fprintf(logSink(logs), "==> Live at %s\n", url)
 	}
 
 	now := time.Now().UTC()

@@ -67,6 +67,8 @@ type BuildOptions struct {
 	Registry        string
 	Timeout         time.Duration
 	DisableBuildKit bool
+	// LogWriter receives docker build's output (the user-facing build log).
+	LogWriter io.Writer
 }
 
 type BuildResult struct {
@@ -412,7 +414,12 @@ func buildNodeDockerImageWithOptions(appPath string, appName string, kind projec
 	pm := packageManager(appPath)
 	// Every Dockerfile copies node_modules out of the deps stage, which fails
 	// for an app with no dependencies unless the directory exists.
-	installCmd := installCommand(pm) + " && mkdir -p node_modules"
+	//
+	// CYPRESS_INSTALL_BINARY=0: Cypress's postinstall downloads a test
+	// browser of several hundred MB that a production image never runs; on
+	// a Vite app with Cypress in devDependencies it was ~44s of a 55s
+	// install.
+	installCmd := "export CYPRESS_INSTALL_BINARY=0 && " + installCommand(pm) + " && mkdir -p node_modules"
 	buildCmd := buildCommand(pm)
 
 	// Detect node version from engines
@@ -703,19 +710,20 @@ func runDockerBuildWithOptions(appPath string, appName string, dockerfilePath st
 	// BuildKit is disabled via the DOCKER_BUILDKIT=0 environment variable, not
 	// a docker CLI flag ("--disable-buildkit" is not a real flag and would
 	// make every build fail).
-	return runDockerBuildWithRetry(ctx, args, 3, opts.DisableBuildKit)
+	return runDockerBuildWithRetry(ctx, args, 3, opts.DisableBuildKit, opts.LogWriter)
 }
 
-func runDockerBuildWithRetry(ctx context.Context, args []string, maxRetries int, forceLegacyBuilder bool) error {
+func runDockerBuildWithRetry(ctx context.Context, args []string, maxRetries int, forceLegacyBuilder bool, logs io.Writer) error {
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
 			log.Printf("Build attempt %d failed, retrying...", attempt)
+			fmt.Fprintf(logSink(logs), "==> Build attempt %d hit a network error; retrying\n", attempt)
 			time.Sleep(2 * time.Second)
 		}
 
-		err := runDockerBuildCmd(ctx, args, forceLegacyBuilder)
+		err := runDockerBuildCmd(ctx, args, forceLegacyBuilder, logs)
 		if err == nil {
 			return nil
 		}
@@ -738,11 +746,11 @@ func runDockerBuildWithRetry(ctx context.Context, args []string, maxRetries int,
 // once with BuildKit disabled via DOCKER_BUILDKIT=0 (never a CLI flag). The retry
 // itself always passes forceLegacyBuilder=true, so this can only recurse one level
 // deep.
-func runDockerBuildCmd(ctx context.Context, args []string, forceLegacyBuilder bool) error {
+func runDockerBuildCmd(ctx context.Context, args []string, forceLegacyBuilder bool, logs io.Writer) error {
 	var stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, "docker", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
+	cmd.Stdout = io.MultiWriter(os.Stdout, logSink(logs))
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr, logSink(logs))
 	if forceLegacyBuilder {
 		cmd.Env = dockerCommandEnvForceLegacyBuilder()
 	} else {
@@ -757,7 +765,7 @@ func runDockerBuildCmd(ctx context.Context, args []string, forceLegacyBuilder bo
 		}
 		if !forceLegacyBuilder && isBuildKitMissingError(err) {
 			log.Printf("BuildKit unavailable, retrying once with legacy builder (DOCKER_BUILDKIT=0)")
-			return runDockerBuildCmd(ctx, args, true)
+			return runDockerBuildCmd(ctx, args, true, logs)
 		}
 		return err
 	}

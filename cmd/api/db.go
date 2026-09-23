@@ -1026,6 +1026,59 @@ BEGIN
     ALTER TABLE deployments ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE;
     ALTER TABLE deployments ADD COLUMN IF NOT EXISTS deleted_reason TEXT;
 END $$`},
+		// audit_logs must not reference users. Its BEFORE UPDATE immutability
+		// trigger also rejects the UPDATE that ON DELETE SET NULL performs,
+		// so any such FK makes a user impossible to hard-delete once they
+		// appear in the log ("audit_logs is immutable: UPDATE is not
+		// permitted"). Migration 14 added one on actor_user_id for databases
+		// built from these migrations alone, and db/schema.sql's legacy
+		// user_id column has one too. Nothing reads audit_logs through
+		// users: actor_user_id/actor_email are kept as plain values, which
+		// is what lets entries outlive the account. Drops whichever FKs
+		// exist, by lookup rather than by name, so it's a no-op when none do.
+		{23, `
+DO $$
+DECLARE
+    fk RECORD;
+BEGIN
+    FOR fk IN
+        SELECT conname
+        FROM pg_constraint
+        WHERE contype = 'f'
+          AND conrelid = 'audit_logs'::regclass
+          AND confrelid = 'users'::regclass
+    LOOP
+        EXECUTE format('ALTER TABLE audit_logs DROP CONSTRAINT %I', fk.conname);
+    END LOOP;
+END $$`},
+		// Per-app access token for cloning private repositories, AES-GCM
+		// encrypted with the same key as env vars (see git_token.go).
+		{24, `
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS git_token_encrypted BYTEA;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS git_token_nonce BYTEA`},
+		// GitHub App installations linked to platform users, and the
+		// installation/repository a deployment clones through (see
+		// github_integration.go). One row per (user, installation): several
+		// users can link the same organization installation. repositories
+		// is a cache refreshed from the GitHub API on every webhook, not the
+		// source of truth for access; clone-time token minting is.
+		{25, `
+CREATE TABLE IF NOT EXISTS github_installations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    github_installation_id BIGINT NOT NULL,
+    account_login TEXT NOT NULL,
+    account_type TEXT NOT NULL,
+    repository_selection TEXT NOT NULL DEFAULT 'selected',
+    repositories JSONB NOT NULL DEFAULT '[]'::jsonb,
+    suspended_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    UNIQUE(user_id, github_installation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_github_installations_installation ON github_installations (github_installation_id);
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS github_installation_id BIGINT;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS github_repository_id BIGINT`},
 	}
 
 	for _, migration := range migrations {

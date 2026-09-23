@@ -394,12 +394,40 @@ func (s *DeploymentStore) AdminHardDeleteUser(ctx context.Context, targetUserID 
 		}
 	}
 
-	tag, err := s.pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, targetUserID)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return &StoreError{Type: ErrDatabase, Message: "failed to begin transaction", Err: err}
+	}
+	defer tx.Rollback(ctx)
+
+	// env_var_history.changed_by and deployment_history.changed_by reference
+	// users with no ON DELETE action. Relying on users -> deployments ->
+	// history cascades isn't enough: Postgres checks those changed_by keys
+	// before the nested cascade has removed the rows, so a plain
+	// DELETE FROM users fails with a foreign key violation for anyone who
+	// ever edited an env var. Delete the user's deployments (and their
+	// history) first, then history rows this user authored on other users'
+	// deployments (e.g. as an admin); changed_by is NOT NULL, so those can't
+	// be kept with the author cleared.
+	for _, q := range []string{
+		`DELETE FROM deployments WHERE owner_user_id = $1`,
+		`DELETE FROM env_var_history WHERE changed_by = $1`,
+		`DELETE FROM deployment_history WHERE changed_by = $1`,
+	} {
+		if _, err := tx.Exec(ctx, q, targetUserID); err != nil {
+			return &StoreError{Type: ErrDatabase, Message: "failed to delete user's deployment data", Err: err}
+		}
+	}
+
+	tag, err := tx.Exec(ctx, `DELETE FROM users WHERE id = $1`, targetUserID)
 	if err != nil {
 		return &StoreError{Type: ErrDatabase, Message: "failed to hard-delete user", Err: err}
 	}
 	if tag.RowsAffected() == 0 {
 		return &StoreError{Type: ErrNotFound, Message: "user not found"}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return &StoreError{Type: ErrDatabase, Message: "failed to commit user deletion", Err: err}
 	}
 	return nil
 }

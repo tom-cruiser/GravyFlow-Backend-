@@ -543,7 +543,7 @@ CREATE INDEX IF NOT EXISTS idx_deployment_metrics_recorded_at ON deployment_metr
 -- only for backward compatibility with anything still reading them directly.
 CREATE TABLE IF NOT EXISTS audit_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    user_id UUID, -- legacy, never written; no REFERENCES for the same reason as actor_user_id
     -- No REFERENCES: the BEFORE UPDATE immutability trigger below rejects
     -- Postgres's own ON DELETE SET NULL cascade just like it rejects any
     -- other UPDATE, so a real FK here would make AdminHardDeleteUser fail for

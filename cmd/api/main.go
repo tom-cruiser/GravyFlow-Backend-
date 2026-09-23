@@ -94,6 +94,10 @@ func run() error {
 	// Start worker
 	go startWorker(jobs)
 
+	// Fail deployments left in BUILDING with no task behind them (lost on a
+	// restart, or whose failure couldn't be written back).
+	go jobs.RunStuckDeploymentReconciler(context.Background())
+
 	// Setup router
 	router := setupRouter(config)
 
@@ -248,6 +252,7 @@ func setupRouter(config ServerConfig) *gin.Engine {
 			protected.POST("/auth/api-keys", AuthMiddleware(true), createAPIKeyHandler)
 			protected.POST("/auth/mfa/enroll", mfaEnrollHandler)
 			protected.POST("/auth/mfa/enable", mfaEnableHandler)
+			protected.POST("/auth/logout", logoutHandler)
 
 			// Apps
 			protected.GET("/apps", listAppsHandler)
@@ -267,12 +272,20 @@ func setupRouter(config ServerConfig) *gin.Engine {
 			// pairs here in batches instead of one request per variable.
 			protected.POST("/apps/:id/env/bulk", bulkAddAppEnvHandler)
 			protected.DELETE("/apps/:id/env/:key", deleteAppEnvHandler)
+			protected.POST("/apps/:id/env/validate", validateEnvVarHandler)
+			protected.GET("/apps/:id/env/history", envVarHistoryHandler)
+			protected.GET("/apps/:id/env/export", exportEnvHandler)
+			protected.POST("/apps/:id/env/import", importEnvHandler)
 
 			// Custom domains
 			protected.GET("/apps/:id/domains", listAppDomainsHandler)
 			protected.POST("/apps/:id/domains", addAppDomainHandler)
 			protected.POST("/apps/:id/domains/:domain/verify", verifyAppDomainHandler)
 			protected.DELETE("/apps/:id/domains/:domain", deleteAppDomainHandler)
+			protected.POST("/apps/:id/domains/bulk", bulkAddAppDomainsHandler)
+			protected.POST("/apps/:id/domains/redirects", addDomainRedirectHandler)
+			protected.GET("/apps/:id/domains/:domain/status", domainVerificationStatusHandler)
+			protected.GET("/apps/:id/domains/:domain/health", checkDomainHealthHandler)
 
 			// Jobs
 			protected.GET("/jobs/:jobId", deploymentJobStatusHandler)

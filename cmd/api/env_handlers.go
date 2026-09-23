@@ -320,8 +320,8 @@ func envVarHistoryHandler(c *gin.Context) {
 	limit := 50
 	if l := c.Query("limit"); l != "" {
 		if parsed, err := fmt.Sscanf(l, "%d", &limit); err == nil && parsed == 1 {
-			if limit > 100 {
-				limit = 100
+			if limit <= 0 || limit > 100 {
+				limit = 50
 			}
 		}
 	}
@@ -593,32 +593,11 @@ func (s *DeploymentStore) UpsertDeploymentEnvVarWithCategory(
 	return err
 }
 
-// ============================================================================
-// ROUTE SETUP
-// ============================================================================
-
-func SetupEnvRoutes(router *gin.Engine) {
-	envGroup := router.Group("/api/deployments/:id/env")
-	envGroup.Use(AuthMiddleware(false))
-	{
-		// List
-		envGroup.GET("/", listAppEnvHandler)
-		
-		// Add/Update
-		envGroup.POST("/", addAppEnvHandler)
-		envGroup.POST("/bulk", bulkAddAppEnvHandler)
-		
-		// Validate
-		envGroup.POST("/validate", validateEnvVarHandler)
-		
-		// History
-		envGroup.GET("/history", envVarHistoryHandler)
-		
-		// Export/Import
-		envGroup.GET("/export", exportEnvHandler)
-		envGroup.POST("/import", importEnvHandler)
-		
-		// Delete
-		envGroup.DELETE("/:key", deleteAppEnvHandler)
-	}
-}
+// Route registration for all of these handlers lives in main.go's
+// setupRouter, under /api/v1/apps/:id/env/... (the prefix the frontend
+// actually calls). This file used to also define a SetupEnvRoutes that
+// registered the same handlers again under /api/deployments/:id/env/...,
+// but that function was never called from main.go, so validateEnvVarHandler,
+// envVarHistoryHandler, exportEnvHandler and importEnvHandler were
+// unreachable 404s despite being fully implemented. It was removed rather
+// than wired up, to avoid two divergent URL namespaces for the same feature.

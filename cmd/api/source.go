@@ -218,10 +218,8 @@ func runGitClone(ctx context.Context, repoURL string, dest string, opts GitClone
 		"--depth", fmt.Sprintf("%d", getDepth(opts.Depth)),
 	}
 
-	// Add filter if not using full depth
-	if getDepth(opts.Depth) > 0 && getDepth(opts.Depth) < 100 {
-		args = append(args, "--filter", "blob:none")
-	}
+	// No --filter blob:none: on a shallow clone it only defers the blob
+	// download to checkout, costing a second round-trip for the same bytes.
 
 	args = append(args, "--single-branch")
 
@@ -255,7 +253,21 @@ func runGitClone(ctx context.Context, repoURL string, dest string, opts GitClone
 	var lastErr error
 	for attempt := 1; attempt <= gitCloneRetryCount; attempt++ {
 		if attempt > 1 {
-			time.Sleep(gitCloneRetryDelay)
+			// Retrying is only worth it for network trouble; a missing repo
+			// or bad credentials fail the same way every time.
+			if !isRetryableError(lastErr) {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("git clone cancelled: %w (last error: %v)", ctx.Err(), lastErr)
+			case <-time.After(gitCloneRetryDelay):
+			}
+			// A failed clone can leave a partial checkout behind, and git
+			// refuses to clone into a non-empty directory.
+			if err := os.RemoveAll(dest); err != nil {
+				return fmt.Errorf("reset app checkout directory: %w", err)
+			}
 		}
 
 		err := runGitCommand(ctx, env, args...)
@@ -279,7 +291,7 @@ func runGitClone(ctx context.Context, repoURL string, dest string, opts GitClone
 		lastErr = err
 	}
 
-	return fmt.Errorf("git clone failed after %d attempts: %w", gitCloneRetryCount, lastErr)
+	return fmt.Errorf("git clone failed: %w", lastErr)
 }
 
 // ============================================================================

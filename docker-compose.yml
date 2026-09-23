@@ -24,6 +24,13 @@ networks:
     ipam:
       config:
         - subnet: 172.20.0.0/16
+  # User app containers + Caddy only — kept separate from gravyflow-network so
+  # deployed apps can't reach Postgres, Redis or the API. The API also creates
+  # it on first deploy, so it's external here: create it once with
+  #   docker network create gravyflow-apps
+  gravyflow-apps:
+    name: gravyflow-apps
+    external: true
 
 # ============================================================================
 # VOLUMES
@@ -44,6 +51,8 @@ volumes:
     name: gravyflow-prometheus-data
   grafana-data:
     name: gravyflow-grafana-data
+  caddy-data:
+    name: gravyflow-caddy-data
 
 # ============================================================================
 # SERVICES
@@ -222,6 +231,12 @@ services:
       PGMAXCONNLIFETIME: ${PGMAXCONNLIFETIME:-30m}
       PGMAXCONNIDLETIME: ${PGMAXCONNIDLETIME:-5m}
       
+      # Routing — the API pushes app routes to Caddy's admin API.
+      CADDY_ADMIN_URL: http://caddy:2019
+      GRAVYFLOW_APPS_DOMAIN: ${GRAVYFLOW_APPS_DOMAIN:-localhost}
+      GRAVYFLOW_APPS_URL_SCHEME: ${GRAVYFLOW_APPS_URL_SCHEME:-http}
+      GRAVYFLOW_APPS_NETWORK: gravyflow-apps
+
       # Build Configuration
       GRAVYFLOW_APPS_DIR: ${GRAVYFLOW_APPS_DIR:-/var/lib/gravyflow/apps}
       NIXPACKS_CACHE_DIR: ${NIXPACKS_CACHE_DIR:-/var/cache/nixpacks}
@@ -243,6 +258,10 @@ services:
       WRITE_TIMEOUT: ${WRITE_TIMEOUT:-15s}
       READ_TIMEOUT: ${READ_TIMEOUT:-15s}
       IDLE_TIMEOUT: ${IDLE_TIMEOUT:-60s}
+    # The image runs as non-root; the host's docker.sock is root:docker 660,
+    # so the container needs the host docker group's GID (`getent group docker`).
+    group_add:
+      - "${DOCKER_GID:-972}"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - app-builds:/var/lib/gravyflow/apps
@@ -292,6 +311,32 @@ services:
       - "com.gravyflow.service=api"
       - "com.gravyflow.environment=${ENVIRONMENT:-development}"
       - "com.gravyflow.version=${BUILD_VERSION:-latest}"
+
+  # ==========================================================================
+  # CADDY (routes <app>.<GRAVYFLOW_APPS_DOMAIN> to app containers)
+  # ==========================================================================
+  caddy:
+    image: caddy:2-alpine
+    container_name: gravyflow-caddy
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    ports:
+      - "${CADDY_HTTP_PORT:-80}:80"
+      - "${CADDY_HTTPS_PORT:-443}:443"
+      # Admin API has no auth — only ever publish it on loopback.
+      - "127.0.0.1:${CADDY_ADMIN_PORT:-2019}:2019"
+    networks:
+      - gravyflow-network
+      - gravyflow-apps
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - "com.gravyflow.service=caddy"
 
   # ==========================================================================
   # PROMETHEUS (Monitoring)

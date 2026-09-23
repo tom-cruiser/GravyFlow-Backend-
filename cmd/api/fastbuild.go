@@ -161,6 +161,19 @@ func detectProjectKind(appPath string) projectKind {
 	return projectKindUnknown
 }
 
+// isNodeProjectKind reports whether the fast Node builder
+// (buildNodeDockerImageWithOptions) has a Dockerfile for kind.
+func isNodeProjectKind(kind projectKind) bool {
+	switch kind {
+	case projectKindNodeNext, projectKindVite, projectKindNode, projectKindReact,
+		projectKindAngular, projectKindNuxt, projectKindSvelte, projectKindSolid,
+		projectKindAstro, projectKindRemix:
+		return true
+	default:
+		return false
+	}
+}
+
 func hasBuildScript(manifest packageManifest) bool {
 	_, ok := manifest.Scripts["build"]
 	return ok
@@ -318,7 +331,9 @@ func installCommand(pm string) string {
 	case "bun":
 		return "bun install --frozen-lockfile"
 	default:
-		return "npm ci --prefer-offline --no-audit --no-fund"
+		// npm ci refuses to run without package-lock.json, and npm is the
+		// fallback when no lockfile was found at all.
+		return "if [ -f package-lock.json ]; then npm ci --prefer-offline --no-audit --no-fund; else npm install --no-audit --no-fund; fi"
 	}
 }
 
@@ -395,7 +410,9 @@ func buildNodeDockerImage(appPath string, appName string, kind projectKind) erro
 
 func buildNodeDockerImageWithOptions(appPath string, appName string, kind projectKind, opts BuildOptions) error {
 	pm := packageManager(appPath)
-	installCmd := installCommand(pm)
+	// Every Dockerfile copies node_modules out of the deps stage, which fails
+	// for an app with no dependencies unless the directory exists.
+	installCmd := installCommand(pm) + " && mkdir -p node_modules"
 	buildCmd := buildCommand(pm)
 
 	// Detect node version from engines
@@ -705,8 +722,10 @@ func runDockerBuildWithRetry(ctx context.Context, args []string, maxRetries int,
 
 		lastErr = err
 
-		// Don't retry on certain errors
-		if isFatalBuildError(err) {
+		// Only retry transient failures (registry/network hiccups). A compile
+		// error, missing script or bad lockfile fails identically every
+		// time, and rerunning it just triples how long the user waits.
+		if isFatalBuildError(err) || !isRetryableError(err) {
 			return err
 		}
 	}

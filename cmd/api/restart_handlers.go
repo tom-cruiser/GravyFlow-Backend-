@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/hibiken/asynq"
 )
 
 // ============================================================================
@@ -429,37 +432,77 @@ WHERE id = $1
 // DEPLOYMENT JOB MANAGER EXTENSIONS
 // ============================================================================
 
+// ListPendingJobs returns the job IDs for deploymentID whose saved status is
+// still queued/active/scheduled (i.e. not yet completed/failed/cancelled).
+// It scans the same "deployment:job:*" status keys ListJobsForUser
+// (deployment_jobs.go) reads, since that's the only place DeploymentID is
+// recorded per job — asynq's own queue only indexes tasks by task ID.
+//
+// This used to be an empty stub that always returned no jobs, which meant
+// restartAppHandler's "restart already pending" conflict check
+// (hasPendingRestart) could never fire: concurrent restart requests for the
+// same deployment were never actually blocked.
 func (m *DeploymentJobManager) ListPendingJobs(ctx context.Context, deploymentID string) ([]string, error) {
 	if m == nil || m.redisClient == nil {
 		return nil, nil
 	}
 
-	// Get pending jobs from Redis
-	// This is a simplified implementation
-	var jobs []string
-	
-	// Scan for jobs with this deployment ID
-	pattern := fmt.Sprintf("deployment:job:*")
-	iter := m.redisClient.Scan(ctx, 0, pattern, 0).Iterator()
-	
-	for iter.Next(ctx) {
-		_ = iter.Val()
-		// Check if this job is for this deployment
-		// This would need to parse the job status
-		// Simplified for example
+	deploymentID = strings.TrimSpace(deploymentID)
+	if deploymentID == "" {
+		return nil, nil
 	}
-	
-	return jobs, iter.Err()
+
+	pending := map[JobStatus]bool{
+		JobStatusQueued:    true,
+		JobStatusActive:    true,
+		JobStatusScheduled: true,
+	}
+
+	var jobs []string
+	iter := m.redisClient.Scan(ctx, 0, "deployment:job:*", 0).Iterator()
+	for iter.Next(ctx) {
+		data, err := m.redisClient.Get(ctx, iter.Val()).Bytes()
+		if err != nil {
+			continue
+		}
+
+		var status DeploymentJobStatus
+		if err := json.Unmarshal(data, &status); err != nil {
+			continue
+		}
+
+		if status.DeploymentID == deploymentID && pending[status.Status] {
+			jobs = append(jobs, status.JobID)
+		}
+	}
+
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+
+	return jobs, nil
 }
 
+// GetQueueLength reports how many deployment jobs are waiting to be picked
+// up by a worker. It used to read Redis key "deployments" with LLen, but
+// jobs are enqueued via asynq onto the "deployment-jobs" queue (see
+// EnqueueDeploymentWithConfig), which asynq stores under its own internal
+// key scheme — "deployments" was never written to, so this always reported
+// 0 regardless of actual load, making restartAppHandler's EstimatedWait
+// meaningless.
 func (m *DeploymentJobManager) GetQueueLength(ctx context.Context) (int, error) {
 	if m == nil || m.redisClient == nil {
 		return 0, nil
 	}
-	
-	// Get queue length from Redis
-	length, err := m.redisClient.LLen(ctx, "deployments").Result()
-	return int(length), err
+
+	inspector := asynq.NewInspector(m.redisOpt)
+	defer inspector.Close()
+
+	info, err := inspector.GetQueueInfo(deploymentJobQueueName)
+	if err != nil {
+		return 0, err
+	}
+	return info.Pending, nil
 }
 
 // ============================================================================

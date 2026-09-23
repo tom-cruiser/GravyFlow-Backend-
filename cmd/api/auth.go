@@ -750,25 +750,12 @@ func logoutHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "logged out successfully"})
 }
 
-// ============================================================================
-// ROUTE SETUP
-// ============================================================================
-
-// setupAuthRoutes configures all authentication routes
-func setupAuthRoutes(router *gin.Engine) {
-	auth := router.Group("/api/auth")
-	{
-		auth.POST("/register", registerHandler)
-		auth.POST("/login", loginHandler)
-		auth.POST("/refresh", refreshHandler)
-		auth.POST("/logout", AuthMiddleware(false), logoutHandler)
-
-		// Protected routes
-		protected := auth.Group("/")
-		protected.Use(AuthMiddleware(false))
-		{
-			protected.POST("/api-keys", createAPIKeyHandler)
-			// Add other protected routes here
-		}
-	}
-}
+// Route registration for register/login/refresh/api-keys/logout lives in
+// main.go's setupRouter, under /api/v1/auth/... (the prefix the frontend
+// actually calls). This file used to also define a setupAuthRoutes that
+// registered the same handlers again under /api/auth/..., but that function
+// was never called from main.go, so logoutHandler in particular was an
+// unreachable 404 despite being fully implemented — meaning refresh tokens
+// could never be explicitly revoked by the client. It was removed rather
+// than wired up, to avoid two divergent URL namespaces for the same feature;
+// logoutHandler is now registered directly at POST /api/v1/auth/logout.

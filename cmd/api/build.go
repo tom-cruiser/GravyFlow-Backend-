@@ -52,9 +52,6 @@ const (
 // ============================================================================
 
 type BuildConfig struct {
-	// Cache directory for Nixpacks (empty = default)
-	NixpacksCacheDir string
-
 	// Build timeout
 	Timeout time.Duration
 
@@ -80,7 +77,6 @@ type BuildConfig struct {
 // DefaultConfig returns a sensible default configuration
 func DefaultConfig() BuildConfig {
 	return BuildConfig{
-		NixpacksCacheDir: "/var/cache/nixpacks",
 		Timeout:          defaultBuildTimeout,
 		MaxRetries:       2,
 		DisableBuildKit:  false,
@@ -157,6 +153,10 @@ func BuildCodeWithConfig(appPath string, appName string, config BuildConfig) (st
 
 	logger.Info("Building application: %s from %s", appName, absPath)
 
+	if err := ensureDockerignore(absPath); err != nil {
+		logger.Warn("could not write default .dockerignore for %q: %v", appName, err)
+	}
+
 	// Check if Nixpacks is available
 	if _, err := exec.LookPath("nixpacks"); err != nil {
 		return "", fmt.Errorf(`nixpacks CLI not found in PATH. Please install nixpacks:
@@ -168,8 +168,9 @@ func BuildCodeWithConfig(appPath string, appName string, config BuildConfig) (st
 	// Detect project type - uses detectProjectKind from fastbuild.go
 	kind := detectProjectKind(absPath)
 
-	// Fast path for Node.js projects
-	if kind != projectKindUnknown {
+	// Fast path for Node.js projects. Python/Go/Rust are detected too, but the
+	// fast builder only has Node Dockerfiles, so those go through Nixpacks.
+	if isNodeProjectKind(kind) {
 		logger.Info("Using fast builder for %q (%s)", appName, projectKindLabel(kind))
 
 		ctx, cancel := context.WithTimeout(context.Background(), config.Timeout)
@@ -185,6 +186,42 @@ func BuildCodeWithConfig(appPath string, appName string, config BuildConfig) (st
 	logger.Info("Using Nixpacks builder for %q", appName)
 
 	return buildWithNixpacks(absPath, appName, config)
+}
+
+// defaultDockerignore keeps VCS data and host-built artifacts out of the build
+// context. Without it every build uploads .git and any committed node_modules
+// (hundreds of MB for some repos), and `COPY . .` then overwrites the
+// freshly installed node_modules with the host's copy.
+const defaultDockerignore = `.git
+node_modules
+.next
+.nuxt
+.svelte-kit
+.turbo
+.cache
+npm-debug.log*
+yarn-error.log*
+`
+
+// ensureDockerignore writes defaultDockerignore into checkouts GravyFlow owns
+// (under appBuildRoot) when the repo doesn't ship its own. It never touches a
+// user-supplied local directory; the file is untracked, so the next git sync
+// cleans it and the next build writes it again.
+func ensureDockerignore(absPath string) error {
+	root, err := filepath.Abs(appBuildRoot())
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(root, absPath)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return nil
+	}
+
+	path := filepath.Join(absPath, ".dockerignore")
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
+	return os.WriteFile(path, []byte(defaultDockerignore), 0o644)
 }
 
 // ============================================================================
@@ -319,17 +356,6 @@ func buildNodeDockerImageWithContext(ctx context.Context, absPath string, appNam
 // ============================================================================
 
 func buildWithNixpacks(absPath string, appName string, config BuildConfig) (string, error) {
-	// Determine cache strategy
-	cacheDir := config.NixpacksCacheDir
-	if cacheDir == "" {
-		cacheDir = os.Getenv("NIXPACKS_CACHE_DIR")
-	}
-	if cacheDir == "" {
-		cacheDir = "/var/cache/nixpacks"
-	}
-
-	useCacheDir := !strings.EqualFold(cacheDir, "off") && !strings.EqualFold(cacheDir, "none")
-
 	ctx, cancel := context.WithTimeout(context.Background(), config.Timeout)
 	defer cancel()
 
@@ -337,12 +363,7 @@ func buildWithNixpacks(absPath string, appName string, config BuildConfig) (stri
 	for attempt := 1; attempt <= config.MaxRetries; attempt++ {
 		logger.Info("Nixpacks build attempt %d/%d", attempt, config.MaxRetries)
 
-		var err error
-		if useCacheDir {
-			err = runNixpacksBuild(ctx, absPath, appName, cacheDir, config)
-		} else {
-			err = runNixpacksBuild(ctx, absPath, appName, "", config)
-		}
+		err := runNixpacksBuild(ctx, absPath, appName)
 
 		if err == nil {
 			logger.Info("Nixpacks build completed successfully")
@@ -371,38 +392,32 @@ func buildWithNixpacks(absPath string, appName string, config BuildConfig) (stri
 	return "", fmt.Errorf("nixpacks build failed after %d attempts: %w", config.MaxRetries, lastErr)
 }
 
-func runNixpacksBuild(ctx context.Context, absPath string, appName string, cacheDir string, config BuildConfig) error {
+// runNixpacksBuild runs `nixpacks build`. Nixpacks has no cache-directory flag
+// (only --cache-key/--cache-from/--no-cache); its layer cache lives in the
+// Docker daemon and is keyed by the source path, which is stable per
+// deployment, so no extra flag is needed.
+func runNixpacksBuild(ctx context.Context, absPath string, appName string) error {
 	// Use dockerCommandEnv from docker_env.go
-	err := runNixpacksBuildWithEnv(ctx, absPath, appName, cacheDir, dockerCommandEnv())
+	err := runNixpacksBuildWithEnv(ctx, absPath, appName, dockerCommandEnv())
 
 	// isBuildKitMissingError is now in helpers.go
 	if err != nil && isBuildKitMissingError(err) {
 		logger.Warn("BuildKit unavailable, retrying with legacy docker builder")
-		if retryErr := runNixpacksBuildWithEnv(ctx, absPath, appName, cacheDir, dockerCommandEnvForceLegacyBuilder()); retryErr == nil {
+		// Report the retry's own error: the first one only says BuildKit is
+		// missing, which is no longer the reason the build failed.
+		if err = runNixpacksBuildWithEnv(ctx, absPath, appName, dockerCommandEnvForceLegacyBuilder()); err == nil {
 			return nil
 		}
-	}
-
-	if err != nil && isUnsupportedCacheDirError(err) {
-		logger.Warn("--cache-dir unsupported, retrying with native cache")
-		if retryErr := runNixpacksBuildWithEnv(ctx, absPath, appName, "", dockerCommandEnv()); retryErr == nil {
-			return nil
+		if isBuildKitMissingError(err) {
+			return fmt.Errorf("%w (install docker-buildx or set DISABLE_BUILDKIT=1)", err)
 		}
-	}
-
-	if err != nil && isBuildKitMissingError(err) {
-		return fmt.Errorf("%w (install docker-buildx or set DISABLE_BUILDKIT=1)", err)
 	}
 
 	return err
 }
 
-func runNixpacksBuildWithEnv(ctx context.Context, absPath string, appName string, cacheDir string, env []string) error {
+func runNixpacksBuildWithEnv(ctx context.Context, absPath string, appName string, env []string) error {
 	args := []string{"build", absPath, "--name", appName}
-
-	if cacheDir != "" {
-		args = append(args, "--cache-dir", cacheDir)
-	}
 
 	// Add verbose flag if configured
 	if logger.(*defaultLogger).verbose {
@@ -458,34 +473,6 @@ func pushDockerImage(ctx context.Context, appName string, registryURL string) er
 // ============================================================================
 
 // Note: isRetryableError is now in helpers.go - DO NOT redeclare here
-
-func isUnsupportedCacheDirError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	s := strings.ToLower(err.Error())
-	if !strings.Contains(s, "cache-dir") {
-		return false
-	}
-
-	for _, marker := range []string{
-		"unexpected argument",
-		"wasn't expected",
-		"isn't expected",
-		"unrecognized",
-		"unknown flag",
-		"unknown option",
-		"invalid option",
-		"found argument",
-	} {
-		if strings.Contains(s, marker) {
-			return true
-		}
-	}
-
-	return false
-}
 
 // Note: isBuildKitMissingError is now in helpers.go - DO NOT redeclare here
 

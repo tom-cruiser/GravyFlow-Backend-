@@ -368,8 +368,8 @@ func parseLogOptions(c *gin.Context) logStreamOptions {
     // Parse tail parameter
     if tail := c.Query("tail"); tail != "" {
         if t, err := fmt.Sscanf(tail, "%d", &opts.Tail); err == nil && t == 1 {
-            if opts.Tail > 10000 {
-                opts.Tail = 10000
+            if opts.Tail <= 0 || opts.Tail > 10000 {
+                opts.Tail = defaultTailLines
             }
         }
     }

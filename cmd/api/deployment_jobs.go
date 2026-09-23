@@ -770,6 +770,109 @@ func (m *DeploymentJobManager) handleDeploymentJobTask(ctx context.Context, task
 	return nil
 }
 
+// ============================================================================
+// STUCK DEPLOYMENT RECONCILIATION
+// ============================================================================
+
+const (
+	stuckDeploymentReconcileInterval = 5 * time.Minute
+	// Grace period between CreateDeploymentAttemptForUser inserting the
+	// BUILDING row and the task landing in the queue.
+	stuckDeploymentGracePeriod = 2 * time.Minute
+	stuckDeploymentMessage     = "deployment was interrupted before it finished (the worker stopped or its status update failed); please redeploy"
+)
+
+// RunStuckDeploymentReconciler marks BUILDING deployments FAILED when no
+// queued, running, scheduled or retrying task exists for them anymore. Without
+// this, a job whose failure couldn't be written to the database (or that was
+// lost when the API restarted) leaves the app showing "Building…" forever.
+func (m *DeploymentJobManager) RunStuckDeploymentReconciler(ctx context.Context) {
+	ticker := time.NewTicker(stuckDeploymentReconcileInterval)
+	defer ticker.Stop()
+
+	for {
+		if n, err := m.ReconcileStuckDeployments(ctx); err != nil {
+			log.Printf("[WARN] stuck deployment reconciler: %v", err)
+		} else if n > 0 {
+			log.Printf("[INFO] stuck deployment reconciler: marked %d deployment(s) failed", n)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (m *DeploymentJobManager) ReconcileStuckDeployments(ctx context.Context) (int, error) {
+	if m == nil || deploymentStore == nil {
+		return 0, fmt.Errorf("deployment job manager is not initialized")
+	}
+
+	stale, err := deploymentStore.ListBuildingDeploymentsNotUpdatedSince(ctx, time.Now().Add(-stuckDeploymentGracePeriod))
+	if err != nil || len(stale) == 0 {
+		return 0, err
+	}
+
+	// Collect the deployments that still have a live task. Checked after
+	// loading the rows, so a job enqueued in between is still seen here.
+	live, err := m.deploymentsWithLiveTasks()
+	if err != nil {
+		return 0, err
+	}
+
+	marked := 0
+	for _, d := range stale {
+		if live[d.DeploymentID] {
+			continue
+		}
+		if err := deploymentStore.MarkDeploymentFailed(ctx, d.DeploymentID, errors.New(stuckDeploymentMessage), d.OwnerUserID); err != nil {
+			log.Printf("[WARN] stuck deployment reconciler: mark %s failed: %v", d.DeploymentID, err)
+			continue
+		}
+		marked++
+	}
+	return marked, nil
+}
+
+func (m *DeploymentJobManager) deploymentsWithLiveTasks() (map[string]bool, error) {
+	inspector := asynq.NewInspector(m.redisOpt)
+	defer inspector.Close()
+
+	listers := []func(string, ...asynq.ListOption) ([]*asynq.TaskInfo, error){
+		inspector.ListPendingTasks,
+		inspector.ListActiveTasks,
+		inspector.ListScheduledTasks,
+		inspector.ListRetryTasks,
+	}
+
+	live := make(map[string]bool)
+	const pageSize = 500
+	for _, list := range listers {
+		for page := 1; ; page++ {
+			tasks, err := list(deploymentJobQueueName, asynq.PageSize(pageSize), asynq.Page(page))
+			if err != nil {
+				// A queue that has never had a task doesn't exist yet.
+				if errors.Is(err, asynq.ErrQueueNotFound) {
+					break
+				}
+				return nil, fmt.Errorf("list deployment tasks: %w", err)
+			}
+			for _, task := range tasks {
+				var payload DeploymentJobPayload
+				if json.Unmarshal(task.Payload, &payload) == nil && payload.DeploymentID != "" {
+					live[payload.DeploymentID] = true
+				}
+			}
+			if len(tasks) < pageSize {
+				break
+			}
+		}
+	}
+	return live, nil
+}
+
 func (m *DeploymentJobManager) updateStatus(ctx context.Context, current DeploymentJobStatus, mutate func(*DeploymentJobStatus)) error {
 	mutate(&current)
 	return m.saveStatus(ctx, current)
@@ -884,15 +987,8 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 		}
 	}
 
-	if strings.TrimSpace(deployment.ContainerID) != "" {
-		if progress != nil {
-			progress("stopping", 35, "stopping existing container")
-		}
-		if err := StopAndRemoveContainer(deployment.ContainerID, false); err != nil {
-			return DeploymentJobStatus{}, err
-		}
-	}
-
+	// Build before touching the running container, so the app keeps serving
+	// for the whole build and a failed build leaves the old version up.
 	if payload.RebuildImage || imageName == "" {
 		if progress != nil {
 			progress("building", 50, "building application image")
@@ -908,16 +1004,28 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 		progress("deploying", 60, "reusing existing image")
 	}
 
-	if progress != nil {
-		progress("deploying", 75, "creating and starting container")
-	}
-
 	envMap, err := deploymentStore.LoadDeploymentEnvMap(ctx, payload.UserID, deployment.DeploymentID)
 	if err != nil {
 		if shouldReleaseOnError {
 			_ = deploymentStore.ReleaseDeploymentResources(ctx, payload.UserID, requestedCPU, requestedMemoryMB, requestedApps, requestedStorageMB)
 		}
 		return DeploymentJobStatus{}, err
+	}
+
+	if strings.TrimSpace(deployment.ContainerID) != "" {
+		if progress != nil {
+			progress("stopping", 70, "stopping existing container")
+		}
+		// An already-gone container (removed by hand, host reboot) is fine:
+		// the goal is only that it isn't running anymore.
+		if err := StopAndRemoveContainer(deployment.ContainerID, false); err != nil &&
+			!strings.Contains(strings.ToLower(err.Error()), "no such container") {
+			return DeploymentJobStatus{}, err
+		}
+	}
+
+	if progress != nil {
+		progress("deploying", 75, "creating and starting container")
 	}
 
 	// Apply environment overrides

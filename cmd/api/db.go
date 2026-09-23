@@ -116,7 +116,7 @@ type DeploymentRecord struct {
 
 // computeDeploymentURL returns the URL a deployment is reachable at, or ""
 // if it isn't currently serving traffic. Every container this app manages
-// gets a "<containerName>.localhost" host in Caddy automatically —
+// gets a "<containerName>.<GRAVYFLOW_APPS_DOMAIN>" host in Caddy automatically —
 // containerName is always set to the app's name (see CreateAndStartContainer
 // call site in runDeploymentWorkflow) — so the default URL only needs the
 // app name; RouteManager.buildHosts in caddy.go is the source of truth this
@@ -131,7 +131,7 @@ func computeDeploymentURL(appName string, status string, containerID string) str
 	}
 	switch DeploymentStatus(status) {
 	case DeploymentStatusRunning, DeploymentStatusDeployed:
-		return fmt.Sprintf("http://%s.localhost", appName)
+		return fmt.Sprintf("%s://%s.%s", appsURLScheme(), appName, appsBaseDomain())
 	default:
 		return ""
 	}
@@ -2035,6 +2035,52 @@ WHERE id = $1
 	}
 
 	return nil
+}
+
+// StaleBuildingDeployment is a BUILDING row that hasn't been touched since
+// before the cutoff passed to ListBuildingDeploymentsNotUpdatedSince.
+type StaleBuildingDeployment struct {
+	DeploymentID string
+	OwnerUserID  string
+}
+
+// ListBuildingDeploymentsNotUpdatedSince returns live (not soft-deleted)
+// deployments still in BUILDING whose row hasn't changed since cutoff.
+func (s *DeploymentStore) ListBuildingDeploymentsNotUpdatedSince(ctx context.Context, cutoff time.Time) ([]StaleBuildingDeployment, error) {
+	if s == nil || s.pool == nil {
+		return nil, &StoreError{
+			Type:    ErrDatabase,
+			Message: "deployment store is not initialized",
+		}
+	}
+
+	rows, err := s.pool.Query(ctx, `
+SELECT id::text, owner_user_id::text
+FROM deployments
+WHERE status = $1 AND deleted_at IS NULL AND updated_at < $2
+`, string(DeploymentStatusBuilding), cutoff)
+	if err != nil {
+		return nil, &StoreError{
+			Type:    ErrDatabase,
+			Message: "failed to list building deployments",
+			Err:     err,
+		}
+	}
+	defer rows.Close()
+
+	var stale []StaleBuildingDeployment
+	for rows.Next() {
+		var d StaleBuildingDeployment
+		if err := rows.Scan(&d.DeploymentID, &d.OwnerUserID); err != nil {
+			return nil, &StoreError{
+				Type:    ErrDatabase,
+				Message: "failed to scan building deployment",
+				Err:     err,
+			}
+		}
+		stale = append(stale, d)
+	}
+	return stale, rows.Err()
 }
 
 func (s *DeploymentStore) MarkDeploymentFailed(ctx context.Context, deploymentID string, cause error, changedBy string) error {

@@ -28,10 +28,35 @@ import (
 // ============================================================================
 
 const (
-	caddyAdminLoadURL = "http://localhost:2019/load"
-	defaultHTTPPort   = "80"
-	defaultHTTPSPort  = "443"
+	defaultHTTPPort  = "80"
+	defaultHTTPSPort = "443"
 )
+
+// caddyAdminURL is the Caddy admin API base URL. Under docker-compose the API
+// container reaches Caddy by service name (CADDY_ADMIN_URL=http://caddy:2019);
+// "localhost" there would be the API container itself.
+func caddyAdminURL() string {
+	return strings.TrimRight(envOrDefault("CADDY_ADMIN_URL", "http://localhost:2019"), "/")
+}
+
+// appsBaseDomain is the domain every app is served under as
+// "<appName>.<domain>". "localhost" only resolves on the server itself; set
+// GRAVYFLOW_APPS_DOMAIN to a wildcard DNS domain (*.apps.example.com) to make
+// apps reachable from outside.
+func appsBaseDomain() string {
+	return strings.Trim(strings.ToLower(envOrDefault("GRAVYFLOW_APPS_DOMAIN", "localhost")), ".")
+}
+
+func appsURLScheme() string {
+	return envOrDefault("GRAVYFLOW_APPS_URL_SCHEME", "http")
+}
+
+// appsNetworkName is the Docker network app containers and Caddy share. It is
+// deliberately not gravyflow-network, so user apps can't reach Postgres,
+// Redis or the API.
+func appsNetworkName() string {
+	return envOrDefault("GRAVYFLOW_APPS_NETWORK", "gravyflow-apps")
+}
 
 type ContainerInfo struct {
 	ContainerName string
@@ -95,7 +120,7 @@ func caddySyncRequired() bool {
 }
 
 func caddyAdminHealthy(ctx context.Context) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:2019/config/", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, caddyAdminURL()+"/config/", nil)
 	if err != nil {
 		return false
 	}
@@ -170,7 +195,7 @@ func (rm *RouteManager) GetRoutes() []Route {
 }
 
 func (rm *RouteManager) buildHosts(container ContainerInfo) []string {
-	hosts := []string{fmt.Sprintf("%s.localhost", container.ContainerName)}
+	hosts := []string{fmt.Sprintf("%s.%s", container.ContainerName, appsBaseDomain())}
 	
 	if container.DeploymentID != "" && deploymentStore != nil {
 		verifiedDomains, err := deploymentStore.ListVerifiedDomainsForDeployment(
@@ -230,7 +255,7 @@ func (rm *RouteManager) syncToCaddyInternal(ctx context.Context) error {
 		return fmt.Errorf("marshal caddy payload: %w", err)
 	}
 	
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, caddyAdminLoadURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, caddyAdminURL()+"/load", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create caddy request: %w", err)
 	}
@@ -432,10 +457,13 @@ func isValidHostName(host string) bool {
 // CONFIGURATION BACKUP
 // ============================================================================
 
+// backupCaddyConfig snapshots the live config before each load. Opt-in via
+// CADDY_BACKUP_DIR: it writes one file per sync (i.e. per deploy) and never
+// prunes them.
 func (rm *RouteManager) backupCaddyConfig(ctx context.Context) error {
 	backupDir := rm.config.BackupDir
 	if backupDir == "" {
-		backupDir = "/var/lib/caddy/backups"
+		return nil
 	}
 	
 	if err := os.MkdirAll(backupDir, 0755); err != nil {
@@ -445,7 +473,7 @@ func (rm *RouteManager) backupCaddyConfig(ctx context.Context) error {
 	timestamp := time.Now().Format("20060102-150405")
 	backupFile := filepath.Join(backupDir, fmt.Sprintf("caddy-config-%s.json", timestamp))
 	
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://localhost:2019/config/", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", caddyAdminURL()+"/config/", nil)
 	if err != nil {
 		return err
 	}
@@ -504,9 +532,12 @@ func init() {
 	config := CaddyConfig{
 		HTTPPort:    defaultHTTPPort,
 		HTTPSPort:   defaultHTTPSPort,
-		EnableTLS:   false,
-		HealthCheck: true,
-		BackupDir:   "/var/lib/caddy/backups",
+		EnableTLS: false,
+		// Off: most apps have no /health endpoint and aren't ready the
+		// instant their container starts, so probing here kept routes from
+		// ever being added. Container liveness is Docker's restart policy's job.
+		HealthCheck: false,
+		BackupDir:   strings.TrimSpace(os.Getenv("CADDY_BACKUP_DIR")),
 	}
 	defaultRouteManager = NewRouteManager(config)
 }
@@ -524,17 +555,38 @@ func SyncCaddyRoutesFromRunningContainers() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	
+	return defaultRouteManager.ReplaceRoutes(ctx, containers)
+}
+
+// ReplaceRoutes makes the routing table exactly the given running containers
+// and pushes it to Caddy once. Calling AddRoute per container instead re-posts
+// the full config N times per deploy and never drops routes for containers
+// that have since stopped.
+func (rm *RouteManager) ReplaceRoutes(ctx context.Context, containers []ContainerInfo) error {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	
+	now := time.Now()
+	routes := make(map[string]Route, len(containers))
 	for _, container := range containers {
 		if container.ContainerName == "" || container.InternalIP == "" || container.InternalPort == "" {
 			continue
 		}
-		
-		if err := defaultRouteManager.AddRoute(ctx, container); err != nil {
-			log.Printf("Failed to add route for %s: %v", container.ContainerName, err)
+		createdAt := now
+		if existing, ok := rm.routes[container.ContainerName]; ok {
+			createdAt = existing.CreatedAt
+		}
+		routes[container.ContainerName] = Route{
+			ContainerName: container.ContainerName,
+			DeploymentID:  container.DeploymentID,
+			Target:        fmt.Sprintf("%s:%s", container.InternalIP, container.InternalPort),
+			Hosts:         rm.buildHosts(container),
+			CreatedAt:     createdAt,
+			UpdatedAt:     now,
 		}
 	}
-	
-	return nil
+	rm.routes = routes
+	return rm.syncToCaddy(ctx)
 }
 
 func DeleteCaddyRouteForContainer(containerName string) error {
@@ -645,12 +697,17 @@ func ListRunningManagedContainers() ([]ContainerInfo, error) {
 			name = appName
 		}
 
+		// Prefer the address on the apps network: that's the one Caddy can
+		// reach. Fall back to any address for containers created before
+		// apps were attached to it.
 		internalIP := ""
 		if c.NetworkSettings != nil {
+			if ep := c.NetworkSettings.Networks[appsNetworkName()]; ep != nil && ep.IPAddress != "" {
+				internalIP = ep.IPAddress
+			}
 			for _, ep := range c.NetworkSettings.Networks {
-				if ep != nil && ep.IPAddress != "" {
+				if internalIP == "" && ep != nil && ep.IPAddress != "" {
 					internalIP = ep.IPAddress
-					break
 				}
 			}
 		}

@@ -318,3 +318,53 @@ func BenchmarkDetectProjectKindNextJS(b *testing.B) {
         detectProjectKind(dir)
     }
 }
+
+// ============================================================================
+// BUILDER ROUTING TESTS
+// ============================================================================
+
+// Python/Go/Rust are detected but have no fast-path Dockerfile; they must be
+// routed to Nixpacks rather than the Node builder, which rejects them.
+func TestNonNodeKindsAreNotRoutedToNodeBuilder(t *testing.T) {
+    for _, kind := range []ProjectKind{projectKindPython, projectKindGo, projectKindRust, projectKindUnknown} {
+        if isNodeProjectKind(kind) {
+            t.Fatalf("%s must not use the Node fast builder", projectKindLabel(kind))
+        }
+    }
+}
+
+// ============================================================================
+// DOCKERIGNORE TESTS
+// ============================================================================
+
+func TestEnsureDockerignoreOnlyInManagedCheckouts(t *testing.T) {
+    root := t.TempDir()
+    t.Setenv("GRAVYFLOW_APPS_DIR", root)
+
+    checkout := filepath.Join(root, "deployment-id")
+    if err := os.MkdirAll(checkout, 0o755); err != nil {
+        t.Fatal(err)
+    }
+    if err := ensureDockerignore(checkout); err != nil {
+        t.Fatal(err)
+    }
+    if data, err := os.ReadFile(filepath.Join(checkout, ".dockerignore")); err != nil || string(data) != defaultDockerignore {
+        t.Fatalf("managed checkout: .dockerignore = %q, %v", data, err)
+    }
+
+    // A repo's own .dockerignore wins.
+    own := filepath.Join(root, "has-own")
+    os.MkdirAll(own, 0o755)
+    createFile(t, own, ".dockerignore", "custom\n")
+    ensureDockerignore(own)
+    if data, _ := os.ReadFile(filepath.Join(own, ".dockerignore")); string(data) != "custom\n" {
+        t.Fatalf("repo .dockerignore was overwritten: %q", data)
+    }
+
+    // Local directories outside the apps root are never written to.
+    outside := t.TempDir()
+    ensureDockerignore(outside)
+    if _, err := os.Stat(filepath.Join(outside, ".dockerignore")); err == nil {
+        t.Fatal(".dockerignore written outside GRAVYFLOW_APPS_DIR")
+    }
+}

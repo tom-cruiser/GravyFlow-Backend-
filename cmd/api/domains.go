@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ============================================================================
@@ -197,6 +198,16 @@ func (s *DeploymentStore) UpsertDeploymentDomain(
 		&record.CreatedAt,
 		&record.UpdatedAt,
 	); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			// Two concurrent inserts of the same custom_domain can both pass
+			// the FOR-UPDATE lookup above (it only locks an existing row) and
+			// race into this INSERT; the DB's UNIQUE(custom_domain)
+			// constraint is what actually catches the collision here. Report
+			// it the same way as the pre-existing-row case above so callers
+			// (e.g. addAppDomainHandler) classify it as a 409, not a 500.
+			return DeploymentDomainRecord{}, fmt.Errorf("custom domain is already attached to another deployment")
+		}
 		return DeploymentDomainRecord{}, fmt.Errorf("insert deployment domain: %w", err)
 	}
 

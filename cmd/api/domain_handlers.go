@@ -7,6 +7,7 @@ import (
     "log"
     "net"
     "net/http"
+    "regexp"
     "strconv"
     "strings"
     "time"
@@ -101,8 +102,8 @@ func addAppDomainHandler(c *gin.Context) {
     }
 
     req.CustomDomain = normalizeCustomDomain(req.CustomDomain)
-    if req.CustomDomain == "" {
-        sendBadRequest(c, "customDomain is required", nil)
+    if err := validateCustomDomainFormat(req.CustomDomain); err != nil {
+        sendBadRequest(c, "invalid customDomain", err)
         return
     }
 
@@ -320,7 +321,12 @@ func bulkAddAppDomainsHandler(c *gin.Context) {
     results := make([]map[string]interface{}, 0, len(req.Domains))
     for _, domain := range req.Domains {
         domain = normalizeCustomDomain(domain)
-        if domain == "" {
+        if err := validateCustomDomainFormat(domain); err != nil {
+            results = append(results, map[string]interface{}{
+                "domain": domain,
+                "status": "error",
+                "error":  err.Error(),
+            })
             continue
         }
 
@@ -502,8 +508,12 @@ func addDomainRedirectHandler(c *gin.Context) {
     req.FromDomain = normalizeCustomDomain(req.FromDomain)
     req.ToDomain = normalizeCustomDomain(req.ToDomain)
 
-    if req.FromDomain == "" || req.ToDomain == "" {
-        sendBadRequest(c, "both fromDomain and toDomain are required", nil)
+    if err := validateCustomDomainFormat(req.FromDomain); err != nil {
+        sendBadRequest(c, "invalid fromDomain", err)
+        return
+    }
+    if err := validateCustomDomainFormat(req.ToDomain); err != nil {
+        sendBadRequest(c, "invalid toDomain", err)
         return
     }
 
@@ -657,32 +667,52 @@ func verifyTXTChallengeName(domain string) string {
     return fmt.Sprintf("_acme-challenge.%s", domain)
 }
 
-// ============================================================================
-// ROUTE SETUP
-// ============================================================================
+// hostnameLabelPattern matches a single DNS label: 1-63 chars, alphanumeric,
+// hyphens allowed in the middle but not at either end. Underscores are
+// deliberately excluded even though isValidHostName (caddy.go) allows them
+// for internal container-derived hosts — a user-submitted custom domain
+// should look like a real, registrable DNS name.
+var hostnameLabelPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 
-func SetupDomainRoutes(router *gin.Engine) {
-    domainGroup := router.Group("/api/deployments/:id/domains")
-    domainGroup.Use(AuthMiddleware(false))
-    {
-        // List domains
-        domainGroup.GET("/", listAppDomainsHandler)
-        
-        // Add domains
-        domainGroup.POST("/", addAppDomainHandler)
-        domainGroup.POST("/bulk", bulkAddAppDomainsHandler)
-        
-        // Domain verification
-        domainGroup.GET("/:domain/status", domainVerificationStatusHandler)
-        domainGroup.POST("/:domain/verify", verifyAppDomainHandler)
-        
-        // Domain health
-        domainGroup.GET("/:domain/health", checkDomainHealthHandler)
-        
-        // Domain redirects
-        domainGroup.POST("/redirects", addDomainRedirectHandler)
-        
-        // Delete domain
-        domainGroup.DELETE("/:domain", deleteAppDomainHandler)
+// validateCustomDomainFormat rejects the input shapes that
+// normalizeCustomDomain's lowercase+trim alone lets through untouched:
+// bare IP literals, wildcards, single-label names (e.g. "localhost"),
+// empty/oversized labels, and any character outside [a-z0-9.-]. Without
+// this, a string like "169.254.169.254" or "internal-service" was accepted
+// as a "custom domain" and later dialed directly by checkDomainHealthHandler/
+// checkSSLCertificate/checkDomainHealthQuick.
+func validateCustomDomainFormat(domain string) error {
+    if domain == "" {
+        return fmt.Errorf("domain is required")
     }
+    if len(domain) > 253 {
+        return fmt.Errorf("domain is too long")
+    }
+    if strings.Contains(domain, "*") {
+        return fmt.Errorf("wildcard domains are not supported")
+    }
+    if net.ParseIP(domain) != nil {
+        return fmt.Errorf("domain must be a hostname, not an IP address")
+    }
+
+    labels := strings.Split(domain, ".")
+    if len(labels) < 2 {
+        return fmt.Errorf("domain must have at least two labels (e.g. example.com)")
+    }
+    for _, label := range labels {
+        if len(label) == 0 || len(label) > 63 || !hostnameLabelPattern.MatchString(label) {
+            return fmt.Errorf("domain contains an invalid label %q", label)
+        }
+    }
+    return nil
 }
+
+// Route registration for all of these handlers lives in main.go's
+// setupRouter, under /api/v1/apps/:id/domains/... (the prefix the frontend
+// actually calls). This file used to also define a SetupDomainRoutes that
+// registered the same handlers again under /api/deployments/:id/domains/...,
+// but that function was never called from main.go, so bulkAddAppDomainsHandler,
+// domainVerificationStatusHandler, checkDomainHealthHandler and
+// addDomainRedirectHandler were unreachable 404s despite being fully
+// implemented. It was removed rather than wired up, to avoid two divergent
+// URL namespaces for the same feature.

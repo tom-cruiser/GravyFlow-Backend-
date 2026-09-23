@@ -24,6 +24,10 @@ NC='\033[0m' # No Color
 # Container names
 POSTGRES_CONTAINER="gravyflow-postgres"
 REDIS_CONTAINER="gravyflow-redis"
+CADDY_CONTAINER="gravyflow-caddy"
+
+# Network shared by deployed app containers and Caddy (see docker-compose.yml)
+APPS_NETWORK="${GRAVYFLOW_APPS_NETWORK:-gravyflow-apps}"
 
 # Ports
 POSTGRES_HOST_PORT="${POSTGRES_PORT:-5433}"
@@ -308,13 +312,37 @@ setup_redis() {
 }
 
 # ============================================================================
+# CADDY SETUP
+# ============================================================================
+
+setup_caddy() {
+    print_header "Setting up Caddy"
+
+    if ! docker network inspect "$APPS_NETWORK" &> /dev/null; then
+        docker network create "$APPS_NETWORK" >/dev/null
+        print_success "Created network $APPS_NETWORK"
+    fi
+
+    # Admin API (no auth) is published on loopback only; the API reaches it
+    # at the default CADDY_ADMIN_URL=http://localhost:2019.
+    local extra_args="-p 127.0.0.1:${CADDY_ADMIN_PORT:-2019}:2019 \
+        -v ${repo_root}/deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro \
+        --network $APPS_NETWORK"
+
+    ensure_container "$CADDY_CONTAINER" "caddy:2-alpine" "${CADDY_HTTP_PORT:-80}:80" "$CADDY_CONTAINER-data:/data" "" "$extra_args"
+
+    local check_cmd="curl -fsS http://localhost:${CADDY_ADMIN_PORT:-2019}/config/"
+    wait_for_service "Caddy" "$check_cmd" "$HEALTH_CHECK_TIMEOUT" "$HEALTH_CHECK_INTERVAL"
+}
+
+# ============================================================================
 # CLEANUP
 # ============================================================================
 
 cleanup_containers() {
     print_header "Cleaning up containers"
     
-    local containers=("$POSTGRES_CONTAINER" "$REDIS_CONTAINER")
+    local containers=("$POSTGRES_CONTAINER" "$REDIS_CONTAINER" "$CADDY_CONTAINER")
     
     for container in "${containers[@]}"; do
         if container_exists "$container"; then
@@ -504,17 +532,18 @@ handle_command() {
             setup_environment
             setup_postgres
             setup_redis
+            setup_caddy
             show_status
             run_application
             ;;
         stop)
             print_header "Stopping containers"
-            docker stop "$POSTGRES_CONTAINER" "$REDIS_CONTAINER" 2>/dev/null || true
+            docker stop "$POSTGRES_CONTAINER" "$REDIS_CONTAINER" "$CADDY_CONTAINER" 2>/dev/null || true
             print_success "Containers stopped"
             ;;
         restart)
             print_header "Restarting containers"
-            docker restart "$POSTGRES_CONTAINER" "$REDIS_CONTAINER" 2>/dev/null || true
+            docker restart "$POSTGRES_CONTAINER" "$REDIS_CONTAINER" "$CADDY_CONTAINER" 2>/dev/null || true
             print_success "Containers restarted"
             ;;
         status)

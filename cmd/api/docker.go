@@ -8,6 +8,7 @@ import (
     "io"
     "log"
     "math"
+    "regexp"
     "sort"
     "strconv"
     "strings"
@@ -267,6 +268,17 @@ func CreateAndStartContainerWithHealthCheck(
         },
     }
 
+    // Put the app on the apps network, the one Caddy also joins, so Caddy can
+    // reach it. Without it the app lands on the default bridge and is
+    // unreachable from a Caddy container.
+    if _, err := EnsureNetwork(ctx, NetworkConfig{Name: appsNetworkName(), Driver: "bridge"}); err != nil {
+        return "", fmt.Errorf("ensure apps network %q: %w", appsNetworkName(), err)
+    }
+    hostCfg.NetworkMode = container.NetworkMode(appsNetworkName())
+    // Bring a crashed app back up; an explicit stop (redeploy, force-stop,
+    // delete) is still respected.
+    hostCfg.RestartPolicy = container.RestartPolicy{Name: container.RestartPolicyUnlessStopped}
+
     resp, err := dockerClient.ContainerCreate(ctx, containerCfg, hostCfg, &network.NetworkingConfig{}, nil, containerName)
     if err != nil {
         if errdefs.IsConflict(err) || strings.Contains(strings.ToLower(err.Error()), "is already in use") {
@@ -352,7 +364,10 @@ func removeContainerByName(ctx context.Context, dockerClient *client.Client, con
         return nil
     }
 
-    containers, err := dockerClient.ContainerList(ctx, container.ListOptions{All: true, Filters: filters.NewArgs(filters.Arg("name", containerName))})
+    // Docker's name filter is an unanchored regex, so a bare "api" would also
+    // match (and force-remove) "gravyflow-api", "my-api", etc. Anchor it to
+    // the exact name; Docker stores names with a leading "/".
+    containers, err := dockerClient.ContainerList(ctx, container.ListOptions{All: true, Filters: filters.NewArgs(filters.Arg("name", "^/"+regexp.QuoteMeta(containerName)+"$"))})
     if err != nil {
         return fmt.Errorf("list containers by name %q: %w", containerName, err)
     }
@@ -522,8 +537,12 @@ func EnsureNetwork(ctx context.Context, config NetworkConfig) (string, error) {
         return "", fmt.Errorf("list networks: %w", err)
     }
 
-    if len(networks) > 0 {
-        return networks[0].ID, nil
+    // The name filter matches substrings, so "gravyflow-apps" would also
+    // match "gravyflow-apps-old"; only an exact name counts.
+    for _, n := range networks {
+        if n.Name == config.Name {
+            return n.ID, nil
+        }
     }
 
     createOpts := network.CreateOptions{

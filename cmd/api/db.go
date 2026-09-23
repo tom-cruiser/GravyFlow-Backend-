@@ -1079,6 +1079,19 @@ CREATE TABLE IF NOT EXISTS github_installations (
 CREATE INDEX IF NOT EXISTS idx_github_installations_installation ON github_installations (github_installation_id);
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS github_installation_id BIGINT;
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS github_repository_id BIGINT`},
+		// Production-domains upgrade: a richer, user-facing status on top of
+		// the existing verified/verification_token ownership fields (which
+		// are unchanged — this is an additional layer, not a replacement),
+		// a single-primary-domain-per-deployment flag, and per-deployment
+		// edge settings (Force HTTPS, www<->apex redirect). See domains.go/
+		// domain_handlers.go/caddy.go.
+		{26, `
+ALTER TABLE domains ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending_dns';
+ALTER TABLE domains ADD COLUMN IF NOT EXISTS status_message TEXT NOT NULL DEFAULT '';
+ALTER TABLE domains ADD COLUMN IF NOT EXISTS is_primary BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE domains ADD COLUMN IF NOT EXISTS dns_checked_at TIMESTAMPTZ;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS force_https BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS www_redirect_mode TEXT NOT NULL DEFAULT 'none'`},
 	}
 
 	for _, migration := range migrations {

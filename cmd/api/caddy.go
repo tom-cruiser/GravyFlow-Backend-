@@ -248,7 +248,7 @@ func (rm *RouteManager) syncToCaddyInternal(ctx context.Context) error {
 		}
 	}
 	
-	payload := rm.buildCaddyPayload(routes)
+	payload := rm.buildCaddyPayload(ctx, routes)
 	
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -315,41 +315,116 @@ func (rm *RouteManager) buildRouteConfig() []map[string]any {
 	return routes
 }
 
-func (rm *RouteManager) buildCaddyPayload(routes []map[string]any) map[string]any {
-	serverConfig := map[string]any{
-		"listen": []string{fmt.Sprintf(":%s", rm.config.HTTPPort)},
-		"routes": routes,
-	}
-	
+func (rm *RouteManager) buildCaddyPayload(ctx context.Context, routes []map[string]any) map[string]any {
+	servers := map[string]any{}
+
 	if rm.config.EnableTLS {
-		serverConfig["listen"] = append(serverConfig["listen"].([]string), 
-			fmt.Sprintf(":%s", rm.config.HTTPSPort))
-		serverConfig["tls"] = map[string]any{
-			"automation": map[string]any{
-				"policy": "acme",
-				"email":  rm.config.TLSEmail,
-				"ca":     rm.config.TLSAcmeCA,
+		// TLS on: the real proxy routes move to the HTTPS listener (with
+		// cert automation), and a second server on the HTTP port either
+		// redirects to HTTPS (force_https deployments) or proxies plainly
+		// (everyone else) — see buildHTTPPortRoutes. A single shared server
+		// on both ports can't distinguish "came in over HTTP" from "came in
+		// over HTTPS" with a plain host matcher, hence the split.
+		servers["gravyflow"] = map[string]any{
+			"listen": []string{fmt.Sprintf(":%s", rm.config.HTTPSPort)},
+			"routes": routes,
+			"tls": map[string]any{
+				"automation": map[string]any{
+					"policy": "acme",
+					"email":  rm.config.TLSEmail,
+					"ca":     rm.config.TLSAcmeCA,
+				},
 			},
 		}
+		servers["gravyflow-http"] = map[string]any{
+			"listen": []string{fmt.Sprintf(":%s", rm.config.HTTPPort)},
+			"routes": rm.buildHTTPPortRoutes(ctx, routes),
+		}
+	} else {
+		// TLS off (default/dev): one plain HTTP server, unchanged from
+		// before force_https existed. force_https has nothing to redirect
+		// to without a real HTTPS listener, so it's a no-op until
+		// CADDY_ENABLE_TLS is set.
+		servers["gravyflow"] = map[string]any{
+			"listen": []string{fmt.Sprintf(":%s", rm.config.HTTPPort)},
+			"routes": routes,
+		}
 	}
-	
+
 	adminListen := rm.config.AdminListen
 	if adminListen == "" {
 		adminListen = "0.0.0.0:2019"
 	}
-	
+
 	return map[string]any{
 		"admin": map[string]any{
 			"listen": adminListen,
 		},
 		"apps": map[string]any{
 			"http": map[string]any{
-				"servers": map[string]any{
-					"gravyflow": serverConfig,
-				},
+				"servers": servers,
 			},
 		},
 	}
+}
+
+// buildHTTPPortRoutes is only used when EnableTLS is on. Hosts whose
+// deployment has force_https enabled get a 308 redirect to HTTPS ahead of
+// the plain proxy routes; every other host keeps working over plain HTTP.
+func (rm *RouteManager) buildHTTPPortRoutes(ctx context.Context, proxyRoutes []map[string]any) []map[string]any {
+	forceHTTPS := rm.loadForceHTTPSFlags(ctx)
+	if len(forceHTTPS) == 0 {
+		return proxyRoutes
+	}
+
+	redirectRoutes := make([]map[string]any, 0, len(rm.routes))
+	for _, route := range rm.routes {
+		if !forceHTTPS[route.DeploymentID] {
+			continue
+		}
+		redirectRoutes = append(redirectRoutes, map[string]any{
+			"match": []any{
+				map[string]any{"host": route.Hosts},
+			},
+			"handle": []any{
+				map[string]any{
+					"handler":     "static_response",
+					"status_code": 308,
+					"headers": map[string]any{
+						"Location": []string{"https://{http.request.host}{http.request.uri}"},
+					},
+				},
+			},
+			"terminal": true,
+		})
+	}
+	// Redirect routes are matched first (terminal), so forced hosts never
+	// reach the plain-proxy entries appended after them; non-forced hosts
+	// fall through to those same entries as before.
+	return append(redirectRoutes, proxyRoutes...)
+}
+
+func (rm *RouteManager) loadForceHTTPSFlags(ctx context.Context) map[string]bool {
+	if deploymentStore == nil {
+		return nil
+	}
+	deploymentIDs := make([]string, 0, len(rm.routes))
+	seen := make(map[string]bool, len(rm.routes))
+	for _, route := range rm.routes {
+		if route.DeploymentID != "" && !seen[route.DeploymentID] {
+			seen[route.DeploymentID] = true
+			deploymentIDs = append(deploymentIDs, route.DeploymentID)
+		}
+	}
+	if len(deploymentIDs) == 0 {
+		return nil
+	}
+	flags, err := deploymentStore.GetForceHTTPSByDeploymentIDs(ctx, deploymentIDs)
+	if err != nil {
+		log.Printf("caddy: failed to load force-https settings, no HTTP->HTTPS redirects will be added: %v", err)
+		return nil
+	}
+	return flags
 }
 
 // ============================================================================
@@ -530,9 +605,16 @@ func caddyLoadSucceededDespiteClose(err error) bool {
 
 func init() {
 	config := CaddyConfig{
-		HTTPPort:    defaultHTTPPort,
-		HTTPSPort:   defaultHTTPSPort,
-		EnableTLS: false,
+		HTTPPort:  envOrDefault("CADDY_HTTP_PORT", defaultHTTPPort),
+		HTTPSPort: envOrDefault("CADDY_HTTPS_PORT", defaultHTTPSPort),
+		// Off by default: real Let's Encrypt issuance needs this server to
+		// be publicly reachable on the HTTP/HTTPS ports above (ACME
+		// HTTP-01/TLS-ALPN-01 challenges), which a local dev box isn't. Set
+		// CADDY_ENABLE_TLS=true (plus CADDY_TLS_EMAIL) once deployed
+		// somewhere with a public IP/domain.
+		EnableTLS: strings.EqualFold(strings.TrimSpace(os.Getenv("CADDY_ENABLE_TLS")), "true"),
+		TLSEmail:  strings.TrimSpace(os.Getenv("CADDY_TLS_EMAIL")),
+		TLSAcmeCA: envOrDefault("CADDY_TLS_ACME_CA", "https://acme-v02.api.letsencrypt.org/directory"),
 		// Off: most apps have no /health endpoint and aren't ready the
 		// instant their container starts, so probing here kept routes from
 		// ever being added. Container liveness is Docker's restart policy's job.
@@ -540,6 +622,18 @@ func init() {
 		BackupDir:   strings.TrimSpace(os.Getenv("CADDY_BACKUP_DIR")),
 	}
 	defaultRouteManager = NewRouteManager(config)
+}
+
+// caddyTLSEnabled reports whether this server is configured to obtain real
+// TLS certificates, so domain_handlers.go can report a domain as
+// "ssl_provisioning" rather than immediately "active" once it's reachable.
+func caddyTLSEnabled() bool {
+	if defaultRouteManager == nil {
+		return false
+	}
+	defaultRouteManager.mu.RLock()
+	defer defaultRouteManager.mu.RUnlock()
+	return defaultRouteManager.config.EnableTLS
 }
 
 func SyncCaddyRoutesFromRunningContainers() error {

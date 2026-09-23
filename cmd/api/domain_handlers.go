@@ -7,6 +7,7 @@ import (
     "log"
     "net"
     "net/http"
+    "os"
     "regexp"
     "strconv"
     "strings"
@@ -160,11 +161,23 @@ func addAppDomainHandler(c *gin.Context) {
             )
             if verifyErr == nil {
                 if syncErr := SyncCaddyRoutesFromRunningContainers(); syncErr != nil {
+                    _ = deploymentStore.UpdateDomainStatus(ctx, verifiedRecord.ID, DomainStatusError, syncErr.Error())
                     c.JSON(http.StatusInternalServerError, gin.H{
                         "error":   "failed_to_sync_caddy",
                         "details": syncErr.Error(),
                     })
                     return
+                }
+                if verifiedRecord.Status == DomainStatusDNSVerified {
+                    finalStatus := DomainStatusActive
+                    finalMessage := "domain is live"
+                    if caddyTLSEnabled() {
+                        finalStatus = DomainStatusSSLProvisioning
+                        finalMessage = "DNS verified; Caddy is obtaining a TLS certificate"
+                    }
+                    _ = deploymentStore.UpdateDomainStatus(ctx, verifiedRecord.ID, finalStatus, finalMessage)
+                    verifiedRecord.Status = finalStatus
+                    verifiedRecord.StatusMessage = finalMessage
                 }
                 c.JSON(http.StatusOK, gin.H{
                     "domain": verifiedRecord,
@@ -237,11 +250,32 @@ func verifyAppDomainHandler(c *gin.Context) {
     }
 
     if syncErr := SyncCaddyRoutesFromRunningContainers(); syncErr != nil {
+        // Ownership (and possibly reachability) already verified in the DB at
+        // this point — record the sync failure as an explicit 'error' status
+        // instead of leaving the domain looking verified with no indication
+        // anything went wrong (the previous behavior: DB said verified,
+        // Caddy never got the route, and the user had no way to tell).
+        _ = deploymentStore.UpdateDomainStatus(c.Request.Context(), record.ID, DomainStatusError, syncErr.Error())
         c.JSON(http.StatusInternalServerError, gin.H{
             "error":   "failed_to_sync_caddy",
             "details": syncErr.Error(),
         })
         return
+    }
+
+    // Only advance past dns_verified once Caddy has actually accepted the
+    // route — if checkDNSTarget (domains.go) found the domain isn't pointed
+    // here yet, record.Status is still pending_dns and stays that way.
+    if record.Status == DomainStatusDNSVerified {
+        finalStatus := DomainStatusActive
+        finalMessage := "domain is live"
+        if caddyTLSEnabled() {
+            finalStatus = DomainStatusSSLProvisioning
+            finalMessage = "DNS verified; Caddy is obtaining a TLS certificate"
+        }
+        _ = deploymentStore.UpdateDomainStatus(c.Request.Context(), record.ID, finalStatus, finalMessage)
+        record.Status = finalStatus
+        record.StatusMessage = finalMessage
     }
 
     c.JSON(http.StatusOK, gin.H{
@@ -290,6 +324,139 @@ func deleteAppDomainHandler(c *gin.Context) {
     }
 
     c.JSON(http.StatusOK, gin.H{"message": "domain removed"})
+}
+
+// makePrimaryDomainHandler is the "Make Primary" toggle: exactly one domain
+// per deployment is primary at a time (see DeploymentStore.MakeDomainPrimary).
+func makePrimaryDomainHandler(c *gin.Context) {
+    user, deployment, ok := currentUserDeployment(c)
+    if !ok {
+        return
+    }
+
+    customDomain := normalizeCustomDomain(c.Param("domain"))
+    if customDomain == "" {
+        sendBadRequest(c, "domain is required", nil)
+        return
+    }
+
+    record, err := deploymentStore.MakeDomainPrimary(c.Request.Context(), user.ID, deployment.DeploymentID, customDomain)
+    if err != nil {
+        if strings.Contains(strings.ToLower(err.Error()), "not found") {
+            c.JSON(http.StatusNotFound, gin.H{"error": "domain_not_found", "details": err.Error()})
+            return
+        }
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_set_primary_domain", "details": err.Error()})
+        return
+    }
+
+    // The primary domain drives the www<->apex redirect target, so a change
+    // here can change what UpsertDomainRedirect should point at. Recomputing
+    // that from the deployment's current edge settings keeps them in sync
+    // without requiring the user to re-save Edge Settings after switching
+    // primaries.
+    if settings, err := deploymentStore.GetEdgeSettings(c.Request.Context(), user.ID, deployment.DeploymentID); err == nil {
+        applyWWWRedirect(c.Request.Context(), user.ID, deployment.DeploymentID, record.CustomDomain, settings.WWWRedirectMode)
+    }
+
+    if err := SyncCaddyRoutesFromRunningContainers(); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_sync_caddy", "details": err.Error()})
+        return
+    }
+
+    c.JSON(http.StatusOK, gin.H{"domain": record})
+}
+
+func getEdgeSettingsHandler(c *gin.Context) {
+    user, deployment, ok := currentUserDeployment(c)
+    if !ok {
+        return
+    }
+
+    settings, err := deploymentStore.GetEdgeSettings(c.Request.Context(), user.ID, deployment.DeploymentID)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_load_edge_settings", "details": err.Error()})
+        return
+    }
+
+    c.JSON(http.StatusOK, gin.H{"edgeSettings": settings})
+}
+
+// updateEdgeSettingsHandler controls Phase 4's per-service traffic rules:
+// Force HTTPS and www<->apex redirect. Force HTTPS is read directly by
+// caddy.go's RouteManager on every sync; the redirect is materialized as a
+// domain_redirects row via the existing UpsertDomainRedirect (same mechanism
+// addDomainRedirectHandler already uses), computed from whichever domain is
+// currently primary.
+func updateEdgeSettingsHandler(c *gin.Context) {
+    user, deployment, ok := currentUserDeployment(c)
+    if !ok {
+        return
+    }
+
+    var req EdgeSettings
+    if err := c.ShouldBindJSON(&req); err != nil {
+        sendBadRequest(c, "invalid JSON body", err)
+        return
+    }
+
+    settings, err := deploymentStore.UpdateEdgeSettings(c.Request.Context(), user.ID, deployment.DeploymentID, req)
+    if err != nil {
+        if strings.Contains(err.Error(), "wwwRedirectMode must be one of") {
+            sendBadRequest(c, err.Error(), nil)
+            return
+        }
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_update_edge_settings", "details": err.Error()})
+        return
+    }
+
+    domains, err := deploymentStore.ListDeploymentDomains(c.Request.Context(), user.ID, deployment.DeploymentID)
+    if err == nil {
+        for _, d := range domains {
+            if d.IsPrimary {
+                applyWWWRedirect(c.Request.Context(), user.ID, deployment.DeploymentID, d.CustomDomain, settings.WWWRedirectMode)
+                break
+            }
+        }
+    }
+
+    if err := SyncCaddyRoutesFromRunningContainers(); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_sync_caddy", "details": err.Error()})
+        return
+    }
+
+    c.JSON(http.StatusOK, gin.H{"edgeSettings": settings})
+}
+
+// applyWWWRedirect computes the from/to pair for a www<->apex redirect
+// mode relative to primaryDomain and upserts it via the existing
+// UpsertDomainRedirect. Best-effort: a failure here shouldn't fail the
+// caller (edge settings / primary-domain changes still succeed), since the
+// redirect is a secondary convenience, not the domain mapping itself.
+func applyWWWRedirect(ctx context.Context, userID string, deploymentID string, primaryDomain string, mode string) {
+    primaryDomain = normalizeCustomDomain(primaryDomain)
+    if primaryDomain == "" {
+        return
+    }
+
+    var from, to string
+    switch mode {
+    case "apex_to_www":
+        from = primaryDomain
+        to = "www." + primaryDomain
+    case "www_to_apex":
+        if !strings.HasPrefix(primaryDomain, "www.") {
+            return
+        }
+        from = primaryDomain
+        to = strings.TrimPrefix(primaryDomain, "www.")
+    default:
+        return
+    }
+
+    if err := deploymentStore.UpsertDomainRedirect(ctx, userID, deploymentID, from, to, true); err != nil {
+        log.Printf("[WARN] applyWWWRedirect: failed to upsert redirect %s -> %s: %v", from, to, err)
+    }
 }
 
 // ============================================================================
@@ -394,7 +561,7 @@ func domainVerificationStatusHandler(c *gin.Context) {
 
     if !record.Verified {
         // Check if DNS record exists
-        exists, err := checkDNSRecord(customDomain, record.VerificationToken)
+        exists, err := checkDNSRecord(c.Request.Context(), customDomain, record.VerificationToken)
         if err == nil && exists {
             status["dnsRecordFound"] = true
             status["readyToVerify"] = true
@@ -580,10 +747,18 @@ func addDomainRedirectHandler(c *gin.Context) {
 // HELPER FUNCTIONS
 // ============================================================================
 
-func checkDNSRecord(domain string, expectedValue string) (bool, error) {
-    // Query DNS TXT record
+// dnsLookupTimeout bounds every DNS check in this file so a slow/unresponsive
+// resolver can't hang a request goroutine indefinitely — the bare
+// net.LookupTXT/net.LookupHost package functions used to have no timeout at
+// all.
+const dnsLookupTimeout = 5 * time.Second
+
+func checkDNSRecord(ctx context.Context, domain string, expectedValue string) (bool, error) {
+    ctx, cancel := context.WithTimeout(ctx, dnsLookupTimeout)
+    defer cancel()
+
     challengeDomain := fmt.Sprintf("_acme-challenge.%s", domain)
-    txts, err := net.LookupTXT(challengeDomain)
+    txts, err := net.DefaultResolver.LookupTXT(ctx, challengeDomain)
     if err != nil {
         return false, err
     }
@@ -594,6 +769,53 @@ func checkDNSRecord(domain string, expectedValue string) (bool, error) {
         }
     }
     return false, nil
+}
+
+// checkDNSTarget reports whether domain's CNAME/A record actually points at
+// this platform yet — a signal separate from (and additional to) ownership
+// verification in VerifyDeploymentDomain (domains.go). Ownership can be
+// proven well before a user updates DNS to route real traffic here; without
+// this, a "verified" domain could still be silently unreachable.
+//
+// GRAVYFLOW_PROXY_TARGET is the hostname or IP the platform's edge (Caddy)
+// is reachable at — e.g. the value customers are told to CNAME to. Left
+// unset in dev, where there's nothing public to point DNS at.
+func checkDNSTarget(ctx context.Context, domain string) (bool, string) {
+    proxyTarget := strings.TrimSpace(os.Getenv("GRAVYFLOW_PROXY_TARGET"))
+    if proxyTarget == "" {
+        return false, "DNS reachability can't be checked yet: GRAVYFLOW_PROXY_TARGET is not configured on this server"
+    }
+
+    ctx, cancel := context.WithTimeout(ctx, dnsLookupTimeout)
+    defer cancel()
+
+    if cname, err := net.DefaultResolver.LookupCNAME(ctx, domain); err == nil {
+        if strings.TrimSuffix(strings.ToLower(cname), ".") == strings.TrimSuffix(strings.ToLower(proxyTarget), ".") {
+            return true, fmt.Sprintf("CNAME correctly points to %s", proxyTarget)
+        }
+    }
+
+    domainIPs, err := net.DefaultResolver.LookupHost(ctx, domain)
+    if err != nil {
+        return false, fmt.Sprintf("could not resolve %s: %v", domain, err)
+    }
+    targetIPs, err := net.DefaultResolver.LookupHost(ctx, proxyTarget)
+    if err != nil {
+        // GRAVYFLOW_PROXY_TARGET may already be a bare IP rather than a
+        // resolvable hostname.
+        targetIPs = []string{proxyTarget}
+    }
+    for _, d := range domainIPs {
+        for _, t := range targetIPs {
+            if d == t {
+                return true, fmt.Sprintf("%s resolves to %s", domain, d)
+            }
+        }
+    }
+    return false, fmt.Sprintf(
+        "%s does not currently point to this platform (resolves to %s, expected %s)",
+        domain, strings.Join(domainIPs, ", "), proxyTarget,
+    )
 }
 
 func autoVerifyDomain(ctx context.Context, domain string, token string, config VerificationConfig) (bool, error) {
@@ -607,7 +829,7 @@ func autoVerifyDomain(ctx context.Context, domain string, token string, config V
         case <-timeout:
             return false, fmt.Errorf("verification timeout after %v", config.Timeout)
         case <-ticker.C:
-            exists, err := checkDNSRecord(domain, token)
+            exists, err := checkDNSRecord(ctx, domain, token)
             if err != nil {
                 // Log but continue
                 log.Printf("DNS check error for %s: %v", domain, err)

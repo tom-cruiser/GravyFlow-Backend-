@@ -39,12 +39,8 @@ const (
 
 type CreateAppRequest struct {
 	Name string `json:"name" binding:"required"`
-	// Required unless GitHub is set, in which case it's ignored and the
-	// repository's clone URL comes from GitHub.
-	Repo string `json:"repo"`
-	// Optional access token for a private repository (see git_token.go).
-	GitToken string `json:"gitToken"`
 	// Repository picked through the GitHub App (see github_integration.go).
+	// New apps can only be created this way — see createAppHandler.
 	GitHub *GitHubSourceRequest `json:"github"`
 }
 
@@ -309,6 +305,9 @@ func setupRouter(config ServerConfig) *gin.Engine {
 			protected.POST("/apps/:id/domains/redirects", addDomainRedirectHandler)
 			protected.GET("/apps/:id/domains/:domain/status", domainVerificationStatusHandler)
 			protected.GET("/apps/:id/domains/:domain/health", checkDomainHealthHandler)
+			protected.PATCH("/apps/:id/domains/:domain/primary", makePrimaryDomainHandler)
+			protected.GET("/apps/:id/edge-settings", getEdgeSettingsHandler)
+			protected.PATCH("/apps/:id/edge-settings", updateEdgeSettingsHandler)
 
 			// Jobs
 			protected.GET("/jobs/:jobId", deploymentJobStatusHandler)
@@ -596,39 +595,21 @@ func createAppHandler(c *gin.Context) {
 	}
 
 	req.Name = strings.TrimSpace(req.Name)
-	req.Repo = strings.TrimSpace(req.Repo)
-	if req.GitHub != nil {
-		if strings.TrimSpace(req.GitToken) != "" {
-			sendBadRequest(c, "gitToken can't be combined with a GitHub App repository", nil)
-			return
-		}
-		repo, status, err := resolveGitHubSource(c.Request.Context(), user.ID, *req.GitHub)
-		if err != nil {
-			c.JSON(status, gin.H{"error": "invalid_github_repository", "details": err.Error(), "request_id": c.GetString("requestID")})
-			return
-		}
-		req.Repo = repo.CloneURL
+	if req.Name == "" {
+		sendBadRequest(c, "name is required", nil)
+		return
 	}
-	if req.Name == "" || req.Repo == "" {
-		sendBadRequest(c, "name and repo are required", nil)
+	if req.GitHub == nil {
+		sendBadRequest(c, "a GitHub repository selection is required", nil)
 		return
 	}
 
-	// Validate repo URL
-	if !strings.HasPrefix(req.Repo, "http") && !strings.HasPrefix(req.Repo, "git@") {
-		sendBadRequest(c, "invalid repo URL format", nil)
+	repo, status, err := resolveGitHubSource(c.Request.Context(), user.ID, *req.GitHub)
+	if err != nil {
+		c.JSON(status, gin.H{"error": "invalid_github_repository", "details": err.Error(), "request_id": c.GetString("requestID")})
 		return
 	}
-
-	gitToken, validToken := normalizeGitToken(req.GitToken)
-	if !validToken {
-		sendBadRequest(c, "gitToken must be an access token without spaces", nil)
-		return
-	}
-	if gitToken != "" && !strings.HasPrefix(req.Repo, "https://") {
-		sendBadRequest(c, "an access token can only be used with an https:// repository URL", nil)
-		return
-	}
+	repoURL := repo.CloneURL
 
 	portMap := allocatePortMap("8080")
 
@@ -636,8 +617,8 @@ func createAppHandler(c *gin.Context) {
 		c.Request.Context(),
 		user.ID,
 		req.Name,
-		req.Repo,
-		req.Repo,
+		repoURL,
+		repoURL,
 		portMap,
 		"",
 	)
@@ -658,25 +639,13 @@ func createAppHandler(c *gin.Context) {
 	}
 
 	// Saved before enqueueing so the first clone already has them.
-	if req.GitHub != nil {
-		if err := deploymentStore.SetDeploymentGitHubSource(c.Request.Context(), deploymentID, req.GitHub.InstallationID, req.GitHub.RepositoryID); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error":      "failed_to_save_github_source",
-				"details":    err.Error(),
-				"request_id": c.GetString("requestID"),
-			})
-			return
-		}
-	}
-	if gitToken != "" {
-		if err := deploymentStore.SetDeploymentGitToken(c.Request.Context(), deploymentID, gitToken); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error":      "failed_to_save_access_token",
-				"details":    err.Error(),
-				"request_id": c.GetString("requestID"),
-			})
-			return
-		}
+	if err := deploymentStore.SetDeploymentGitHubSource(c.Request.Context(), deploymentID, req.GitHub.InstallationID, req.GitHub.RepositoryID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":      "failed_to_save_github_source",
+			"details":    err.Error(),
+			"request_id": c.GetString("requestID"),
+		})
+		return
 	}
 
 	jobID, err := deploymentJobs.EnqueueDeployment(c.Request.Context(), user.ID, deploymentID, true)
@@ -695,7 +664,7 @@ func createAppHandler(c *gin.Context) {
 		"jobId":        jobID,
 		"app": AppResponse{
 			Name: req.Name,
-			Repo: req.Repo,
+			Repo: repoURL,
 		},
 	})
 }

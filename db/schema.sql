@@ -225,6 +225,9 @@ CREATE TABLE IF NOT EXISTS deployments (
     finished_at TIMESTAMPTZ,
     last_restart_at TIMESTAMPTZ,
     deleted_at TIMESTAMPTZ,
+    -- Per-service edge settings (see db.go migration 26 and caddy.go).
+    force_https BOOLEAN NOT NULL DEFAULT TRUE,
+    www_redirect_mode TEXT NOT NULL DEFAULT 'none',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -358,6 +361,12 @@ CREATE TABLE IF NOT EXISTS domains (
     verification_token TEXT NOT NULL DEFAULT '',
     verified_at TIMESTAMPTZ,
     expires_at TIMESTAMPTZ,
+    -- Richer, user-facing status layered on top of verified/verification_token
+    -- (unchanged) — see db.go migration 26 and domain_handlers.go.
+    status TEXT NOT NULL DEFAULT 'pending_dns',
+    status_message TEXT NOT NULL DEFAULT '',
+    is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+    dns_checked_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

@@ -17,6 +17,20 @@ import (
 // TYPES
 // ============================================================================
 
+// Domain status values, layered on top of verified/verification_token
+// (which remain the ownership source of truth — see UpsertDeploymentDomain/
+// VerifyDeploymentDomain). Written by VerifyDeploymentDomain (pendingDNS/
+// dnsVerified/error from the DNS checks) and by domain_handlers.go's
+// verifyAppDomainHandler (sslProvisioning/active/error from the Caddy sync
+// outcome).
+const (
+	DomainStatusPendingDNS     = "pending_dns"
+	DomainStatusDNSVerified    = "dns_verified"
+	DomainStatusSSLProvisioning = "ssl_provisioning"
+	DomainStatusActive         = "active"
+	DomainStatusError          = "error"
+)
+
 type DeploymentDomainRecord struct {
 	ID                string     `json:"id"`
 	DeploymentID      string     `json:"deploymentId"`
@@ -26,6 +40,10 @@ type DeploymentDomainRecord struct {
 	VerificationToken string     `json:"verificationToken,omitempty"`
 	VerifiedAt        *time.Time `json:"verifiedAt,omitempty"`
 	ExpiresAt         *time.Time `json:"expiresAt,omitempty"`
+	Status            string     `json:"status"`
+	StatusMessage     string     `json:"statusMessage,omitempty"`
+	IsPrimary         bool       `json:"isPrimary"`
+	DNSCheckedAt      *time.Time `json:"dnsCheckedAt,omitempty"`
 	CreatedAt         time.Time  `json:"createdAt"`
 	UpdatedAt         time.Time  `json:"updatedAt"`
 }
@@ -129,10 +147,14 @@ func (s *DeploymentStore) UpsertDeploymentDomain(
 			verification_token = $2,
 			verified_at = NULL,
 			expires_at = $3,
+			status = 'pending_dns',
+			status_message = '',
+			dns_checked_at = NULL,
 			updated_at = now()
 		WHERE custom_domain = $1
-		RETURNING id::text, deployment_id::text, project_id::text, custom_domain, 
-				  verified, verification_token, verified_at, expires_at, 
+		RETURNING id::text, deployment_id::text, project_id::text, custom_domain,
+				  verified, verification_token, verified_at, expires_at,
+				  status, status_message, is_primary, dns_checked_at,
 				  created_at, updated_at
 		`, customDomain, verificationToken, expiresAt).Scan(
 			&record.ID,
@@ -143,6 +165,10 @@ func (s *DeploymentStore) UpsertDeploymentDomain(
 			&record.VerificationToken,
 			&record.VerifiedAt,
 			&record.ExpiresAt,
+			&record.Status,
+			&record.StatusMessage,
+			&record.IsPrimary,
+			&record.DNSCheckedAt,
 			&record.CreatedAt,
 			&record.UpdatedAt,
 		); err != nil {
@@ -172,7 +198,8 @@ func (s *DeploymentStore) UpsertDeploymentDomain(
 		verified,
 		verification_token,
 		verified_at,
-		expires_at
+		expires_at,
+		status
 	) VALUES (
 		(SELECT project_id FROM deployments WHERE id = $1),
 		$1,
@@ -181,10 +208,12 @@ func (s *DeploymentStore) UpsertDeploymentDomain(
 		FALSE,
 		$3,
 		NULL,
-		$4
+		$4,
+		'pending_dns'
 	)
-	RETURNING id::text, deployment_id::text, project_id::text, custom_domain, 
-			  verified, verification_token, verified_at, expires_at, 
+	RETURNING id::text, deployment_id::text, project_id::text, custom_domain,
+			  verified, verification_token, verified_at, expires_at,
+			  status, status_message, is_primary, dns_checked_at,
 			  created_at, updated_at
 	`, deploymentID, customDomain, verificationToken, expiresAt).Scan(
 		&record.ID,
@@ -195,6 +224,10 @@ func (s *DeploymentStore) UpsertDeploymentDomain(
 		&record.VerificationToken,
 		&record.VerifiedAt,
 		&record.ExpiresAt,
+		&record.Status,
+		&record.StatusMessage,
+		&record.IsPrimary,
+		&record.DNSCheckedAt,
 		&record.CreatedAt,
 		&record.UpdatedAt,
 	); err != nil {
@@ -293,8 +326,9 @@ func (s *DeploymentStore) VerifyDeploymentDomain(
 
 	var record DeploymentDomainRecord
 	if err := s.pool.QueryRow(ctx, `
-	SELECT id::text, deployment_id::text, project_id::text, custom_domain, 
+	SELECT id::text, deployment_id::text, project_id::text, custom_domain,
 		   verified, verification_token, verified_at, expires_at,
+		   status, status_message, is_primary, dns_checked_at,
 		   created_at, updated_at
 	FROM domains
 	WHERE deployment_id = $1 AND custom_domain = $2
@@ -307,29 +341,41 @@ func (s *DeploymentStore) VerifyDeploymentDomain(
 		&record.VerificationToken,
 		&record.VerifiedAt,
 		&record.ExpiresAt,
+		&record.Status,
+		&record.StatusMessage,
+		&record.IsPrimary,
+		&record.DNSCheckedAt,
 		&record.CreatedAt,
 		&record.UpdatedAt,
 	); err != nil {
 		return DeploymentDomainRecord{}, fmt.Errorf("load deployment domain: %w", err)
 	}
 
+	// Ownership proof (unchanged): a TXT record at _acme-challenge.<domain>
+	// matching our token. This is the security boundary — it stays required
+	// even though the reachability check below is new, since dropping it
+	// would let anyone claim a domain they don't own by pointing a dangling
+	// CNAME/A record at our shared proxy IP.
 	challengeName := verifyTXTChallengeName(record.CustomDomain)
-	txtRecords, err := net.LookupTXT(challengeName)
+	txtRecords, err := net.DefaultResolver.LookupTXT(ctx, challengeName)
 	if err != nil {
-		// Record failed attempt
+		message := fmt.Sprintf("TXT lookup on %s failed: %v", challengeName, err)
 		_ = s.RecordDomainVerificationAttempt(ctx, record.ID, "failed", err.Error())
+		_ = s.UpdateDomainStatus(ctx, record.ID, DomainStatusPendingDNS, message)
 		return record, fmt.Errorf("lookup txt record %s: %w", challengeName, err)
 	}
 
-	verified := false
+	ownershipVerified := false
 	for _, candidate := range txtRecords {
 		if strings.TrimSpace(candidate) == record.VerificationToken {
-			verified = true
+			ownershipVerified = true
 			break
 		}
 	}
-	if !verified {
+	if !ownershipVerified {
+		message := fmt.Sprintf("no TXT record at %s matches the expected verification token", challengeName)
 		_ = s.RecordDomainVerificationAttempt(ctx, record.ID, "failed", "verification token not found")
+		_ = s.UpdateDomainStatus(ctx, record.ID, DomainStatusPendingDNS, message)
 		return record, fmt.Errorf("verification token not found on %s", challengeName)
 	}
 
@@ -341,17 +387,32 @@ func (s *DeploymentStore) VerifyDeploymentDomain(
 		expiresAt = &oneYear
 	}
 
+	// Reachability check (new, additional signal): does the domain's
+	// CNAME/A record actually point at this platform yet? Ownership can be
+	// proven (above) well before a user updates their DNS to route traffic
+	// here — without this, a "verified" domain could still be completely
+	// unreachable with no feedback.
+	dnsOK, dnsMessage := checkDNSTarget(ctx, record.CustomDomain)
+	status := DomainStatusPendingDNS
+	if dnsOK {
+		status = DomainStatusDNSVerified
+	}
+
 	if err := s.pool.QueryRow(ctx, `
 	UPDATE domains
 	SET verified = TRUE,
 		verified_at = $3,
 		expires_at = $4,
+		status = $5,
+		status_message = $6,
+		dns_checked_at = now(),
 		updated_at = now()
 	WHERE id = $1
 	RETURNING id::text, deployment_id::text, project_id::text, custom_domain,
 			  verified, verification_token, verified_at, expires_at,
+			  status, status_message, is_primary, dns_checked_at,
 			  created_at, updated_at
-	`, record.ID, record.CustomDomain, now, expiresAt).Scan(
+	`, record.ID, record.CustomDomain, now, expiresAt, status, dnsMessage).Scan(
 		&record.ID,
 		&record.DeploymentID,
 		&record.ProjectID,
@@ -360,16 +421,148 @@ func (s *DeploymentStore) VerifyDeploymentDomain(
 		&record.VerificationToken,
 		&record.VerifiedAt,
 		&record.ExpiresAt,
+		&record.Status,
+		&record.StatusMessage,
+		&record.IsPrimary,
+		&record.DNSCheckedAt,
 		&record.CreatedAt,
 		&record.UpdatedAt,
 	); err != nil {
 		return DeploymentDomainRecord{}, fmt.Errorf("mark deployment domain verified: %w", err)
 	}
 
-	// Record successful verification
-	_ = s.RecordDomainVerificationAttempt(ctx, record.ID, "succeeded", "domain verified successfully")
+	// Record successful ownership verification (history table tracks the
+	// TXT ownership proof only, same as before the reachability check).
+	_ = s.RecordDomainVerificationAttempt(ctx, record.ID, "succeeded", "domain ownership verified successfully")
 
 	return record, nil
+}
+
+// UpdateDomainStatus sets the user-facing status/status_message shown by the
+// UI. Called both from here (pending_dns/dns_verified/error from the DNS
+// checks) and from verifyAppDomainHandler/deleteAppDomainHandler in
+// domain_handlers.go (ssl_provisioning/active/error from the Caddy sync
+// outcome), so the SQL lives in one place instead of being duplicated.
+func (s *DeploymentStore) UpdateDomainStatus(ctx context.Context, domainID string, status string, message string) error {
+	if s == nil || s.pool == nil {
+		return fmt.Errorf("deployment store is not initialized")
+	}
+	_, err := s.pool.Exec(ctx, `
+	UPDATE domains
+	SET status = $2, status_message = $3, updated_at = now()
+	WHERE id = $1
+	`, domainID, status, message)
+	return err
+}
+
+// MakeDomainPrimary marks customDomain as the deployment's primary domain
+// and every other domain on the same deployment as not-primary, in one
+// statement so there's never a moment with zero or two primaries.
+func (s *DeploymentStore) MakeDomainPrimary(ctx context.Context, userID string, deploymentID string, customDomain string) (DeploymentDomainRecord, error) {
+	if s == nil || s.pool == nil {
+		return DeploymentDomainRecord{}, fmt.Errorf("deployment store is not initialized")
+	}
+
+	userID = strings.TrimSpace(userID)
+	deploymentID = strings.TrimSpace(deploymentID)
+	customDomain = normalizeCustomDomain(customDomain)
+	if userID == "" || deploymentID == "" || customDomain == "" {
+		return DeploymentDomainRecord{}, fmt.Errorf("userID, deploymentID, and customDomain are required")
+	}
+
+	if _, err := s.GetDeploymentForUser(ctx, userID, deploymentID); err != nil {
+		return DeploymentDomainRecord{}, err
+	}
+
+	tag, err := s.pool.Exec(ctx, `
+	UPDATE domains
+	SET is_primary = (custom_domain = $2), updated_at = now()
+	WHERE deployment_id = $1
+	`, deploymentID, customDomain)
+	if err != nil {
+		return DeploymentDomainRecord{}, fmt.Errorf("update primary domain: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return DeploymentDomainRecord{}, fmt.Errorf("domain not found")
+	}
+
+	return s.GetDeploymentDomain(ctx, userID, deploymentID, customDomain)
+}
+
+// EdgeSettings are per-deployment traffic rules applied by Caddy — see
+// caddy.go's RouteManager.buildRouteConfig.
+type EdgeSettings struct {
+	ForceHTTPS      bool   `json:"forceHttps"`
+	WWWRedirectMode string `json:"wwwRedirectMode"`
+}
+
+func (s *DeploymentStore) GetEdgeSettings(ctx context.Context, userID string, deploymentID string) (EdgeSettings, error) {
+	if s == nil || s.pool == nil {
+		return EdgeSettings{}, fmt.Errorf("deployment store is not initialized")
+	}
+	if _, err := s.GetDeploymentForUser(ctx, userID, deploymentID); err != nil {
+		return EdgeSettings{}, err
+	}
+
+	var settings EdgeSettings
+	err := s.pool.QueryRow(ctx, `
+	SELECT force_https, www_redirect_mode FROM deployments WHERE id = $1
+	`, deploymentID).Scan(&settings.ForceHTTPS, &settings.WWWRedirectMode)
+	return settings, err
+}
+
+// GetForceHTTPSByDeploymentIDs batch-loads the force_https flag for a set of
+// deployments — used once per Caddy sync (caddy.go's loadForceHTTPSFlags)
+// instead of one query per route.
+func (s *DeploymentStore) GetForceHTTPSByDeploymentIDs(ctx context.Context, deploymentIDs []string) (map[string]bool, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("deployment store is not initialized")
+	}
+	if len(deploymentIDs) == 0 {
+		return map[string]bool{}, nil
+	}
+
+	rows, err := s.pool.Query(ctx, `
+	SELECT id::text, force_https FROM deployments WHERE id = ANY($1::uuid[])
+	`, deploymentIDs)
+	if err != nil {
+		return nil, fmt.Errorf("load force_https flags: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[string]bool, len(deploymentIDs))
+	for rows.Next() {
+		var id string
+		var forceHTTPS bool
+		if err := rows.Scan(&id, &forceHTTPS); err != nil {
+			return nil, fmt.Errorf("scan force_https flag: %w", err)
+		}
+		result[id] = forceHTTPS
+	}
+	return result, rows.Err()
+}
+
+func (s *DeploymentStore) UpdateEdgeSettings(ctx context.Context, userID string, deploymentID string, settings EdgeSettings) (EdgeSettings, error) {
+	if s == nil || s.pool == nil {
+		return EdgeSettings{}, fmt.Errorf("deployment store is not initialized")
+	}
+	if _, err := s.GetDeploymentForUser(ctx, userID, deploymentID); err != nil {
+		return EdgeSettings{}, err
+	}
+	switch settings.WWWRedirectMode {
+	case "none", "apex_to_www", "www_to_apex":
+	default:
+		return EdgeSettings{}, fmt.Errorf("wwwRedirectMode must be one of: none, apex_to_www, www_to_apex")
+	}
+
+	_, err := s.pool.Exec(ctx, `
+	UPDATE deployments SET force_https = $2, www_redirect_mode = $3, updated_at = now()
+	WHERE id = $1
+	`, deploymentID, settings.ForceHTTPS, settings.WWWRedirectMode)
+	if err != nil {
+		return EdgeSettings{}, fmt.Errorf("update edge settings: %w", err)
+	}
+	return settings, nil
 }
 
 // ============================================================================
@@ -806,6 +999,7 @@ func (s *DeploymentStore) GetDeploymentDomain(
 	err := s.pool.QueryRow(ctx, `
 	SELECT id::text, deployment_id::text, project_id::text, custom_domain,
 		   verified, verification_token, verified_at, expires_at,
+		   status, status_message, is_primary, dns_checked_at,
 		   created_at, updated_at
 	FROM domains
 	WHERE deployment_id = $1 AND custom_domain = $2
@@ -818,6 +1012,10 @@ func (s *DeploymentStore) GetDeploymentDomain(
 		&record.VerificationToken,
 		&record.VerifiedAt,
 		&record.ExpiresAt,
+		&record.Status,
+		&record.StatusMessage,
+		&record.IsPrimary,
+		&record.DNSCheckedAt,
 		&record.CreatedAt,
 		&record.UpdatedAt,
 	)
@@ -925,10 +1123,11 @@ func (s *DeploymentStore) ListDeploymentDomains(
 	rows, err := s.pool.Query(ctx, `
 	SELECT id::text, deployment_id::text, project_id::text, custom_domain,
 		   verified, verification_token, verified_at, expires_at,
+		   status, status_message, is_primary, dns_checked_at,
 		   created_at, updated_at
 	FROM domains
 	WHERE deployment_id = $1
-	ORDER BY custom_domain ASC
+	ORDER BY is_primary DESC, custom_domain ASC
 	`, deploymentID)
 	if err != nil {
 		return nil, fmt.Errorf("list deployment domains: %w", err)
@@ -947,6 +1146,10 @@ func (s *DeploymentStore) ListDeploymentDomains(
 			&record.VerificationToken,
 			&record.VerifiedAt,
 			&record.ExpiresAt,
+			&record.Status,
+			&record.StatusMessage,
+			&record.IsPrimary,
+			&record.DNSCheckedAt,
 			&record.CreatedAt,
 			&record.UpdatedAt,
 		); err != nil {

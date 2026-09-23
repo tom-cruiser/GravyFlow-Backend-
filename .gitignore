@@ -7,6 +7,11 @@
 .env.*
 !.env.example
 
+# Secret material (GitHub App private key, TLS certs, etc.) — the folder
+# itself is tracked (via .gitkeep) so it always exists, its contents never are.
+secret/*
+!secret/.gitkeep
+
 # Editor / OS
 .vscode/
 .DS_Store

@@ -545,8 +545,13 @@ func listGitHubReposHandler(c *gin.Context) {
 		}
 		list, err := client.ListInstallationRepositories(ctx, inst.GitHubInstallationID)
 		if err != nil {
-			if isGitHubStatus(err, http.StatusNotFound) {
-				// Uninstalled while we missed the webhook.
+			// Uninstalled while we missed the webhook. GitHub returns 404 for
+			// an installation ID it's never heard of, but in practice can
+			// also return 401 ("Bad credentials") for one that existed and
+			// was since removed — both mean the same thing here, so both
+			// self-heal the same way instead of only 404 leaving a stale,
+			// permanently-broken row for someone to clean up by hand.
+			if isGitHubStatus(err, http.StatusNotFound) || isGitHubStatus(err, http.StatusUnauthorized) {
 				client.forgetInstallation(inst.GitHubInstallationID)
 				_ = deploymentStore.DeleteGitHubInstallation(ctx, inst.GitHubInstallationID)
 				continue

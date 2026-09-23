@@ -429,7 +429,23 @@ show_status() {
 
 run_application() {
     print_header "Starting Application"
-    
+
+    # Load .env first so anything this script doesn't itself manage (GitHub
+    # App credentials, encryption keys, etc.) still reaches the process —
+    # this was silently never happening before, so GITHUB_APP_* and similar
+    # vars set only in .env were invisible to `go run` under this script.
+    # The explicit exports below run afterward and win for the values this
+    # script derives from the containers it just started (ports, DB/Redis
+    # credentials) — those must reflect the actual running containers, not
+    # whatever is written in .env.
+    if [ -f "$repo_root/.env" ]; then
+        print_info "Loading $repo_root/.env"
+        set -a
+        # shellcheck disable=SC1091
+        source "$repo_root/.env"
+        set +a
+    fi
+
     # Set environment variables with your custom credentials
     export PGHOST=127.0.0.1
     export PGPORT=$POSTGRES_HOST_PORT

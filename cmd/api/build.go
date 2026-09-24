@@ -52,6 +52,11 @@ const (
 // ============================================================================
 
 type BuildConfig struct {
+	// DockerfilePath, when set, builds that Dockerfile (relative to the repo
+	// root, which stays the build context) instead of auto-detecting the
+	// project — how monorepo services are built. See build_settings.go.
+	DockerfilePath string
+
 	// Build timeout
 	Timeout time.Duration
 
@@ -134,9 +139,45 @@ func BuildCode(appPath string, appName string) (string, error) {
 
 // BuildCodeWithLogs is BuildCode with the build output also written to logs.
 func BuildCodeWithLogs(appPath string, appName string, logs io.Writer) (string, error) {
+	return BuildCodeWithLogsAndDockerfile(appPath, appName, logs, "")
+}
+
+// BuildCodeWithLogsAndDockerfile is BuildCodeWithLogs for a service that names
+// its own Dockerfile (dockerfilePath empty = auto-detect, as before).
+func BuildCodeWithLogsAndDockerfile(appPath string, appName string, logs io.Writer, dockerfilePath string) (string, error) {
 	config := DefaultConfig()
 	config.LogWriter = logs
+	config.DockerfilePath = dockerfilePath
 	return BuildCodeWithConfig(appPath, appName, config)
+}
+
+// buildWithDockerfile builds an explicitly chosen Dockerfile with the repo
+// root as the context. It skips language detection entirely, so it works for
+// anything with a Dockerfile — including monorepo services that have no start
+// command at the root.
+func buildWithDockerfile(absPath string, appName string, config BuildConfig) (string, error) {
+	dockerfile, err := resolveDockerfile(absPath, config.DockerfilePath)
+	if err != nil {
+		if found := findDockerfiles(absPath, 12); len(found) > 0 {
+			return "", fmt.Errorf("%w (Dockerfiles in this repository: %s)", err, strings.Join(found, ", "))
+		}
+		return "", err
+	}
+
+	tag := dockerImageTag(appName, config.RegistryURL)
+	fmt.Fprintf(logSink(config.LogWriter), "==> Building %s with Docker\n", config.DockerfilePath)
+
+	opts := BuildOptions{
+		Platform:        config.TargetPlatform,
+		BuildArgs:       config.BuildArgs,
+		Timeout:         config.Timeout,
+		DisableBuildKit: config.DisableBuildKit,
+		LogWriter:       config.LogWriter,
+	}
+	if err := runDockerBuildWithOptions(absPath, tag, dockerfile, opts); err != nil {
+		return "", fmt.Errorf("docker build failed: %w", err)
+	}
+	return tag, nil
 }
 
 // BuildCodeWithConfig builds with custom configuration
@@ -145,6 +186,15 @@ func BuildCodeWithConfig(appPath string, appName string, config BuildConfig) (st
 	if config.Verbose {
 		logger = &defaultLogger{verbose: true}
 	}
+
+	// Docker/nixpacks require a lowercase tag with no leading/trailing
+	// separator; a display name taken straight from a GitHub repo (mixed
+	// case, or literally ending in "-" like "GravyFlow-Backend-") can
+	// violate that. Sanitize once, up front, so every downstream build path
+	// (nixpacks, the Node fast builder) and the tag this function returns
+	// all agree on the same valid name — otherwise an image can build
+	// successfully under one name and be un-findable under another.
+	appName = dockerSafeTag(appName)
 
 	// Validate inputs
 	if err := validateInputs(appPath, appName); err != nil {
@@ -166,6 +216,11 @@ func BuildCodeWithConfig(appPath string, appName string, config BuildConfig) (st
 
 	if err := ensureDockerignore(absPath); err != nil {
 		logger.Warn("could not write default .dockerignore for %q: %v", appName, err)
+	}
+
+	// An explicit Dockerfile wins over any detection (and needs no Nixpacks).
+	if strings.TrimSpace(config.DockerfilePath) != "" {
+		return buildWithDockerfile(absPath, appName, config)
 	}
 
 	// Check if Nixpacks is available
@@ -297,20 +352,26 @@ func validateInputs(appPath, appName string) error {
 }
 
 func isValidDockerImageName(name string) bool {
-	// Docker image name regex: [a-z0-9][a-z0-9._-]*
+	// Docker image name regex: [a-z0-9][a-z0-9._-]*[a-z0-9] — note the name
+	// must also *end* in an alphanumeric; a trailing separator (e.g. a repo
+	// literally named "my-app-") is just as invalid to Docker as a leading
+	// one, but was never checked here, letting it slip through to nixpacks
+	// (which fails with a much less obvious "invalid reference format").
 	if name == "" {
 		return false
 	}
-	for i, ch := range name {
-		if i == 0 {
+	runes := []rune(name)
+	last := len(runes) - 1
+	for i, ch := range runes {
+		if i == 0 || i == last {
 			if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
 				return false
 			}
-		} else {
-			if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
-				ch == '.' || ch == '_' || ch == '-') {
-				return false
-			}
+			continue
+		}
+		if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+			ch == '.' || ch == '_' || ch == '-') {
+			return false
 		}
 	}
 	return true
@@ -460,8 +521,40 @@ func runNixpacksBuildWithEnv(ctx context.Context, absPath string, appName string
 // DOCKER HELPERS
 // ============================================================================
 
+// dockerSafeTag turns an arbitrary display name (e.g. a GitHub repo name,
+// which can carry uppercase letters or literally end in "-") into a string
+// that is always a valid Docker image tag component: lowercase, alphanumeric
+// runs joined by single "-" separators, never starting or ending in one.
+// nixpacks and `docker build -t` both reject anything else outright with
+// "invalid reference format" — so this must run before the name is ever
+// handed to either, and idempotently (safe to call again on its own output).
+func dockerSafeTag(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+
+	var b strings.Builder
+	lastWasSeparator := true // drop a leading separator instead of doubling it
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			lastWasSeparator = false
+		default:
+			if !lastWasSeparator {
+				b.WriteRune('-')
+				lastWasSeparator = true
+			}
+		}
+	}
+
+	tag := strings.Trim(b.String(), "-")
+	if tag == "" {
+		return "app"
+	}
+	return tag
+}
+
 func dockerImageTag(appName string, registryURL string) string {
-	tag := strings.ToLower(appName)
+	tag := dockerSafeTag(appName)
 	if registryURL != "" {
 		return fmt.Sprintf("%s/%s:latest", strings.TrimSuffix(registryURL, "/"), tag)
 	}

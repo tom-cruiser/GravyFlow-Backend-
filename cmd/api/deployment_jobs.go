@@ -192,7 +192,10 @@ func NewDeploymentJobManager(config JobConfig) (*DeploymentJobManager, error) {
 
 	asynqClient := asynq.NewClient(redisOpt)
 
+	// Deployments the worker runs at once. 1 serialises every clone/build on
+	// the platform, so a single slow clone blocks all other deploys.
 	concurrency := intFromEnvOrDefault("ASYNQ_CONCURRENCY", 1)
+	log.Printf("deployment worker concurrency=%d (set ASYNQ_CONCURRENCY to change)", concurrency)
 	asynqServer := asynq.NewServer(redisOpt, asynq.Config{
 		Concurrency: concurrency,
 		Queues: map[string]int{
@@ -1027,8 +1030,10 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 			progress("cloning", 15, "cloning source repository")
 		}
 
-		// prepareDeploymentSource is now in source.go
-		localAppPath, err := prepareDeploymentSource(ctx, deployment)
+		// prepareDeploymentSource is now in source.go. The reporter lets the
+		// clone stream its progress to the console, the job status and the
+		// deploy log (git_progress.go).
+		localAppPath, err := prepareDeploymentSource(withCloneReporter(ctx, progress, logs), deployment)
 		if err != nil {
 			return DeploymentJobStatus{}, err
 		}
@@ -1056,12 +1061,48 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 		if progress != nil {
 			progress("building", 50, "building application image")
 		}
-		imageName, err = BuildCodeWithLogs(deployment.AppPath, deployment.AppName, logs)
+		buildSettings, err := deploymentStore.GetBuildSettings(ctx, deployment.DeploymentID)
 		if err != nil {
 			if shouldReleaseOnError {
 				_ = deploymentStore.ReleaseDeploymentResources(ctx, payload.UserID, requestedCPU, requestedMemoryMB, requestedApps, requestedStorageMB)
 			}
 			return DeploymentJobStatus{}, err
+		}
+		imageName, err = BuildCodeWithLogsAndDockerfile(deployment.AppPath, deployment.AppName, logs, buildSettings.DockerfilePath)
+		if err != nil {
+			if shouldReleaseOnError {
+				_ = deploymentStore.ReleaseDeploymentResources(ctx, payload.UserID, requestedCPU, requestedMemoryMB, requestedApps, requestedStorageMB)
+			}
+			// A monorepo built from its root fails with a bare "no start
+			// command"; say what to do about it.
+			if buildSettings.DockerfilePath == "" && strings.Contains(err.Error(), "No start command could be found") {
+				if hint := monorepoHint(deployment.AppPath); hint != "" {
+					err = fmt.Errorf("%w. %s", err, hint)
+				}
+			}
+			return DeploymentJobStatus{}, err
+		}
+
+		// Resolve the port the container listens on: an explicit setting, else
+		// the custom Dockerfile's EXPOSE, else whatever the service already had
+		// (8080 by default). Persisted so the container, Caddy and the UI agree.
+		port := buildSettings.ContainerPort
+		source := "the service's port setting"
+		if port == 0 && buildSettings.DockerfilePath != "" {
+			if dockerfile, resolveErr := resolveDockerfile(deployment.AppPath, buildSettings.DockerfilePath); resolveErr == nil {
+				port = detectDockerfilePort(dockerfile)
+				source = "the Dockerfile's EXPOSE"
+			}
+		}
+		if port > 0 {
+			resolved := strconv.Itoa(port)
+			if normalizePortMap(deployment.PortMap) != resolved {
+				if err := deploymentStore.UpdateDeploymentPortMap(ctx, deployment.DeploymentID, resolved); err != nil {
+					return DeploymentJobStatus{}, err
+				}
+				deployment.PortMap = resolved
+			}
+			fmt.Fprintf(logSink(logs), "==> Container port %d (from %s)\n", port, source)
 		}
 	} else if progress != nil {
 		progress("deploying", 60, "reusing existing image")

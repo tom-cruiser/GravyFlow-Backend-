@@ -284,6 +284,10 @@ func NewDeploymentStore(ctx context.Context) (*DeploymentStore, error) {
 			Err:     err,
 		}
 	}
+	// Make the active database obvious in the startup log: a dashboard that
+	// suddenly feels slow is very often "this is pointing at the remote DB".
+	log.Printf("database: host=%s port=%d db=%s (GRAVYFLOW_DB_TARGET=%q)",
+		config.ConnConfig.Host, config.ConnConfig.Port, config.ConnConfig.Database, os.Getenv("GRAVYFLOW_DB_TARGET"))
 
 	// Configure pool
 	if maxConns, err := int32FromEnv("PGMAXCONNS", 10); err == nil {
@@ -442,8 +446,19 @@ func pingWithRetry(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 }
 
+// dbTargetLocal reports whether GRAVYFLOW_DB_TARGET=local: connect to the
+// local Postgres described by the PG* variables and ignore DATABASE_URL. That
+// lets a .env keep a remote (e.g. Neon) DATABASE_URL for production while
+// local development flips one variable to hit the docker-compose "postgres"
+// container instead — same-host round trips are ~1ms instead of the ~200ms+
+// each query costs over the internet.
+func dbTargetLocal() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("GRAVYFLOW_DB_TARGET")), "local")
+}
+
 func buildPostgresConnString() (string, error) {
-	if rawURL := strings.TrimSpace(os.Getenv("DATABASE_URL")); rawURL != "" {
+	local := dbTargetLocal()
+	if rawURL := strings.TrimSpace(os.Getenv("DATABASE_URL")); rawURL != "" && !local {
 		return rawURL, nil
 	}
 
@@ -458,9 +473,14 @@ func buildPostgresConnString() (string, error) {
 		}
 	}
 	sslMode := envOrDefault("PGSSLMODE", "disable")
+	if local {
+		// A .env written for a remote database usually carries
+		// PGSSLMODE=require, which a plain local Postgres rejects.
+		sslMode = envOrDefault("GRAVYFLOW_DB_SSLMODE", "disable")
+	}
 	user := strings.TrimSpace(os.Getenv("PGUSER"))
 	password := os.Getenv("PGPASSWORD")
-	if useLocalDevPostgresDefaults(host, dbName) {
+	if useLocalDevPostgresDefaults(host, dbName) && !(local && user != "") {
 		user = "gravyflow"
 		password = "gravyflow"
 	}
@@ -1092,6 +1112,13 @@ ALTER TABLE domains ADD COLUMN IF NOT EXISTS is_primary BOOLEAN NOT NULL DEFAULT
 ALTER TABLE domains ADD COLUMN IF NOT EXISTS dns_checked_at TIMESTAMPTZ;
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS force_https BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS www_redirect_mode TEXT NOT NULL DEFAULT 'none'`},
+		// Monorepo support (build_settings.go): which Dockerfile in the repo to
+		// build (relative to the repo root, which is also the build context) and
+		// the port the container listens on. Empty/0 keep the old behaviour:
+		// auto-detect the language at the repo root, listen on 8080.
+		{27, `
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS dockerfile_path TEXT NOT NULL DEFAULT '';
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_port INTEGER NOT NULL DEFAULT 0`},
 	}
 
 	for _, migration := range migrations {

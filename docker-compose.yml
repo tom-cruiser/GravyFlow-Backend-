@@ -252,6 +252,9 @@ services:
         BUILD_TIME: ${BUILD_TIME:-}
     image: gravyflow-api:${IMAGE_TAG:-latest}
     container_name: gravyflow-api
+    # Tiny init as PID 1: git helpers (git-remote-https, ssh) orphaned when a
+    # stalled clone is killed are otherwise never reaped and pile up as zombies.
+    init: true
     # Load environment variables from .env file
     env_file:
       - .env
@@ -263,6 +266,18 @@ services:
       PGDATABASE: ${POSTGRES_DB:-gravyflow}
       PGUSER: ${POSTGRES_USER:-postgres}
       PGPASSWORD: ${POSTGRES_PASSWORD:-blackey333Vi@32}
+      # GRAVYFLOW_DB_TARGET=local makes the API ignore DATABASE_URL (e.g. a
+      # remote Neon URL kept in .env) and use the "postgres" service in this
+      # file via the PG* variables above. Empty/anything else = use DATABASE_URL.
+      GRAVYFLOW_DB_TARGET: ${GRAVYFLOW_DB_TARGET:-}
+
+      # Deployment worker + git clone tuning (see cmd/api/git_progress.go,
+      # repo_preflight.go). Concurrency 1 serialised every clone and build
+      # platform-wide, so one slow clone blocked all other deploys.
+      ASYNQ_CONCURRENCY: ${ASYNQ_CONCURRENCY:-2}
+      GRAVYFLOW_GIT_CLONE_TIMEOUT: ${GRAVYFLOW_GIT_CLONE_TIMEOUT:-10m}
+      GRAVYFLOW_GIT_STALL_TIMEOUT: ${GRAVYFLOW_GIT_STALL_TIMEOUT:-2m}
+      GRAVYFLOW_MAX_CLONE_SIZE_MB: ${GRAVYFLOW_MAX_CLONE_SIZE_MB:-500}
       
       # Redis
       REDIS_ADDR: redis:6379

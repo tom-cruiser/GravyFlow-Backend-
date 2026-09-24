@@ -340,6 +340,35 @@ func (g *GitHubAppClient) GetRepository(ctx context.Context, installationID int6
 	return repo, nil
 }
 
+// GitHubTreeEntry is one path in a repository tree.
+type GitHubTreeEntry struct {
+	Path string `json:"path"`
+	Type string `json:"type"` // "blob", "tree" or "commit" (submodule)
+	Size int64  `json:"size"` // blobs only
+}
+
+// GetRepositoryTree lists every path at ref, with blob sizes, in a single
+// call. It's how a clone's real size is known up front: the repository
+// "size" GitHub reports covers all history, which a --depth 1 clone never
+// downloads, so it would wrongly reject repos that are large only in the
+// past. truncated is true when GitHub cut the listing short (100k entries),
+// in which case the sizes are a lower bound.
+func (g *GitHubAppClient) GetRepositoryTree(ctx context.Context, installationID int64, fullName string, ref string) (entries []GitHubTreeEntry, truncated bool, err error) {
+	token, err := g.installationToken(ctx, installationID)
+	if err != nil {
+		return nil, false, err
+	}
+	var resp struct {
+		Truncated bool              `json:"truncated"`
+		Tree      []GitHubTreeEntry `json:"tree"`
+	}
+	endpoint := fmt.Sprintf("%s/repos/%s/git/trees/%s?recursive=1", g.cfg.APIBaseURL, fullName, url.PathEscape(ref))
+	if err := g.do(ctx, http.MethodGet, endpoint, "token "+token, nil, &resp); err != nil {
+		return nil, false, fmt.Errorf("get repository tree: %w", err)
+	}
+	return resp.Tree, resp.Truncated, nil
+}
+
 // ============================================================================
 // USER VERIFICATION (OAuth during installation)
 // ============================================================================

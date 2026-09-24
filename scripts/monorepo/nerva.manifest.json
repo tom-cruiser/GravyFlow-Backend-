@@ -1,0 +1,21 @@
+{
+  "repo": "tom-cruiser/Nerva-backend",
+  "envFile": "/home/zha/Desktop/project/Nerva/Nerva-backend/.env",
+  "redis": {
+    "container": "nerva-redis",
+    "volume": "nerva-redis-data",
+    "passwordFile": "secret/nerva-redis.password"
+  },
+  "env": {},
+  "services": [
+    { "name": "auth-tenant",     "dockerfilePath": "services/auth-tenant/Dockerfile",     "port": 3001 },
+    { "name": "inventory",       "dockerfilePath": "services/inventory/Dockerfile",       "port": 3002 },
+    { "name": "sales-sync",      "dockerfilePath": "services/sales-sync/Dockerfile",      "port": 3003,
+      "env": { "SYNC_QUEUE_NAME": "sales-sync-batch" } },
+    { "name": "ledger-payments", "dockerfilePath": "services/ledger-payments/Dockerfile", "port": 3004 },
+    { "name": "whatsapp-engine", "dockerfilePath": "services/whatsapp-engine/Dockerfile", "port": 3005 },
+    { "name": "shifts",          "dockerfilePath": "services/shifts/Dockerfile",          "port": 3006 },
+    { "name": "superadmin",      "dockerfilePath": "services/superadmin/Dockerfile",      "port": 3007 },
+    { "name": "realtime",        "dockerfilePath": "services/realtime/Dockerfile",        "port": 3008 }
+  ]
+}

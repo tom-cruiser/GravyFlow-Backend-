@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -123,6 +125,12 @@ func resolveRepoURL(deployment DeploymentRecord) string {
 func prepareDeploymentSource(ctx context.Context, deployment DeploymentRecord) (string, error) {
 	var opts GitCloneOptions
 	if deploymentStore != nil && isRemoteRepoSource(resolveRepoURL(deployment)) {
+		// Fail fast, before any download, if the repository is inaccessible or
+		// too large to clone (repo_preflight.go).
+		if err := preflightGitHubRepo(ctx, deployment.DeploymentID); err != nil {
+			return "", err
+		}
+
 		// Services picked through the GitHub App get a fresh installation
 		// token, scoped to their repository, for every clone.
 		appToken, viaApp, err := githubCloneToken(ctx, deployment.DeploymentID)
@@ -179,11 +187,33 @@ func prepareDeploymentSourceWithOptions(ctx context.Context, deployment Deployme
 		return "", fmt.Errorf("create app build root: %w", err)
 	}
 
+	// Two jobs for the same deployment (ASYNQ_CONCURRENCY > 1) would
+	// otherwise run git in the same checkout at once and trip each other's
+	// lock files.
+	unlock := lockCheckout(dest)
+	defer unlock()
+
 	// Check if we need to clone or sync
 	if _, err := os.Stat(filepath.Join(dest, ".git")); err == nil {
-		// Existing repo - sync
+		// Existing repo - sync. We hold the checkout lock, so any git lock
+		// file still present was left by a git that was killed mid-run
+		// (stall watchdog, timeout, cancelled deploy, API restart); git
+		// never removes those itself and would refuse every later fetch.
+		removeStaleGitLocks(dest)
 		if err := runGitSync(ctx, dest, repoURL, opts); err != nil {
-			return "", withGitAuthHint(err, opts)
+			// The checkout is only a cache: rather than failing every deploy
+			// on a corrupt one, start over from a fresh clone. Bad
+			// credentials would fail the clone identically, so skip it then.
+			if isGitAuthError(err) || ctx.Err() != nil {
+				return "", withGitAuthHint(err, opts)
+			}
+			fmt.Printf("[WARN] git sync of %s failed, re-cloning: %v\n", dest, err)
+			if err := os.RemoveAll(dest); err != nil {
+				return "", fmt.Errorf("reset app checkout directory: %w", err)
+			}
+			if err := runGitClone(ctx, repoURL, dest, opts); err != nil {
+				return "", withGitAuthHint(err, opts)
+			}
 		}
 	} else {
 		// New clone - remove any existing directory
@@ -249,12 +279,18 @@ func runGitClone(ctx context.Context, repoURL string, dest string, opts GitClone
 		return fmt.Errorf("git CLI not found in PATH: %w", err)
 	}
 
-	// Set timeout
-	ctx, cancel := context.WithTimeout(ctx, gitCommandTimeout)
+	// Hard ceiling for the whole clone (GRAVYFLOW_GIT_CLONE_TIMEOUT); a
+	// stalled transfer is caught much sooner by the watchdog inside
+	// runGitCommandProgress (GRAVYFLOW_GIT_STALL_TIMEOUT).
+	timeout := gitTimeout()
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// --progress: git only prints transfer progress to a terminal, and this
+	// isn't one. Without it a multi-minute clone is completely silent.
 	args := []string{
 		"clone",
+		"--progress",
 		"--depth", fmt.Sprintf("%d", getDepth(opts.Depth)),
 	}
 
@@ -309,7 +345,7 @@ func runGitClone(ctx context.Context, repoURL string, dest string, opts GitClone
 			}
 		}
 
-		err := runGitCommand(ctx, env, args...)
+		err := runGitCommandProgress(ctx, env, args...)
 		if err == nil {
 			// If sparse checkout, add patterns
 			if len(opts.SparseCheckout) > 0 {
@@ -330,6 +366,9 @@ func runGitClone(ctx context.Context, repoURL string, dest string, opts GitClone
 		lastErr = err
 	}
 
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("git clone timed out after %s (raise GRAVYFLOW_GIT_CLONE_TIMEOUT for large repositories): %w", timeout, lastErr)
+	}
 	return fmt.Errorf("git clone failed: %w", lastErr)
 }
 
@@ -342,7 +381,7 @@ func runGitSync(ctx context.Context, dest string, repoURL string, opts GitCloneO
 		return fmt.Errorf("git CLI not found in PATH: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, gitCommandTimeout)
+	ctx, cancel := context.WithTimeout(ctx, gitTimeout())
 	defer cancel()
 
 	// Setup environment
@@ -364,14 +403,14 @@ func runGitSync(ctx context.Context, dest string, repoURL string, opts GitCloneO
 	}
 
 	// Fetch latest changes
-	fetchArgs := []string{"-C", dest, "fetch", "--depth", fmt.Sprintf("%d", getDepth(opts.Depth))}
+	fetchArgs := []string{"-C", dest, "fetch", "--progress", "--depth", fmt.Sprintf("%d", getDepth(opts.Depth))}
 	if opts.Branch != "" {
 		fetchArgs = append(fetchArgs, "origin", opts.Branch)
 	} else {
 		fetchArgs = append(fetchArgs, "origin")
 	}
 
-	if err := runGitCommand(ctx, env, fetchArgs...); err != nil {
+	if err := runGitCommandProgress(ctx, env, fetchArgs...); err != nil {
 		return err
 	}
 
@@ -593,6 +632,43 @@ func getGitOutput(ctx context.Context, path string, args ...string) (string, err
 	}
 
 	return stdout.String(), nil
+}
+
+// ============================================================================
+// CHECKOUT LOCKING
+// ============================================================================
+
+var checkoutLocks sync.Map // checkout path -> *sync.Mutex
+
+// lockCheckout serializes git work on one checkout directory within this
+// process and returns the unlock func.
+func lockCheckout(dest string) func() {
+	v, _ := checkoutLocks.LoadOrStore(dest, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// removeStaleGitLocks deletes every *.lock file under dest/.git (index.lock,
+// shallow.lock, HEAD.lock, refs/**/x.lock, ...). Only call it while holding
+// lockCheckout(dest), when no git process can legitimately own one.
+func removeStaleGitLocks(dest string) {
+	gitDir := filepath.Join(dest, ".git")
+	_ = filepath.WalkDir(gitDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		// Object storage never holds ref/index locks and can be huge.
+		if d.IsDir() && path == filepath.Join(gitDir, "objects") {
+			return filepath.SkipDir
+		}
+		if !d.IsDir() && strings.HasSuffix(d.Name(), ".lock") {
+			if err := os.Remove(path); err == nil {
+				fmt.Printf("[WARN] removed stale git lock %s\n", path)
+			}
+		}
+		return nil
+	})
 }
 
 // ============================================================================

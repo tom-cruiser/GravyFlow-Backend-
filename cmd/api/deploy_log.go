@@ -608,7 +608,13 @@ func parseTimestampFromLine(line string) (time.Time, string) {
 	
 	// Try to find timestamp anywhere in the line
 	for _, format := range formats {
-		if idx := strings.Index(line, format[:10]); idx >= 0 {
+		// Sniff on the format's own first 10 characters — but "15:04:05" (a
+		// bare-time format) is only 8 long, and slicing past a string's
+		// length panics rather than clamping, which is exactly what was
+		// crashing every /deploy-log request once a build log line reached
+		// this fallback path.
+		prefixLen := min(10, len(format))
+		if idx := strings.Index(line, format[:prefixLen]); idx >= 0 {
 			if len(line) >= idx+len(format) {
 				if t, err := time.Parse(format, line[idx:idx+len(format)]); err == nil {
 					remaining := strings.TrimSpace(line[:idx] + line[idx+len(format):])

@@ -446,6 +446,10 @@ run_application() {
         set +a
     fi
 
+    # Two deployments at a time instead of one (a single slow clone used to
+    # block every other deploy). A value from .env wins.
+    export ASYNQ_CONCURRENCY="${ASYNQ_CONCURRENCY:-2}"
+
     # Set environment variables with your custom credentials
     export PGHOST=127.0.0.1
     export PGPORT=$POSTGRES_HOST_PORT

@@ -212,7 +212,7 @@ func deleteAppEnvHandler(c *gin.Context) {
 // ============================================================================
 
 func bulkAddAppEnvHandler(c *gin.Context) {
-	user, deployment, ok := currentUserDeployment(c)
+	_, deployment, ok := currentUserDeployment(c)
 	if !ok {
 		return
 	}
@@ -234,6 +234,21 @@ func bulkAddAppEnvHandler(c *gin.Context) {
 	}
 
 	results := make([]map[string]interface{}, 0, len(req.Variables))
+
+	// Validate + encrypt every entry up front (all local, no DB) so only one
+	// query touches the database regardless of how many variables came in.
+	// A later duplicate key in the request wins, matching dotenv "last one
+	// wins" semantics the import preview already applies client-side.
+	type preparedVar struct {
+		encryptedValue []byte
+		nonce          []byte
+		category       string
+		sensitive      bool
+		description    string
+	}
+	prepared := make(map[string]preparedVar, len(req.Variables))
+	order := make([]string, 0, len(req.Variables))
+
 	for _, env := range req.Variables {
 		key := normalizeEnvKey(env.Key)
 		if key == "" {
@@ -259,35 +274,12 @@ func bulkAddAppEnvHandler(c *gin.Context) {
 			continue
 		}
 
-		// Check if exists
-		exists, _ := deploymentStore.DeploymentEnvVarExists(
-			c.Request.Context(), deployment.DeploymentID, key,
-		)
-		if exists && !req.Overwrite {
-			results = append(results, map[string]interface{}{
-				"key":    key,
-				"status": "skipped",
-				"reason": "already exists",
-			})
-			continue
-		}
-
-		// Auto-detect category
 		if env.Category == "" {
 			env.Category = string(getCategoryFromKey(key))
 		}
 		env.Sensitive = env.Sensitive || isSensitiveKey(key)
 
-		err := deploymentStore.UpsertDeploymentEnvVarWithCategory(
-			c.Request.Context(),
-			user.ID,
-			deployment.DeploymentID,
-			key,
-			env.Value,
-			env.Category,
-			env.Sensitive,
-			env.Description,
-		)
+		encryptedValue, nonce, err := encryptEnvValue(env.Value)
 		if err != nil {
 			results = append(results, map[string]interface{}{
 				"key":    key,
@@ -297,12 +289,67 @@ func bulkAddAppEnvHandler(c *gin.Context) {
 			continue
 		}
 
-		results = append(results, map[string]interface{}{
-			"key":       key,
-			"status":    "saved",
-			"category":  env.Category,
-			"sensitive": env.Sensitive,
-		})
+		if _, exists := prepared[key]; !exists {
+			order = append(order, key)
+		}
+		prepared[key] = preparedVar{
+			encryptedValue: encryptedValue,
+			nonce:          nonce,
+			category:       env.Category,
+			sensitive:      env.Sensitive,
+			description:    env.Description,
+		}
+	}
+
+	if len(order) > 0 {
+		keys := make([]string, len(order))
+		encryptedValues := make([][]byte, len(order))
+		nonces := make([][]byte, len(order))
+		categories := make([]string, len(order))
+		sensitives := make([]bool, len(order))
+		descriptions := make([]string, len(order))
+		for i, key := range order {
+			v := prepared[key]
+			keys[i] = key
+			encryptedValues[i] = v.encryptedValue
+			nonces[i] = v.nonce
+			categories[i] = v.category
+			sensitives[i] = v.sensitive
+			descriptions[i] = v.description
+		}
+
+		saved, err := deploymentStore.bulkUpsertEnvVarsFast(
+			c.Request.Context(), deployment.DeploymentID,
+			keys, encryptedValues, nonces, categories, sensitives, descriptions,
+			req.Overwrite,
+		)
+		if err != nil {
+			for _, key := range order {
+				results = append(results, map[string]interface{}{
+					"key":    key,
+					"status": "error",
+					"error":  err.Error(),
+				})
+			}
+		} else {
+			for _, key := range order {
+				if saved[key] {
+					v := prepared[key]
+					results = append(results, map[string]interface{}{
+						"key":       key,
+						"status":    "saved",
+						"category":  v.category,
+						"sensitive": v.sensitive,
+					})
+				} else {
+					results = append(results, map[string]interface{}{
+						"key":    key,
+						"status": "skipped",
+						"reason": "already exists",
+					})
+				}
+			}
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -589,8 +636,67 @@ func (s *DeploymentStore) UpsertDeploymentEnvVarWithCategory(
 		description = EXCLUDED.description,
 		updated_at = now()
 	`, deploymentID, key, encryptedValue, nonce, category, sensitive, description)
-	
+
 	return err
+}
+
+// bulkUpsertEnvVarsFast upserts every already-validated, already-encrypted
+// variable in a single round trip via unnest(), instead of one exists-check
+// plus one upsert per key. That N*2-round-trip pattern is cheap against a
+// local Postgres but, against a remote/pooled DB (e.g. Neon), each round
+// trip costs the full network latency — a 20-variable import was measured
+// taking 20+ seconds and blowing past the server's WRITE_TIMEOUT. Batching
+// collapses that to one round trip regardless of N (up to the 50-variable
+// request cap).
+//
+// overwrite selects the conflict behaviour for the whole batch: DO UPDATE
+// (every key ends up "saved") or DO NOTHING (a pre-existing key is silently
+// skipped and simply absent from the returned set). Returns the set of keys
+// that were actually inserted or updated; any key not in it already existed
+// and was skipped.
+func (s *DeploymentStore) bulkUpsertEnvVarsFast(
+	ctx context.Context,
+	deploymentID string,
+	keys []string,
+	encryptedValues [][]byte,
+	nonces [][]byte,
+	categories []string,
+	sensitives []bool,
+	descriptions []string,
+	overwrite bool,
+) (map[string]bool, error) {
+	conflictClause := "ON CONFLICT (deployment_id, env_key) DO NOTHING"
+	if overwrite {
+		conflictClause = `ON CONFLICT (deployment_id, env_key) DO UPDATE SET
+			encrypted_value = EXCLUDED.encrypted_value,
+			nonce = EXCLUDED.nonce,
+			category = EXCLUDED.category,
+			sensitive = EXCLUDED.sensitive,
+			description = EXCLUDED.description,
+			updated_at = now()`
+	}
+
+	rows, err := s.pool.Query(ctx, `
+	INSERT INTO deployment_env_vars (deployment_id, env_key, encrypted_value, nonce, category, sensitive, description)
+	SELECT $1, k, v, n, c, s, d
+	FROM unnest($2::text[], $3::bytea[], $4::bytea[], $5::text[], $6::bool[], $7::text[]) AS t(k, v, n, c, s, d)
+	`+conflictClause+`
+	RETURNING env_key
+	`, deploymentID, keys, encryptedValues, nonces, categories, sensitives, descriptions)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	saved := make(map[string]bool, len(keys))
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		saved[key] = true
+	}
+	return saved, rows.Err()
 }
 
 // Route registration for all of these handlers lives in main.go's

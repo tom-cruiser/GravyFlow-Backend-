@@ -91,14 +91,28 @@ RUN --mount=type=cache,target=/var/cache/apt \
       | tar -xz -C /tmp; \
     mv /tmp/docker/docker /usr/local/bin/docker; \
     rm -rf /tmp/docker; \
+    # buildx CLI plugin — nixpacks 1.4x+ shells out to `docker buildx build`
+    # unconditionally (it never falls back to the classic builder, so
+    # DOCKER_BUILDKIT=0 does nothing for it); without this plugin every
+    # nixpacks deploy fails with "buildx component is missing or broken".
+    # Installed via Docker's official apt repo rather than a pinned GitHub
+    # release URL, so the version always matches what's current/compatible.
+    install -m 0755 -d /etc/apt/keyrings; \
+    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc; \
+    chmod a+r /etc/apt/keyrings/docker.asc; \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+      > /etc/apt/sources.list.d/docker.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends docker-buildx-plugin; \
     # nixpacks — the builder the control plane invokes for user source.
     curl -fsSL https://nixpacks.com/install.sh | bash; \
     # Cleanup
     apt-get clean; \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*; \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /etc/apt/sources.list.d/docker.list /etc/apt/keyrings/docker.asc; \
     # Assert both tools are present & on PATH now, so a broken install fails the
     # build here rather than every deployment job later.
     docker --version; \
+    docker buildx version; \
     nixpacks --version
 
 # ============================================================================

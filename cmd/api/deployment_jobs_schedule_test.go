@@ -37,13 +37,13 @@ func TestEnqueueDeploymentDoesNotDelayEligibility(t *testing.T) {
 
 	// Clean up everything this test wrote, regardless of outcome.
 	defer func() {
-		inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: "127.0.0.1:6379"})
+		inspector := asynq.NewInspector(manager.redisOpt)
 		defer inspector.Close()
 		_ = inspector.DeleteTask(deploymentJobQueueName, jobID)
 		_ = manager.redisClient.Del(ctx, manager.statusKey(jobID)).Err()
 	}()
 
-	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: "127.0.0.1:6379"})
+	inspector := asynq.NewInspector(manager.redisOpt)
 	defer inspector.Close()
 
 	info, err := inspector.GetTaskInfo(deploymentJobQueueName, jobID)

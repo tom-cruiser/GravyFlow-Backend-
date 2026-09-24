@@ -228,6 +228,9 @@ CREATE TABLE IF NOT EXISTS deployments (
     -- Per-service edge settings (see db.go migration 26 and caddy.go).
     force_https BOOLEAN NOT NULL DEFAULT TRUE,
     www_redirect_mode TEXT NOT NULL DEFAULT 'none',
+    -- Monorepo support (see db.go migration 27 and build_settings.go).
+    dockerfile_path TEXT NOT NULL DEFAULT '',
+    container_port INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

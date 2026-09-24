@@ -42,6 +42,10 @@ type CreateAppRequest struct {
 	// Repository picked through the GitHub App (see github_integration.go).
 	// New apps can only be created this way — see createAppHandler.
 	GitHub *GitHubSourceRequest `json:"github"`
+	// Optional monorepo settings (see build_settings.go): the Dockerfile to
+	// build, relative to the repo root, and the port the app listens on.
+	DockerfilePath string `json:"dockerfilePath"`
+	ContainerPort  int    `json:"containerPort"`
 }
 
 type AppResponse struct {
@@ -308,6 +312,8 @@ func setupRouter(config ServerConfig) *gin.Engine {
 			protected.PATCH("/apps/:id/domains/:domain/primary", makePrimaryDomainHandler)
 			protected.GET("/apps/:id/edge-settings", getEdgeSettingsHandler)
 			protected.PATCH("/apps/:id/edge-settings", updateEdgeSettingsHandler)
+			protected.GET("/apps/:id/build-settings", getBuildSettingsHandler)
+			protected.PUT("/apps/:id/build-settings", updateBuildSettingsHandler)
 
 			// Jobs
 			protected.GET("/jobs/:jobId", deploymentJobStatusHandler)
@@ -367,6 +373,9 @@ func setupRouter(config ServerConfig) *gin.Engine {
 				// Module D: System Audit Logs (insert-only; no update/delete route
 				// exists for audit_logs, and the DB trigger rejects it even so)
 				admin.GET("/audit-logs", adminListAuditLogsHandler)
+
+				// System health: dependencies, process and host (admin_system.go)
+				admin.GET("/system/health", adminSystemHealthHandler)
 			}
 		}
 	}
@@ -611,7 +620,16 @@ func createAppHandler(c *gin.Context) {
 	}
 	repoURL := repo.CloneURL
 
+	buildSettings, err := BuildSettings{DockerfilePath: req.DockerfilePath, ContainerPort: req.ContainerPort}.validated()
+	if err != nil {
+		sendBadRequest(c, err.Error(), nil)
+		return
+	}
+
 	portMap := allocatePortMap("8080")
+	if buildSettings.ContainerPort > 0 {
+		portMap = allocatePortMap(strconv.Itoa(buildSettings.ContainerPort))
+	}
 
 	deploymentID, err := deploymentStore.CreateDeploymentAttemptForUser(
 		c.Request.Context(),
@@ -636,6 +654,18 @@ func createAppHandler(c *gin.Context) {
 			"request_id": c.GetString("requestID"),
 		})
 		return
+	}
+
+	// Saved before enqueueing so the very first build already uses them.
+	if buildSettings != (BuildSettings{}) {
+		if err := deploymentStore.SetBuildSettings(c.Request.Context(), deploymentID, buildSettings); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":      "failed_to_save_build_settings",
+				"details":    err.Error(),
+				"request_id": c.GetString("requestID"),
+			})
+			return
+		}
 	}
 
 	// Saved before enqueueing so the first clone already has them.

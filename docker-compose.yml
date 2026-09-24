@@ -80,6 +80,9 @@ services:
       - "${POSTGRES_PORT:-5433}:5432"
     networks:
       - gravyflow-network
+    depends_on:
+      gravyflow-volume-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-gravyflow}"]
       interval: 10s
@@ -164,6 +167,9 @@ services:
       - "127.0.0.1:${REDIS_PORT:-6380}:6379"
     networks:
       - gravyflow-network
+    depends_on:
+      gravyflow-volume-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -187,6 +193,52 @@ services:
     labels:
       - "com.gravyflow.service=redis"
       - "com.gravyflow.environment=${ENVIRONMENT:-development}"
+
+  # ==========================================================================
+  # VOLUME INIT
+  # ==========================================================================
+  # Named volumes are created root-owned by Docker the first time they're
+  # used, which silently overrides whatever each image's Dockerfile chowned
+  # at build time — every service below runs as a non-root uid and can't
+  # write into a root-owned mount. That's what produced "create app build
+  # root: mkdir /var/lib/gravyflow/apps: permission denied" for the api
+  # service, and the identical "mkdir ... Permission denied" for postgres's
+  # pgdata, both only on a volume's first use (a fresh host, or after
+  # `compose down -v`). This fixes ownership for every affected volume
+  # before its service starts, every time, so the stack self-heals
+  # regardless of whether the volumes are fresh or pre-existing — no manual
+  # chown ever needed. Per-image uids confirmed via `docker run <image:tag>
+  # id <user>` against the EXACT tags this compose file uses — postgres:15
+  # (Debian) and postgres:15-alpine use different uids for the same
+  # "postgres" username, which is what made an earlier version of this fix
+  # chown pgdata to the wrong owner (999:999, copied from the wrong tag) and
+  # break a volume that was otherwise fine: gravyflow-api runs as uid 1000
+  # (Dockerfile's `gravyflow` user); postgres:15-alpine's `postgres` user is
+  # 70:70; redis:7-alpine's `redis` user is 999:1000. Caddy runs as root, so
+  # caddy-data needs nothing.
+  gravyflow-volume-init:
+    image: busybox:latest
+    container_name: gravyflow-volume-init
+    command:
+      - sh
+      - -c
+      - |
+        chown -R 1000:1000 /var/lib/gravyflow/apps /var/cache/nixpacks
+        chown -R 70:70 /pgdata
+        chown -R 999:1000 /redisdata
+    volumes:
+      - app-builds:/var/lib/gravyflow/apps
+      - nixpacks-cache:/var/cache/nixpacks
+      - postgres-data:/pgdata
+      - redis-data:/redisdata
+    # Every other service explicitly joins gravyflow-network; without the
+    # same here, Compose creates an implicit project-default network that
+    # grabs gravyflow-network's own hardcoded 172.20.0.0/16 subnet the
+    # moment this service exists, and gravyflow-network then fails to
+    # create with a pool-overlap error.
+    networks:
+      - gravyflow-network
+    restart: "no"
 
   # ==========================================================================
   # API
@@ -264,17 +316,29 @@ services:
     # so the container needs the host docker group's GID (`getent group docker`).
     group_add:
       - "${DOCKER_GID:-972}"
+    # Without this, Docker copies the host's /etc/resolv.conf verbatim into
+    # the container. On a host using systemd-resolved (common on Debian/
+    # Ubuntu) that file points at 127.0.0.53, its local-only stub resolver —
+    # unreachable from inside a container's own network namespace. DATABASE_URL
+    # here can point at an external host (e.g. a managed Postgres provider),
+    # which then fails DNS resolution entirely. Public resolvers sidestep it.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - app-builds:/var/lib/gravyflow/apps
       - nixpacks-cache:/var/cache/nixpacks
       - ./configs:/app/configs:ro
+      - ./secret:/app/secret:ro
     ports:
       - "${API_PORT:-8080}:8080"
       - "${METRICS_PORT:-9090}:9090"
     networks:
       - gravyflow-network
     depends_on:
+      gravyflow-volume-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:

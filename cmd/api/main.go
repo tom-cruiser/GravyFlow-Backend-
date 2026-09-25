@@ -107,6 +107,9 @@ func run() error {
 	// Flag sustained crypto-mining-like CPU load (Admin panel, Module C).
 	go RunRiskAlertSweeper(context.Background(), deploymentStore, getDurationEnv("GRAVYFLOW_RISK_SWEEP_INTERVAL", defaultRiskSweepInterval))
 
+	// Re-push app routes after Caddy restarts or an app comes back on a new IP.
+	go RunCaddyRouteReconciler(context.Background(), getDurationEnv("GRAVYFLOW_CADDY_RECONCILE_INTERVAL", defaultCaddyReconcileInterval))
+
 	githubAppLogStartup()
 
 	// Setup router

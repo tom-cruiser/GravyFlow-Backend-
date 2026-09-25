@@ -826,3 +826,87 @@ func firstOrEmpty(values []string) string {
 	}
 	return values[0]
 }
+// ============================================================================
+// ROUTE RECONCILER
+// ============================================================================
+
+const defaultCaddyReconcileInterval = 30 * time.Second
+
+// RunCaddyRouteReconciler keeps Caddy's routes in step with the running app
+// containers. Routes are otherwise only pushed when this API starts a
+// container or changes a domain, so two things silently break every app:
+//   - Caddy restarts and reloads its bare Caddyfile, dropping all routes, and
+//   - Docker's restart policy brings a crashed app back on a new IP, leaving
+//     its route pointing at the old one.
+// It pushes once at startup, then again whenever either drift is seen.
+func RunCaddyRouteReconciler(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = defaultCaddyReconcileInterval
+	}
+	reconcile := func(force bool) {
+		containers, err := ListRunningManagedContainers()
+		if err != nil {
+			log.Printf("caddy reconcile: list containers: %v", err)
+			return
+		}
+		if !force && !defaultRouteManager.routesDrifted(ctx, containers) {
+			return
+		}
+		syncCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		if err := defaultRouteManager.ReplaceRoutes(syncCtx, containers); err != nil {
+			log.Printf("caddy reconcile: sync failed: %v", err)
+			return
+		}
+		log.Printf("caddy reconcile: pushed %d app route(s)", len(containers))
+	}
+
+	reconcile(true)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reconcile(false)
+		}
+	}
+}
+
+// routesDrifted reports whether the running containers' targets differ from
+// the routes last pushed, or Caddy no longer holds our server (it restarted).
+func (rm *RouteManager) routesDrifted(ctx context.Context, containers []ContainerInfo) bool {
+	rm.mu.RLock()
+	want := 0
+	for _, c := range containers {
+		if c.ContainerName == "" || c.InternalIP == "" || c.InternalPort == "" {
+			continue
+		}
+		want++
+		r, ok := rm.routes[c.ContainerName]
+		if !ok || r.Target != fmt.Sprintf("%s:%s", c.InternalIP, c.InternalPort) {
+			rm.mu.RUnlock()
+			return true
+		}
+	}
+	drifted := want != len(rm.routes)
+	rm.mu.RUnlock()
+	if drifted {
+		return true
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, caddyAdminURL()+"/config/apps/http/servers/gravyflow", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		// Caddy unreachable: nothing to push to yet; retry next tick.
+		return false
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	// Caddy answers "null" for a path that doesn't exist.
+	return resp.StatusCode != http.StatusOK || strings.TrimSpace(string(body)) == "null"
+}

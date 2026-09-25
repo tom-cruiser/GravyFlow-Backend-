@@ -240,7 +240,7 @@ func TestGitHubInstallState(t *testing.T) {
 	}
 
 	// A regular access token (same base secret) must not pass as a state.
-	access, _, err := issueToken(UserRecord{ID: "user-1"}, tokenTypeAccess, time.Minute, "")
+	access, _, err := issueToken(UserRecord{ID: "user-1"}, tokenTypeAccess, time.Minute, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}

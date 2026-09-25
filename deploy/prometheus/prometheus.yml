@@ -1,0 +1,15 @@
+# Scrapes the GravyFlow API. It serves /metrics on its main port (8080) when
+# ENABLE_METRICS=true — see cmd/api/main.go; METRICS_PORT is not used.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: gravyflow-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8080"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

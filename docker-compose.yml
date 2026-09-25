@@ -7,11 +7,9 @@
 # Usage:
 #   docker-compose up -d                    # Start all services
 #   docker-compose --profile monitoring up -d  # Start with monitoring
-#   docker-compose --profile production up -d  # Start with nginx
+#   docker-compose --profile backup up -d      # Start with nightly pg_dump
 #   docker-compose down -v                  # Stop and remove volumes
 # ============================================================================
-
-version: '3.8'
 
 # ============================================================================
 # NETWORKS
@@ -68,7 +66,7 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-gravyflow}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-blackey333Vi@32}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_INITDB_ARGS: "--data-checksums"
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
@@ -117,7 +115,7 @@ services:
       POSTGRES_HOST: postgres
       POSTGRES_DB: ${POSTGRES_DB:-gravyflow}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-blackey333Vi@32}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       BACKUP_SCHEDULE: ${BACKUP_SCHEDULE:-0 2 * * *}
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
     volumes:
@@ -128,11 +126,17 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    entrypoint: |
-      sh -c "
-        echo '0 2 * * * /backup.sh' > /etc/crontab &&
-        crond -f -l 2
-      "
+    # busybox crond reads /etc/crontabs/<user>, not /etc/crontab (which the
+    # old entrypoint wrote to, so no backup ever ran), and runs jobs with an
+    # empty environment — hence the /etc/backup.env snapshot backup.sh reads.
+    # $$ keeps Compose from interpolating; the container's env supplies it.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        (umask 077 && export -p | grep -E ' (POSTGRES_|BACKUP_)' > /etc/backup.env)
+        echo "$$BACKUP_SCHEDULE /bin/sh /backup.sh >> /proc/1/fd/1 2>&1" > /etc/crontabs/root
+        exec crond -f -l 2
     restart: unless-stopped
     deploy:
       resources:
@@ -260,12 +264,13 @@ services:
       - .env
     environment:
       # Database (using values from .env)
-      DATABASE_URL: ${DATABASE_URL:-postgres://postgres:blackey333Vi@32@postgres:5432/gravyflow?sslmode=disable}
+      # No default: a URL with the password baked in used to live here.
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
       PGHOST: postgres
       PGPORT: 5432
       PGDATABASE: ${POSTGRES_DB:-gravyflow}
       PGUSER: ${POSTGRES_USER:-postgres}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-blackey333Vi@32}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       # GRAVYFLOW_DB_TARGET=local makes the API ignore DATABASE_URL (e.g. a
       # remote Neon URL kept in .env) and use the "postgres" service in this
       # file via the PG* variables above. Empty/anything else = use DATABASE_URL.
@@ -313,6 +318,9 @@ services:
       
       # Health Checker
       HEALTH_CHECKER_INTERVAL: ${HEALTH_CHECKER_INTERVAL:-30s}
+
+      # Abuse detection sweep (admin panel risk alerts); 0 disables it.
+      GRAVYFLOW_RISK_SWEEP_INTERVAL: ${GRAVYFLOW_RISK_SWEEP_INTERVAL:-1m}
       
       # Metrics
       ENABLE_METRICS: ${ENABLE_METRICS:-true}
@@ -426,10 +434,10 @@ services:
     image: prom/prometheus:v2.48.0
     container_name: gravyflow-prometheus
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
     ports:
-      - "${PROMETHEUS_PORT:-9091}:9090"
+      - "127.0.0.1:${PROMETHEUS_PORT:-9091}:9090"
     networks:
       - gravyflow-network
     command:
@@ -466,15 +474,17 @@ services:
     container_name: gravyflow-grafana
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      # Loopback-only (see ports); Grafana forces a change of the admin/admin
+      # default on first login.
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
       GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
-      GF_SERVER_ROOT_URL: ${GRAFANA_URL:-http://localhost:3000}
+      GF_SERVER_ROOT_URL: ${GRAFANA_URL:-http://localhost:3001}
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
-      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
     ports:
-      - "${GRAFANA_PORT:-3000}:3000"
+      # 3001 on the host: the Next.js frontend's dev server holds 3000.
+      - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"
     networks:
       - gravyflow-network
     depends_on:
@@ -497,39 +507,3 @@ services:
       - "com.gravyflow.service=grafana"
     profiles:
       - monitoring
-
-  # ==========================================================================
-  # NGINX (Reverse Proxy - Production)
-  # ==========================================================================
-  nginx:
-    image: nginx:1.25-alpine
-    container_name: gravyflow-nginx
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/conf.d:/etc/nginx/conf.d:ro
-      - ./nginx/ssl:/etc/nginx/ssl:ro
-    ports:
-      - "${NGINX_HTTP_PORT:-80}:80"
-      - "${NGINX_HTTPS_PORT:-443}:443"
-    networks:
-      - gravyflow-network
-    depends_on:
-      - api
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          cpus: '1'
-          memory: 256M
-        reservations:
-          cpus: '0.1'
-          memory: 128M
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    labels:
-      - "com.gravyflow.service=nginx"
-    profiles:
-      - production

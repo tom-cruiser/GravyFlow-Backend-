@@ -45,7 +45,18 @@ REDIS_CONTAINER_PORT="6379"
 # Database credentials (YOUR CUSTOM VALUES)
 POSTGRES_DB="${POSTGRES_DB:-gravyflow}"
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
-POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-blackey333Vi@32}"
+# No built-in default password: take it from the environment, else from the
+# repo's .env (the same file docker-compose.yml reads).
+if [ -z "${POSTGRES_PASSWORD:-}" ]; then
+    _dev_env_file="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.env"
+    if [ -f "$_dev_env_file" ]; then
+        POSTGRES_PASSWORD="$(grep -E '^POSTGRES_PASSWORD=' "$_dev_env_file" | tail -n 1 | cut -d= -f2- | sed -e 's/^["'\'']//' -e 's/["'\'']$//')"
+    fi
+fi
+if [ -z "${POSTGRES_PASSWORD:-}" ]; then
+    echo "POSTGRES_PASSWORD is not set — add it to .env or export it before running this script." >&2
+    exit 1
+fi
 
 # Timeouts
 HEALTH_CHECK_TIMEOUT="${HEALTH_CHECK_TIMEOUT:-60}"
@@ -414,7 +425,7 @@ show_status() {
     
     # Show connection strings
     print_info "Connection Strings:"
-    echo "  PostgreSQL: postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@localhost:$POSTGRES_HOST_PORT/$POSTGRES_DB"
+    echo "  PostgreSQL: postgresql://$POSTGRES_USER:****@localhost:$POSTGRES_HOST_PORT/$POSTGRES_DB"
     echo "  Redis: redis://localhost:$REDIS_HOST_PORT"
     echo ""
     
@@ -527,7 +538,7 @@ Environment Variables:
     REDIS_PORT          Redis host port (default: 6380)
     POSTGRES_DB         Database name (default: gravyflow)
     POSTGRES_USER       Database user (default: postgres)
-    POSTGRES_PASSWORD   Database password (default: blackey333Vi@32)
+    POSTGRES_PASSWORD   Database password (required; read from .env if unset)
     HEALTH_CHECK_TIMEOUT Health check timeout in seconds (default: 60)
     APP_PATH           Application path (default: ./cmd/api)
     BUILD_COMMAND      Build command (default: go run)

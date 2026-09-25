@@ -24,6 +24,7 @@ import (
 const (
 	currentUserContextKey  = "currentUser"
 	impersonatorContextKey = "impersonatorId"
+	sessionMFAContextKey   = "sessionMfa"
 	tokenTypeAccess        = "access"
 	tokenTypeRefresh       = "refresh"
 	tokenTypeMFA           = "mfa"
@@ -77,6 +78,10 @@ type authClaims struct {
 	TokenType    string `json:"typ"`
 	DisplayName  string `json:"displayName,omitempty"`
 	Impersonator string `json:"imp,omitempty"` // admin user ID, set only on impersonation-mode tokens
+	// MFA is true only on tokens whose session passed a second factor (TOTP
+	// or recovery code) — see mfaVerifyHandler/mfaEnableHandler. Refresh
+	// carries it forward; AdminMiddleware requires it.
+	MFA bool `json:"mfa,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -119,23 +124,24 @@ func hmacEqual(a string, b string) bool {
 // JWT TOKEN FUNCTIONS
 // ============================================================================
 
-// issueAccessToken issues a new access token
-func issueAccessToken(user UserRecord) (string, time.Time, error) {
+// issueAccessToken issues a new access token. mfa marks a session that
+// passed a second factor.
+func issueAccessToken(user UserRecord, mfa bool) (string, time.Time, error) {
 	ttl := tokenTTLFromEnv("AUTH_ACCESS_TOKEN_TTL", 15*time.Minute)
-	return issueToken(user, tokenTypeAccess, ttl, "")
+	return issueToken(user, tokenTypeAccess, ttl, "", mfa)
 }
 
 // issueRefreshToken issues a new refresh token
-func issueRefreshToken(user UserRecord) (string, time.Time, error) {
+func issueRefreshToken(user UserRecord, mfa bool) (string, time.Time, error) {
 	ttl := tokenTTLFromEnv("AUTH_REFRESH_TOKEN_TTL", 30*24*time.Hour)
-	return issueToken(user, tokenTypeRefresh, ttl, "")
+	return issueToken(user, tokenTypeRefresh, ttl, "", mfa)
 }
 
 // issueMFAToken issues a short-lived token that only proves the password step
 // passed; it must be exchanged via POST /auth/mfa/verify for real tokens.
 func issueMFAToken(user UserRecord) (string, time.Time, error) {
 	ttl := tokenTTLFromEnv("AUTH_MFA_TOKEN_TTL", 5*time.Minute)
-	return issueToken(user, tokenTypeMFA, ttl, "")
+	return issueToken(user, tokenTypeMFA, ttl, "", false)
 }
 
 // issueImpersonationToken issues a normal access token scoped to targetUser,
@@ -144,11 +150,11 @@ func issueMFAToken(user UserRecord) (string, time.Time, error) {
 // giving admins a read-only view into a user's workspace (Module A).
 func issueImpersonationToken(admin UserRecord, target UserRecord) (string, time.Time, error) {
 	ttl := tokenTTLFromEnv("AUTH_IMPERSONATION_TOKEN_TTL", 15*time.Minute)
-	return issueToken(target, tokenTypeAccess, ttl, admin.ID)
+	return issueToken(target, tokenTypeAccess, ttl, admin.ID, false)
 }
 
 // issueToken is the core token issuance function
-func issueToken(user UserRecord, tokenType string, ttl time.Duration, impersonator string) (string, time.Time, error) {
+func issueToken(user UserRecord, tokenType string, ttl time.Duration, impersonator string, mfa bool) (string, time.Time, error) {
 	secret := []byte(envOrDefault("AUTH_JWT_SECRET", "dev-auth-secret-change-me-in-production"))
 	now := time.Now().UTC()
 	expiresAt := now.Add(ttl)
@@ -162,6 +168,7 @@ func issueToken(user UserRecord, tokenType string, ttl time.Duration, impersonat
 		TokenType:    tokenType,
 		DisplayName:  user.DisplayName,
 		Impersonator: impersonator,
+		MFA:          mfa,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   user.ID,
 			ID:        jti,
@@ -287,14 +294,14 @@ func registerHandler(c *gin.Context) {
 	}
 
 	// Issue access token
-	accessToken, accessExpiry, err := issueAccessToken(user)
+	accessToken, accessExpiry, err := issueAccessToken(user, false)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_issue_access_token", "details": err.Error()})
 		return
 	}
 
 	// Issue and store refresh token
-	refreshToken, refreshExpiry, err := issueRefreshToken(user)
+	refreshToken, refreshExpiry, err := issueRefreshToken(user, false)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_issue_refresh_token", "details": err.Error()})
 		return
@@ -376,7 +383,8 @@ func loginHandler(c *gin.Context) {
 
 	// Security Constraints: MFA is required for admin logins once enrolled.
 	// Hold the session at a password-only checkpoint until the TOTP code is
-	// verified via /auth/mfa/verify.
+	// verified via /auth/mfa/verify. Admins not yet enrolled get a plain
+	// session that AdminMiddleware refuses until they enroll.
 	if user.IsAdmin && user.MFAEnabled {
 		mfaToken, mfaExpiry, err := issueMFAToken(user)
 		if err != nil {
@@ -391,7 +399,7 @@ func loginHandler(c *gin.Context) {
 		return
 	}
 
-	if err := respondWithIssuedTokens(c, user); err != nil {
+	if err := respondWithIssuedTokens(c, user, false); err != nil {
 		return
 	}
 
@@ -405,14 +413,14 @@ func loginHandler(c *gin.Context) {
 // respondWithIssuedTokens issues an access/refresh token pair for user,
 // persists the refresh token, and writes the AuthTokenResponse. Shared by
 // loginHandler and mfaVerifyHandler so both paths end a session the same way.
-func respondWithIssuedTokens(c *gin.Context, user UserRecord) error {
-	accessToken, accessExpiry, err := issueAccessToken(user)
+func respondWithIssuedTokens(c *gin.Context, user UserRecord, mfa bool) error {
+	accessToken, accessExpiry, err := issueAccessToken(user, mfa)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_issue_access_token", "details": err.Error()})
 		return err
 	}
 
-	refreshToken, refreshExpiry, err := issueRefreshToken(user)
+	refreshToken, refreshExpiry, err := issueRefreshToken(user, mfa)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_issue_refresh_token", "details": err.Error()})
 		return err
@@ -469,14 +477,16 @@ func refreshHandler(c *gin.Context) {
 		return
 	}
 
-	// Issue new tokens
-	newAccessToken, accessExpiry, err := issueAccessToken(user)
+	// Issue new tokens. The second-factor mark survives rotation only while
+	// the account still has MFA enabled — disabling it downgrades sessions.
+	sessionMFA := claims.MFA && user.MFAEnabled
+	newAccessToken, accessExpiry, err := issueAccessToken(user, sessionMFA)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_issue_access_token", "details": err.Error()})
 		return
 	}
 
-	newRefreshToken, refreshExpiry, err := issueRefreshToken(user)
+	newRefreshToken, refreshExpiry, err := issueRefreshToken(user, sessionMFA)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_issue_refresh_token", "details": err.Error()})
 		return
@@ -544,16 +554,17 @@ func createAPIKeyHandler(c *gin.Context) {
 // AuthMiddleware creates authentication middleware
 func AuthMiddleware(allowAPIKey bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		user, impersonatorID, err := authenticateRequest(c, allowAPIKey)
+		user, session, err := authenticateRequest(c, allowAPIKey)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized", "details": err.Error()})
 			return
 		}
 
 		c.Set(currentUserContextKey, user)
-		if impersonatorID != "" {
-			c.Set(impersonatorContextKey, impersonatorID)
+		if session.Impersonator != "" {
+			c.Set(impersonatorContextKey, session.Impersonator)
 		}
+		c.Set(sessionMFAContextKey, session.MFA)
 		c.Next()
 	}
 }
@@ -561,12 +572,11 @@ func AuthMiddleware(allowAPIKey bool) gin.HandlerFunc {
 // AdminMiddleware restricts a route group to internal System Administrators.
 // It must run after AuthMiddleware(false) so currentAuthUser(c) is populated.
 //
-// MFA is opt-in, not enforced here: an admin can enroll voluntarily via
-// POST /auth/mfa/enroll + /enable (both under plain AuthMiddleware, not this
-// one), and once enrolled, loginHandler holds their session at the TOTP
-// checkpoint (see "Security Constraints" comment there). This middleware only
-// checks IsAdmin — it does not require MFAEnabled — so admin panel access
-// never depends on enrollment status.
+// Security Constraints: admin access requires MFA. The account must have MFA
+// enabled AND this session must have passed the second factor (the token's
+// mfa claim). An admin without MFA can still sign in and enroll via
+// POST /auth/mfa/enroll + /enable (plain AuthMiddleware, not this one);
+// mfaEnableHandler then hands back an MFA-marked session.
 func AdminMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		user, ok := currentAuthUser(c)
@@ -576,6 +586,14 @@ func AdminMiddleware() gin.HandlerFunc {
 		}
 		if !user.IsAdmin {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "forbidden", "details": "admin access required"})
+			return
+		}
+		if !user.MFAEnabled || !currentSessionMFA(c) {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"error":       "mfa_required",
+				"details":     "admin access requires a session verified with multi-factor authentication",
+				"mfaEnrolled": user.MFAEnabled,
+			})
 			return
 		}
 		c.Next()
@@ -615,6 +633,17 @@ func ImpersonationReadOnlyMiddleware() gin.HandlerFunc {
 	}
 }
 
+// currentSessionMFA reports whether the request's token was issued after a
+// second factor was verified.
+func currentSessionMFA(c *gin.Context) bool {
+	value, ok := c.Get(sessionMFAContextKey)
+	if !ok {
+		return false
+	}
+	mfa, ok := value.(bool)
+	return ok && mfa
+}
+
 // currentAuthUser extracts the authenticated user from context
 func currentAuthUser(c *gin.Context) (UserRecord, bool) {
 	value, ok := c.Get(currentUserContextKey)
@@ -649,28 +678,34 @@ func currentUserDeployment(c *gin.Context) (UserRecord, DeploymentRecord, bool) 
 	return user, deployment, true
 }
 
-// authenticateRequest authenticates the request using various methods. The
-// second return value is the acting admin's user ID when the token was
-// issued by issueImpersonationToken, empty otherwise.
-func authenticateRequest(c *gin.Context, allowAPIKey bool) (UserRecord, string, error) {
+// authSession is what a request's credential says about its session beyond
+// the user: the acting admin's ID for impersonation tokens, and whether a
+// second factor was verified. API keys never carry either.
+type authSession struct {
+	Impersonator string
+	MFA          bool
+}
+
+// authenticateRequest authenticates the request using various methods.
+func authenticateRequest(c *gin.Context, allowAPIKey bool) (UserRecord, authSession, error) {
 	// Try Bearer token first
 	if bearerToken := extractBearerToken(c.GetHeader("Authorization")); bearerToken != "" {
 		claims, err := parseAndValidateToken(bearerToken, tokenTypeAccess)
 		if err != nil {
-			return UserRecord{}, "", fmt.Errorf("invalid bearer token: %w", err)
+			return UserRecord{}, authSession{}, fmt.Errorf("invalid bearer token: %w", err)
 		}
 		user, err := deploymentStore.GetUserByID(c.Request.Context(), claims.Subject)
-		return user, claims.Impersonator, err
+		return user, authSession{Impersonator: claims.Impersonator, MFA: claims.MFA}, err
 	}
 
 	// Try query token (for WebSocket support)
 	if queryToken := strings.TrimSpace(c.Query("token")); queryToken != "" {
 		claims, err := parseAndValidateToken(queryToken, tokenTypeAccess)
 		if err != nil {
-			return UserRecord{}, "", fmt.Errorf("invalid query token: %w", err)
+			return UserRecord{}, authSession{}, fmt.Errorf("invalid query token: %w", err)
 		}
 		user, err := deploymentStore.GetUserByID(c.Request.Context(), claims.Subject)
-		return user, claims.Impersonator, err
+		return user, authSession{Impersonator: claims.Impersonator, MFA: claims.MFA}, err
 	}
 
 	// Try API key if allowed
@@ -678,13 +713,13 @@ func authenticateRequest(c *gin.Context, allowAPIKey bool) (UserRecord, string, 
 		if apiKey := extractAPIKey(c); apiKey != "" {
 			user, err := deploymentStore.GetUserByAPIKey(c.Request.Context(), apiKey)
 			if err != nil {
-				return UserRecord{}, "", fmt.Errorf("invalid API key: %w", err)
+				return UserRecord{}, authSession{}, fmt.Errorf("invalid API key: %w", err)
 			}
-			return user, "", nil
+			return user, authSession{}, nil
 		}
 	}
 
-	return UserRecord{}, "", fmt.Errorf("no valid authentication credentials provided")
+	return UserRecord{}, authSession{}, fmt.Errorf("no valid authentication credentials provided")
 }
 
 // extractBearerToken extracts Bearer token from Authorization header

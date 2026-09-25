@@ -104,6 +104,9 @@ func run() error {
 	// restart, or whose failure couldn't be written back).
 	go jobs.RunStuckDeploymentReconciler(context.Background())
 
+	// Flag sustained crypto-mining-like CPU load (Admin panel, Module C).
+	go RunRiskAlertSweeper(context.Background(), deploymentStore, getDurationEnv("GRAVYFLOW_RISK_SWEEP_INTERVAL", defaultRiskSweepInterval))
+
 	githubAppLogStartup()
 
 	// Setup router

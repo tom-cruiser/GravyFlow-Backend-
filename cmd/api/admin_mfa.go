@@ -106,6 +106,40 @@ func (s *DeploymentStore) EnableMFA(ctx context.Context, userID string) error {
 	return err
 }
 
+// ConsumeMFARecoveryCode redeems one recovery code by removing its hash from
+// the stored set. Atomic: two concurrent logins with the same code can't
+// both succeed. Returns false when the code isn't in the set.
+func (s *DeploymentStore) ConsumeMFARecoveryCode(ctx context.Context, userID string, hashedCode string) (bool, error) {
+	if s == nil || s.pool == nil {
+		return false, &StoreError{Type: ErrDatabase, Message: "deployment store is not initialized"}
+	}
+	tag, err := s.pool.Exec(ctx, `
+UPDATE users
+SET mfa_recovery_codes = array_remove(mfa_recovery_codes, $1)
+WHERE id = $2 AND $1 = ANY(mfa_recovery_codes)
+`, hashedCode, userID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// canonicalRecoveryCode normalises user input to the form generateRecoveryCode
+// hashes (uppercase hex, no hyphen or spaces). Returns "" when the input
+// can't be a recovery code, so TOTP-looking input never hits the database.
+func canonicalRecoveryCode(code string) string {
+	code = strings.ToUpper(strings.NewReplacer("-", "", " ", "").Replace(strings.TrimSpace(code)))
+	if len(code) != 10 {
+		return ""
+	}
+	for _, r := range code {
+		if !(r >= '0' && r <= '9') && !(r >= 'A' && r <= 'F') {
+			return ""
+		}
+	}
+	return code
+}
+
 // DisableMFA turns MFA off and clears the stored secret.
 func (s *DeploymentStore) DisableMFA(ctx context.Context, userID string) error {
 	if s == nil || s.pool == nil {
@@ -134,6 +168,13 @@ func mfaEnrollHandler(c *gin.Context) {
 	}
 	if !user.IsAdmin {
 		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden", "details": "MFA enrollment is limited to admin accounts"})
+		return
+	}
+	// Re-enrolling would overwrite the active secret and switch MFA off
+	// (SetPendingMFASecret), letting any session replace the factor. Turning
+	// MFA off first requires the password via /profile/mfa/disable.
+	if user.MFAEnabled {
+		c.JSON(http.StatusConflict, gin.H{"error": "mfa_already_enabled", "details": "disable MFA before enrolling a new authenticator"})
 		return
 	}
 
@@ -189,8 +230,22 @@ func mfaEnableHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_enable_mfa", "details": err.Error()})
 		return
 	}
+	fresh.MFAEnabled = true
 
-	c.JSON(http.StatusOK, gin.H{"message": "mfa enabled"})
+	// Sessions opened before enrollment never passed a second factor; revoke
+	// their refresh tokens so they can't linger, then hand this caller an
+	// MFA-marked pair — the code above just proved possession of the factor.
+	if err := deploymentStore.RevokeAllUserTokens(c.Request.Context(), user.ID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_revoke_sessions", "details": err.Error()})
+		return
+	}
+
+	actorID, actorEmail := auditActorFromContext(c)
+	if logErr := RecordAuditLog(c.Request.Context(), actorID, actorEmail, "admin.mfa.enabled", "user", user.ID, nil, c.ClientIP()); logErr != nil {
+		fmt.Printf("[WARN] failed to record audit log for admin.mfa.enabled on %q: %v\n", user.ID, logErr)
+	}
+
+	_ = respondWithIssuedTokens(c, fresh, true)
 }
 
 type MFAVerifyRequest struct {
@@ -199,8 +254,8 @@ type MFAVerifyRequest struct {
 }
 
 // mfaVerifyHandler exchanges a password-only mfaToken plus a live TOTP code
-// for real access/refresh tokens, completing the login flow started in
-// loginHandler when the account has MFA enabled.
+// — or one unused recovery code — for real access/refresh tokens, completing
+// the login flow started in loginHandler when the account has MFA enabled.
 func mfaVerifyHandler(c *gin.Context) {
 	var req MFAVerifyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -220,12 +275,32 @@ func mfaVerifyHandler(c *gin.Context) {
 		return
 	}
 
-	if !user.MFAEnabled || !verifyTOTPCode(user.MFATOTPSecret, req.Code) {
+	if !user.MFAEnabled {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_mfa_code"})
 		return
 	}
 
-	if err := respondWithIssuedTokens(c, user); err != nil {
+	if !verifyTOTPCode(user.MFATOTPSecret, req.Code) {
+		recovery := canonicalRecoveryCode(req.Code)
+		if recovery == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_mfa_code"})
+			return
+		}
+		redeemed, err := deploymentStore.ConsumeMFARecoveryCode(c.Request.Context(), user.ID, hashToken(recovery))
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_verify_recovery_code", "details": err.Error()})
+			return
+		}
+		if !redeemed {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_mfa_code"})
+			return
+		}
+		if logErr := RecordAuditLog(c.Request.Context(), &user.ID, user.Email, "admin.mfa.recovery_code.used", "user", user.ID, nil, c.ClientIP()); logErr != nil {
+			fmt.Printf("[WARN] failed to record audit log for admin.mfa.recovery_code.used on %q: %v\n", user.ID, logErr)
+		}
+	}
+
+	if err := respondWithIssuedTokens(c, user, true); err != nil {
 		return
 	}
 

@@ -254,12 +254,15 @@ func adminChangePasswordHandler(c *gin.Context) {
 			return
 		}
 
-		accessToken, accessExpiry, err := issueAccessToken(fresh)
+		// Keep this session's second-factor mark: rotating the password
+		// shouldn't drop an admin out of the panel.
+		sessionMFA := currentSessionMFA(c) && fresh.MFAEnabled
+		accessToken, accessExpiry, err := issueAccessToken(fresh, sessionMFA)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_issue_access_token", "details": err.Error()})
 			return
 		}
-		refreshToken, refreshExpiry, err := issueRefreshToken(fresh)
+		refreshToken, refreshExpiry, err := issueRefreshToken(fresh, sessionMFA)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_issue_refresh_token", "details": err.Error()})
 			return
@@ -326,6 +329,12 @@ func adminMFADisableHandler(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "mfa_not_enabled"})
 		return
 	}
+	// A session that never passed the second factor (one opened before
+	// enrollment) mustn't be able to remove it, even with the password.
+	if !currentSessionMFA(c) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "mfa_required", "details": "sign in again with your authenticator to disable MFA"})
+		return
+	}
 
 	if err := deploymentStore.DisableMFA(c.Request.Context(), caller.ID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_disable_mfa", "details": err.Error()})
@@ -365,10 +374,8 @@ func generateRecoveryCode() (display string, hashed string, err error) {
 // plaintext codes are returned exactly once in this response; only their
 // SHA-256 hashes are persisted, so the caller must save them immediately.
 //
-// Note: this endpoint generates and stores codes; it does not add a
-// code-redemption step to the login flow (mfaVerifyHandler in admin_mfa.go
-// still only accepts a live TOTP code). Wiring recovery-code login is a
-// separate change to that handler and is out of scope here.
+// Each code is redeemable once in place of a TOTP code at /auth/mfa/verify
+// (mfaVerifyHandler in admin_mfa.go).
 func adminRegenerateRecoveryCodesHandler(c *gin.Context) {
 	caller, ok := currentAuthUser(c)
 	if !ok {
@@ -383,6 +390,10 @@ func adminRegenerateRecoveryCodesHandler(c *gin.Context) {
 	}
 	if !fresh.MFAEnabled {
 		c.JSON(http.StatusConflict, gin.H{"error": "mfa_not_enabled", "details": "enable MFA before generating recovery codes"})
+		return
+	}
+	if !currentSessionMFA(c) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "mfa_required", "details": "sign in again with your authenticator to generate recovery codes"})
 		return
 	}
 

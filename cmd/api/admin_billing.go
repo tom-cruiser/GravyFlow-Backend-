@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 )
 
 // ============================================================================
@@ -25,6 +28,10 @@ const (
 	// sustained crypto-mining load rather than normal request traffic.
 	riskScoreHighCPU     = 75
 	riskCPUCoreThreshold = 1.8 // cores; compared against ContainerStats.CPUUsage
+	// riskSustainedSamples consecutive sweeps above the threshold before an
+	// alert opens (~3 minutes at the default one-minute interval).
+	riskSustainedSamples     = 3
+	defaultRiskSweepInterval = time.Minute
 )
 
 // ============================================================================
@@ -109,53 +116,130 @@ type RiskAlert struct {
 	ResolvedAt   *time.Time `json:"resolvedAt"`
 }
 
-// ComputeRiskAlerts samples live CPU usage (via GetContainerStats, same real
-// Docker stats path as the cluster overview) across every running deployment
-// and opens a risk_alerts row for anything that looks like sustained
-// crypto-mining load. There is no background scheduler in this codebase
-// (see Agents.md's zero-mock/no-placeholder policy — adding a fake cron
-// runner would be worse than not having one); this runs on demand when an
-// admin opens the Fraud & Abuse panel, which is an accurate reflection of
-// what heuristic is actually implemented today.
-func (s *DeploymentStore) ComputeRiskAlerts(ctx context.Context) ([]RiskAlert, error) {
-	running, err := s.adminListRunningContainers(ctx)
+// riskSweeper samples live CPU usage (via GetContainerStats, same real Docker
+// stats path as the cluster overview) across every running deployment on a
+// fixed interval, and opens a risk_alerts row only once a deployment has
+// stayed above riskCPUCoreThreshold for riskSustainedSamples consecutive
+// samples — a single busy moment (a build step, a traffic spike) never alerts.
+type riskSweeper struct {
+	store    *DeploymentStore
+	required int
+	hot      map[string]int // deploymentID -> consecutive high-CPU samples
+}
+
+func newRiskSweeper(store *DeploymentStore) *riskSweeper {
+	return &riskSweeper{store: store, required: riskSustainedSamples, hot: make(map[string]int)}
+}
+
+// observe records one sample round — the IDs currently above the threshold —
+// and returns those that have now been high for the required run. Anything
+// not in this round resets. Returning the same ID on later rounds is fine:
+// openRiskAlert dedupes against the deployment's open alert, and re-alerts
+// if an admin resolved it but the load came back.
+func (r *riskSweeper) observe(highIDs []string) []string {
+	next := make(map[string]int, len(highIDs))
+	sustained := make([]string, 0)
+	for _, id := range highIDs {
+		next[id] = r.hot[id] + 1
+		if next[id] >= r.required {
+			sustained = append(sustained, id)
+		}
+	}
+	r.hot = next
+	return sustained
+}
+
+// sweep runs one sample round and opens alerts for sustained load. It returns
+// the alerts newly opened.
+func (r *riskSweeper) sweep(ctx context.Context) ([]RiskAlert, error) {
+	running, err := r.store.adminListRunningContainers(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	statsCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
+	byID := make(map[string]AdminDeploymentSummary, len(running))
+	cpuByID := make(map[string]float64, len(running))
+	highIDs := make([]string, 0)
+	for _, d := range running {
+		// Per-container timeout: one wedged container mustn't starve the
+		// rest of the round.
+		statsCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		stats, err := GetContainerStats(statsCtx, d.ContainerID)
+		cancel()
+		if err != nil || stats == nil || stats.CPUUsage < riskCPUCoreThreshold {
+			continue
+		}
+		byID[d.DeploymentID] = d
+		cpuByID[d.DeploymentID] = stats.CPUUsage
+		highIDs = append(highIDs, d.DeploymentID)
+	}
 
 	created := make([]RiskAlert, 0)
-	for _, d := range running {
-		stats, err := GetContainerStats(statsCtx, d.ContainerID)
-		if err != nil || stats == nil {
-			continue
+	for _, id := range r.observe(highIDs) {
+		d := byID[id]
+		reason := fmt.Sprintf("sustained high CPU usage consistent with crypto-mining (%.1f cores over %d consecutive samples)", cpuByID[id], r.hot[id])
+		alert, opened, err := r.store.openRiskAlert(ctx, d, riskScoreHighCPU, reason)
+		if err != nil {
+			return created, err
 		}
-		if stats.CPUUsage < riskCPUCoreThreshold {
-			continue
+		if opened {
+			created = append(created, alert)
 		}
+	}
+	return created, nil
+}
 
-		reason := "sustained high CPU usage consistent with crypto-mining"
-		var alert RiskAlert
-		err = s.pool.QueryRow(ctx, `
+// openRiskAlert inserts an open alert unless the deployment already has one.
+func (s *DeploymentStore) openRiskAlert(ctx context.Context, d AdminDeploymentSummary, score int, reason string) (RiskAlert, bool, error) {
+	var alert RiskAlert
+	err := s.pool.QueryRow(ctx, `
 INSERT INTO risk_alerts (user_id, deployment_id, risk_score, reason, status)
 SELECT $1, $2, $3, $4, 'open'
 WHERE NOT EXISTS (
 	SELECT 1 FROM risk_alerts WHERE deployment_id = $2 AND status = 'open'
 )
 RETURNING id::text, user_id::text, deployment_id::text, risk_score, reason, status, created_at
-`, d.OwnerUserID, d.DeploymentID, riskScoreHighCPU, reason).Scan(
-			&alert.ID, &alert.UserID, &alert.DeploymentID, &alert.RiskScore, &alert.Reason, &alert.Status, &alert.CreatedAt,
-		)
-		if err != nil {
-			continue // either a real DB error (surfaced on next list call) or an open alert already exists
-		}
-		alert.UserEmail = d.OwnerEmail
-		alert.AppName = d.AppName
-		created = append(created, alert)
+`, d.OwnerUserID, d.DeploymentID, score, reason).Scan(
+		&alert.ID, &alert.UserID, &alert.DeploymentID, &alert.RiskScore, &alert.Reason, &alert.Status, &alert.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return RiskAlert{}, false, nil // an open alert already exists
 	}
-	return created, nil
+	if err != nil {
+		return RiskAlert{}, false, err
+	}
+	alert.UserEmail = d.OwnerEmail
+	alert.AppName = d.AppName
+	return alert, true, nil
+}
+
+// RunRiskAlertSweeper runs the abuse heuristic every interval until ctx is
+// done, so a miner is flagged whether or not an admin has the Abuse panel
+// open. GRAVYFLOW_RISK_SWEEP_INTERVAL sets the interval; 0 disables it.
+func RunRiskAlertSweeper(ctx context.Context, store *DeploymentStore, interval time.Duration) {
+	if store == nil || interval <= 0 {
+		log.Printf("[INFO] risk alert sweeper disabled")
+		return
+	}
+	sweeper := newRiskSweeper(store)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		created, err := sweeper.sweep(ctx)
+		if err != nil {
+			log.Printf("[WARN] risk alert sweeper: %v", err)
+		}
+		for _, a := range created {
+			log.Printf("[WARN] risk alert opened: %s (owner %s): %s", a.AppName, a.UserEmail, a.Reason)
+		}
+	}
 }
 
 func (s *DeploymentStore) ListRiskAlerts(ctx context.Context, status string) ([]RiskAlert, error) {
@@ -390,13 +474,8 @@ func adminGetCreditBalanceHandler(c *gin.Context) {
 // ============================================================================
 
 func adminListRiskAlertsHandler(c *gin.Context) {
-	// Refresh alerts from live container stats before listing, so opening
-	// this panel always reflects current usage rather than a stale sweep.
-	if _, err := deploymentStore.ComputeRiskAlerts(c.Request.Context()); err != nil {
-		// Non-fatal: fall through and return whatever alerts already exist.
-		_ = err
-	}
-
+	// Alerts are opened by RunRiskAlertSweeper in the background; listing
+	// never samples Docker, so the panel loads fast however many apps run.
 	alerts, err := deploymentStore.ListRiskAlerts(c.Request.Context(), c.Query("status"))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_load_risk_alerts", "details": err.Error()})

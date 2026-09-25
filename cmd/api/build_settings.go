@@ -115,6 +115,20 @@ func resolveDockerfile(repoRoot string, rel string) (string, error) {
 	return resolved, nil
 }
 
+// effectiveDockerfilePath is the Dockerfile a build should use: the explicit
+// setting, else a Dockerfile at the repository root (the Railway/Render
+// convention — a repo that ships one knows how it must be built better than
+// the generated templates do), else "" for language detection.
+func effectiveDockerfilePath(repoRoot string, configured string) string {
+	if strings.TrimSpace(configured) != "" {
+		return configured
+	}
+	if _, err := resolveDockerfile(repoRoot, "Dockerfile"); err == nil {
+		return "Dockerfile"
+	}
+	return ""
+}
+
 // detectDockerfilePort returns the port from the Dockerfile's last EXPOSE
 // instruction (the final stage's, in a multi-stage build), or 0 if there is
 // none. "3001", "3001/tcp" and "$PORT"-style values are handled; only a

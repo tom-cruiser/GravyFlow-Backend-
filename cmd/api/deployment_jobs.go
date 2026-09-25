@@ -1068,14 +1068,15 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 			}
 			return DeploymentJobStatus{}, err
 		}
-		imageName, err = BuildCodeWithLogsAndDockerfile(deployment.AppPath, deployment.AppName, logs, buildSettings.DockerfilePath)
+		dockerfilePath := effectiveDockerfilePath(deployment.AppPath, buildSettings.DockerfilePath)
+		imageName, err = BuildCodeWithLogsAndDockerfile(deployment.AppPath, deployment.AppName, logs, dockerfilePath)
 		if err != nil {
 			if shouldReleaseOnError {
 				_ = deploymentStore.ReleaseDeploymentResources(ctx, payload.UserID, requestedCPU, requestedMemoryMB, requestedApps, requestedStorageMB)
 			}
 			// A monorepo built from its root fails with a bare "no start
 			// command"; say what to do about it.
-			if buildSettings.DockerfilePath == "" && strings.Contains(err.Error(), "No start command could be found") {
+			if dockerfilePath == "" && strings.Contains(err.Error(), "No start command could be found") {
 				if hint := monorepoHint(deployment.AppPath); hint != "" {
 					err = fmt.Errorf("%w. %s", err, hint)
 				}
@@ -1088,8 +1089,8 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 		// (8080 by default). Persisted so the container, Caddy and the UI agree.
 		port := buildSettings.ContainerPort
 		source := "the service's port setting"
-		if port == 0 && buildSettings.DockerfilePath != "" {
-			if dockerfile, resolveErr := resolveDockerfile(deployment.AppPath, buildSettings.DockerfilePath); resolveErr == nil {
+		if port == 0 && dockerfilePath != "" {
+			if dockerfile, resolveErr := resolveDockerfile(deployment.AppPath, dockerfilePath); resolveErr == nil {
 				port = detectDockerfilePort(dockerfile)
 				source = "the Dockerfile's EXPOSE"
 			}

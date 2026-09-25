@@ -155,7 +155,7 @@ func issueImpersonationToken(admin UserRecord, target UserRecord) (string, time.
 
 // issueToken is the core token issuance function
 func issueToken(user UserRecord, tokenType string, ttl time.Duration, impersonator string, mfa bool) (string, time.Time, error) {
-	secret := []byte(envOrDefault("AUTH_JWT_SECRET", "dev-auth-secret-change-me-in-production"))
+	secret := authJWTSecret()
 	now := time.Now().UTC()
 	expiresAt := now.Add(ttl)
 
@@ -189,7 +189,7 @@ func issueToken(user UserRecord, tokenType string, ttl time.Duration, impersonat
 
 // parseAndValidateToken parses and validates a JWT token
 func parseAndValidateToken(tokenString string, expectedType string) (*authClaims, error) {
-	secret := []byte(envOrDefault("AUTH_JWT_SECRET", "dev-auth-secret-change-me-in-production"))
+	secret := authJWTSecret()
 
 	parsed, err := jwt.ParseWithClaims(tokenString, &authClaims{}, func(token *jwt.Token) (any, error) {
 		if token.Method != jwt.SigningMethodHS256 {

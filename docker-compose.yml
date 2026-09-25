@@ -7,7 +7,6 @@
 # Usage:
 #   docker-compose up -d                    # Start all services
 #   docker-compose --profile monitoring up -d  # Start with monitoring
-#   docker-compose --profile backup up -d      # Start with nightly pg_dump
 #   docker-compose down -v                  # Stop and remove volumes
 # ============================================================================
 
@@ -35,8 +34,10 @@ networks:
 # ============================================================================
 
 volumes:
+  # PostgreSQL 18 (matches the Neon primary) — a fresh volume; the old
+  # PostgreSQL 15 one (gravyflow-postgres-data) was empty and is left alone.
   postgres-data:
-    name: gravyflow-postgres-data
+    name: gravyflow-postgres18-data
   postgres-backup:
     name: gravyflow-postgres-backup
   redis-data:
@@ -58,24 +59,31 @@ volumes:
 
 services:
   # ==========================================================================
-  # POSTGRESQL
+  # POSTGRESQL — warm standby of the primary (Neon, DATABASE_URL)
   # ==========================================================================
+  # postgres-standby-sync copies the primary into it every
+  # STANDBY_SYNC_INTERVAL seconds. Failover when the primary is down:
+  #   set GRAVYFLOW_DB_TARGET=local in .env, then `docker compose up -d`
+  # (the sync pauses while that is set). Failback: scripts/db_failback.sh.
+  # Its major version must match the primary's for pg_dump/pg_restore.
   postgres:
-    image: postgres:15-alpine
+    image: postgres:18-alpine
     container_name: gravyflow-postgres
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-gravyflow}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_INITDB_ARGS: "--data-checksums"
-      PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      # 18+ images keep data under /var/lib/postgresql/18/docker and refuse a
+      # mount at the old /var/lib/postgresql/data path.
+      - postgres-data:/var/lib/postgresql
       - postgres-backup:/backup
       - ./db/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
       - ./db/migrations:/docker-entrypoint-initdb.d/migrations:ro
     ports:
-      - "${POSTGRES_PORT:-5433}:5432"
+      # Loopback only: the standby holds a full copy of the platform's data.
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
     networks:
       - gravyflow-network
     depends_on:
@@ -106,37 +114,31 @@ services:
       - "com.gravyflow.environment=${ENVIRONMENT:-development}"
 
   # ==========================================================================
-  # POSTGRES BACKUP
+  # POSTGRES STANDBY SYNC — primary (Neon) → local standby + daily backups
   # ==========================================================================
-  postgres-backup:
-    image: postgres:15-alpine
-    container_name: gravyflow-postgres-backup
+  # See scripts/standby_sync.sh. Backups land in the postgres-backup volume:
+  # primary-latest.dump (every sync) and primary-YYYYMMDD.dump (one a day).
+  postgres-standby-sync:
+    image: postgres:18-alpine
+    container_name: gravyflow-postgres-standby-sync
     environment:
+      SOURCE_DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL (the primary) in .env}
+      GRAVYFLOW_DB_TARGET: ${GRAVYFLOW_DB_TARGET:-}
       POSTGRES_HOST: postgres
       POSTGRES_DB: ${POSTGRES_DB:-gravyflow}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-      BACKUP_SCHEDULE: ${BACKUP_SCHEDULE:-0 2 * * *}
+      SYNC_INTERVAL_SECONDS: ${STANDBY_SYNC_INTERVAL:-900}
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
     volumes:
       - postgres-backup:/backup
-      - ./scripts/backup.sh:/backup.sh:ro
+      - ./scripts/standby_sync.sh:/standby_sync.sh:ro
+    entrypoint: ["sh", "/standby_sync.sh"]
     networks:
       - gravyflow-network
     depends_on:
       postgres:
         condition: service_healthy
-    # busybox crond reads /etc/crontabs/<user>, not /etc/crontab (which the
-    # old entrypoint wrote to, so no backup ever ran), and runs jobs with an
-    # empty environment — hence the /etc/backup.env snapshot backup.sh reads.
-    # $$ keeps Compose from interpolating; the container's env supplies it.
-    entrypoint:
-      - sh
-      - -c
-      - |
-        (umask 077 && export -p | grep -E ' (POSTGRES_|BACKUP_)' > /etc/backup.env)
-        echo "$$BACKUP_SCHEDULE /bin/sh /backup.sh >> /proc/1/fd/1 2>&1" > /etc/crontabs/root
-        exec crond -f -l 2
     restart: unless-stopped
     deploy:
       resources:
@@ -145,16 +147,14 @@ services:
           memory: 256M
         reservations:
           cpus: '0.1'
-          memory: 128M
+          memory: 64M
     logging:
       driver: "json-file"
       options:
         max-size: "5m"
         max-file: "2"
     labels:
-      - "com.gravyflow.service=postgres-backup"
-    profiles:
-      - backup
+      - "com.gravyflow.service=postgres-standby-sync"
 
   # ==========================================================================
   # REDIS
@@ -217,7 +217,7 @@ services:
   # "postgres" username, which is what made an earlier version of this fix
   # chown pgdata to the wrong owner (999:999, copied from the wrong tag) and
   # break a volume that was otherwise fine: gravyflow-api runs as uid 1000
-  # (Dockerfile's `gravyflow` user); postgres:15-alpine's `postgres` user is
+  # (Dockerfile's `gravyflow` user); postgres:18-alpine's `postgres` user is
   # 70:70; redis:7-alpine's `redis` user is 999:1000. Caddy runs as root, so
   # caddy-data needs nothing.
   gravyflow-volume-init:
@@ -294,8 +294,8 @@ services:
       DEBUG: ${DEBUG:-true}
       
       # Security (from .env)
-      AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-}
-      APP_ENV_ENCRYPTION_KEY: ${APP_ENV_ENCRYPTION_KEY:-}
+      AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:?set AUTH_JWT_SECRET in .env (openssl rand -base64 48)}
+      APP_ENV_ENCRYPTION_KEY: ${APP_ENV_ENCRYPTION_KEY:?set APP_ENV_ENCRYPTION_KEY in .env (openssl rand -base64 32)}
       
       # Database Connection
       PGCONNECTATTEMPTS: ${PGCONNECTATTEMPTS:-30}
@@ -362,8 +362,9 @@ services:
     depends_on:
       gravyflow-volume-init:
         condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
+      # No depends_on postgres: with the primary (Neon) in use the API must
+      # not wait on the standby. After failover (GRAVYFLOW_DB_TARGET=local)
+      # the API retries its connection (PGCONNECTATTEMPTS) until it's up.
       redis:
         condition: service_healthy
     healthcheck:
@@ -476,7 +477,7 @@ services:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
       # Loopback-only (see ports); Grafana forces a change of the admin/admin
       # default on first login.
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in .env}
       GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
       GF_SERVER_ROOT_URL: ${GRAFANA_URL:-http://localhost:3001}
     volumes:

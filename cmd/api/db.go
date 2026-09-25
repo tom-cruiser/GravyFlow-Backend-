@@ -480,7 +480,9 @@ func buildPostgresConnString() (string, error) {
 	}
 	user := strings.TrimSpace(os.Getenv("PGUSER"))
 	password := os.Getenv("PGPASSWORD")
-	if useLocalDevPostgresDefaults(host, dbName) && !(local && user != "") {
+	// Only a bare localhost dev database with NO credentials configured gets
+	// the dev-only defaults; configured credentials are never overridden.
+	if useLocalDevPostgresDefaults(host, dbName) && user == "" && password == "" {
 		user = "gravyflow"
 		password = "gravyflow"
 	}

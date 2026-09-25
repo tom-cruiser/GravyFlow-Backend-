@@ -308,7 +308,7 @@ type githubStateClaims struct {
 
 func githubStateSecret() []byte {
 	// Derived, so a state can never be replayed as an access token.
-	mac := hmac.New(sha256.New, []byte(envOrDefault("AUTH_JWT_SECRET", "dev-auth-secret-change-me-in-production")))
+	mac := hmac.New(sha256.New, authJWTSecret())
 	mac.Write([]byte("gravyflow/github-app-install-state"))
 	return mac.Sum(nil)
 }

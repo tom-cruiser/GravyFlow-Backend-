@@ -77,6 +77,9 @@ func main() {
 func run() error {
 	// Load configuration
 	config := loadConfig()
+	if err := validateRequiredSecrets(); err != nil {
+		return err
+	}
 
 	// Setup logging
 	setupLogging(config.Debug)

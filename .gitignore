@@ -19,3 +19,9 @@ secret/*
 # Node / frontend (lives in a separate repo)
 node_modules/
 *.tsbuildinfo
+
+# database dumps (scripts/db_failback.sh, standby backups)
+*.dump
+
+# Compiled binary at the repo root (go build -o api ./cmd/api)
+/api

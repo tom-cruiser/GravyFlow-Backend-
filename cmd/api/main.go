@@ -363,6 +363,7 @@ func setupRouter(config ServerConfig) *gin.Engine {
 				admin.POST("/deployments/:id/restart", adminRestartServiceHandler)
 				admin.POST("/deployments/:id/force-stop", adminForceStopHandler)
 				admin.POST("/deployments/:id/purge-cache", adminPurgeCacheHandler)
+				admin.PATCH("/deployments/:id/resources", adminUpdateDeploymentResourcesHandler)
 				admin.GET("/deployments/:id/env", adminGetDeploymentEnvHandler)
 
 				// Module C: Billing, Quotas & Abuse Control
@@ -768,8 +769,9 @@ func deleteAppHandler(c *gin.Context) {
 		}
 	}
 
+	cpu, memoryMB := deploymentResources(c.Request.Context(), deployment.DeploymentID)
 	if err := deploymentStore.ReleaseDeploymentResources(
-		c.Request.Context(), user.ID, defaultDeployCPU, defaultDeployMemoryMB, defaultDeployApps, 0,
+		c.Request.Context(), user.ID, cpu, memoryMB, defaultDeployApps, 0,
 	); err != nil {
 		log.Printf("[WARN] delete app: failed to release quota for user %q, deployment %q: %v", user.ID, deployment.DeploymentID, err)
 	}

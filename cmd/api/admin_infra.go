@@ -25,6 +25,15 @@ type AdminDeploymentSummary struct {
 	DeploymentRecord
 	OwnerUserID string `json:"ownerUserId"`
 	OwnerEmail  string `json:"ownerEmail"`
+	// Container limits as configured (0 = platform default) and as applied.
+	MemoryMB          int     `json:"memoryMB"`
+	CPU               float64 `json:"cpu"`
+	EffectiveMemoryMB int64   `json:"effectiveMemoryMB"`
+	EffectiveCPU      float64 `json:"effectiveCpu"`
+}
+
+func (d *AdminDeploymentSummary) fillEffectiveResources() {
+	d.EffectiveCPU, d.EffectiveMemoryMB = BuildSettings{MemoryMB: d.MemoryMB, CPU: d.CPU}.resources()
 }
 
 type PaginatedAdminDeployments struct {
@@ -64,20 +73,21 @@ SELECT
 	d.id::text, d.project_id::text, d.app_name, d.source_repo_url, d.app_path, d.port_map,
 	COALESCE(d.image_name, ''), COALESCE(d.container_id, ''), COALESCE(d.container_name, ''),
 	d.status::text, COALESCE(d.status_message, ''), d.started_at, d.finished_at, d.created_at, d.updated_at,
-	d.owner_user_id::text, u.email
+	d.owner_user_id::text, u.email, d.memory_mb, d.cpu
 FROM deployments d
 JOIN users u ON u.id = d.owner_user_id
 WHERE d.id = $1 AND d.deleted_at IS NULL
 `, deploymentID).Scan(
 		&d.DeploymentID, &d.ProjectID, &d.AppName, &d.SourceRepoURL, &d.AppPath, &d.PortMap,
 		&d.ImageName, &d.ContainerID, &d.ContainerName, &d.Status, &d.StatusMessage, &startedAt, &finishedAt,
-		&d.CreatedAt, &d.UpdatedAt, &d.OwnerUserID, &d.OwnerEmail,
+		&d.CreatedAt, &d.UpdatedAt, &d.OwnerUserID, &d.OwnerEmail, &d.MemoryMB, &d.CPU,
 	)
 	if err != nil {
 		return AdminDeploymentSummary{}, &StoreError{Type: ErrNotFound, Message: "deployment not found", Err: err}
 	}
 	d.StartedAt = startedAt
 	d.FinishedAt = finishedAt
+	d.fillEffectiveResources()
 	return d, nil
 }
 
@@ -113,7 +123,7 @@ SELECT
 	d.id::text, d.project_id::text, d.app_name, d.source_repo_url, d.app_path, d.port_map,
 	COALESCE(d.image_name, ''), COALESCE(d.container_id, ''), COALESCE(d.container_name, ''),
 	d.status::text, COALESCE(d.status_message, ''), d.started_at, d.finished_at, d.created_at, d.updated_at,
-	d.owner_user_id::text, u.email
+	d.owner_user_id::text, u.email, d.memory_mb, d.cpu
 FROM deployments d
 JOIN users u ON u.id = d.owner_user_id
 `+whereClause+`
@@ -130,11 +140,12 @@ LIMIT $`+strconv.Itoa(argIndex)+` OFFSET $`+strconv.Itoa(argIndex+1), listArgs..
 		var startedAt, finishedAt *time.Time
 		if err := rows.Scan(&d.DeploymentID, &d.ProjectID, &d.AppName, &d.SourceRepoURL, &d.AppPath, &d.PortMap,
 			&d.ImageName, &d.ContainerID, &d.ContainerName, &d.Status, &d.StatusMessage, &startedAt, &finishedAt,
-			&d.CreatedAt, &d.UpdatedAt, &d.OwnerUserID, &d.OwnerEmail); err != nil {
+			&d.CreatedAt, &d.UpdatedAt, &d.OwnerUserID, &d.OwnerEmail, &d.MemoryMB, &d.CPU); err != nil {
 			return PaginatedAdminDeployments{}, &StoreError{Type: ErrDatabase, Message: "failed to scan deployment", Err: err}
 		}
 		d.StartedAt = startedAt
 		d.FinishedAt = finishedAt
+		d.fillEffectiveResources()
 		items = append(items, d)
 	}
 	if err := rows.Err(); err != nil {
@@ -320,6 +331,100 @@ func adminRestartServiceHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{"message": "service restart queued", "deploymentId": deploymentID, "jobId": jobID})
+}
+
+// AdminUpdateResourcesRequest sets a hosted app's container limits. A nil
+// field is left unchanged; 0 resets it to the platform default.
+type AdminUpdateResourcesRequest struct {
+	MemoryMB *int     `json:"memoryMB"`
+	CPU      *float64 `json:"cpu"`
+	// ApplyNow restarts a running service (reusing its image) so the new
+	// limits take effect immediately instead of on the next deploy.
+	ApplyNow bool `json:"applyNow"`
+}
+
+// adminUpdateDeploymentResourcesHandler is the "[Resources]" action: raise or
+// lower any existing service's memory/CPU without touching its owner's build
+// settings otherwise. The owner's quota is not enforced here (an admin may
+// deliberately exceed it), but the response warns when it would be, since a
+// later redeploy by the owner can then be refused.
+func adminUpdateDeploymentResourcesHandler(c *gin.Context) {
+	ctx := c.Request.Context()
+	deploymentID := strings.TrimSpace(c.Param("id"))
+	deployment, err := deploymentStore.AdminGetDeploymentByID(ctx, deploymentID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "deployment_not_found", "details": err.Error()})
+		return
+	}
+
+	var req AdminUpdateResourcesRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		sendBadRequest(c, "invalid JSON body", err)
+		return
+	}
+	if req.MemoryMB == nil && req.CPU == nil {
+		sendBadRequest(c, "set memoryMB and/or cpu", nil)
+		return
+	}
+	memoryMB, cpu := deployment.MemoryMB, deployment.CPU
+	if req.MemoryMB != nil {
+		memoryMB = *req.MemoryMB
+	}
+	if req.CPU != nil {
+		cpu = *req.CPU
+	}
+	if err := validateAppResources(memoryMB, cpu); err != nil {
+		sendBadRequest(c, err.Error(), nil)
+		return
+	}
+
+	if err := deploymentStore.SetDeploymentResources(ctx, deploymentID, memoryMB, cpu); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_update_resources", "details": err.Error()})
+		return
+	}
+	effectiveCPU, effectiveMemoryMB := BuildSettings{MemoryMB: memoryMB, CPU: cpu}.resources()
+
+	var quotaWarning string
+	if summary, err := deploymentStore.GetQuotaSummary(ctx, deployment.OwnerUserID); err == nil {
+		if effectiveMemoryMB > summary.Quota.MaxMemoryMB || effectiveCPU > summary.Quota.MaxCPU {
+			quotaWarning = fmt.Sprintf("exceeds the owner's quota (%d MB / %.2f CPU); raise it or the owner's next deploy may be refused",
+				summary.Quota.MaxMemoryMB, summary.Quota.MaxCPU)
+		}
+	}
+
+	var jobID string
+	if req.ApplyNow && deployment.Status == string(DeploymentStatusRunning) {
+		jobID, err = deploymentJobs.EnqueueDeployment(ctx, deployment.OwnerUserID, deploymentID, false)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "saved_but_failed_to_restart", "details": err.Error()})
+			return
+		}
+	}
+
+	actorID, actorEmail := auditActorFromContext(c)
+	if err := RecordAuditLog(ctx, actorID, actorEmail, "deployment.resources.update", "deployment", deploymentID, map[string]any{
+		"ownerEmail":  deployment.OwnerEmail,
+		"oldMemoryMB": deployment.MemoryMB, "newMemoryMB": memoryMB,
+		"oldCpu": deployment.CPU, "newCpu": cpu,
+		"restartJobId": jobID,
+	}, c.ClientIP()); err != nil {
+		fmt.Printf("[WARN] failed to record audit log for deployment.resources.update on %q: %v\n", deploymentID, err)
+	}
+
+	message := "resources saved; they apply on the next restart or deploy"
+	if jobID != "" {
+		message = "resources saved; restart queued to apply them"
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message":           message,
+		"deploymentId":      deploymentID,
+		"memoryMB":          memoryMB,
+		"cpu":               cpu,
+		"effectiveMemoryMB": effectiveMemoryMB,
+		"effectiveCpu":      effectiveCPU,
+		"jobId":             jobID,
+		"quotaWarning":      quotaWarning,
+	})
 }
 
 type AdminForceStopRequest struct {

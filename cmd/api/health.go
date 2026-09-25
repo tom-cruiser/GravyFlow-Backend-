@@ -525,6 +525,8 @@ func (m *DeploymentHealthManager) attemptRestart(ctx context.Context, target Run
 		return
 	}
 
+	cpu, memoryMB := deploymentResources(ctx, target.DeploymentID)
+
 	// Restart container
 	restartedContainerID, err := RestartContainer(
 		target.ContainerID,
@@ -533,8 +535,8 @@ func (m *DeploymentHealthManager) attemptRestart(ctx context.Context, target Run
 		target.DeploymentID,
 		normalizePortMap(target.PortMap),
 		loadDockerEnvList(envMap),
-		defaultDeployMemoryMB,
-		defaultDeployCPU,
+		memoryMB,
+		cpu,
 	)
 	if err != nil {
 		m.handleRestartFailure(ctx, target, err)

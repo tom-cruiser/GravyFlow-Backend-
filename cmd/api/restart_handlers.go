@@ -296,8 +296,7 @@ func checkResourceAvailability(ctx context.Context, userID string, deployment De
 	}
 
 	// Check if we have enough resources
-	neededCPU := defaultDeployCPU
-	neededMemory := defaultDeployMemoryMB
+	neededCPU, neededMemory := deploymentResources(ctx, deployment.DeploymentID)
 
 	if summary.Available.MaxCPU < neededCPU {
 		return fmt.Errorf("insufficient CPU: available %.2f, needed %.2f", summary.Available.MaxCPU, neededCPU)

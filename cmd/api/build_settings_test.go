@@ -219,7 +219,7 @@ func TestBuildSettingsStoreRoundTrip(t *testing.T) {
 		t.Fatalf("defaults = %+v, %v; want empty settings", got, err)
 	}
 
-	want := BuildSettings{DockerfilePath: "services/auth-tenant/Dockerfile", ContainerPort: 3001}
+	want := BuildSettings{DockerfilePath: "services/auth-tenant/Dockerfile", ContainerPort: 3001, MemoryMB: 1536, CPU: 1}
 	if err := store.SetBuildSettings(ctx, id, want); err != nil {
 		t.Fatalf("SetBuildSettings: %v", err)
 	}
@@ -374,4 +374,39 @@ func TestBuildSettingsHandlers(t *testing.T) {
 	if w.Code == http.StatusOK {
 		t.Fatalf("another user could change this service's build settings: %d %s", w.Code, w.Body.String())
 	}
+}
+
+func TestAppResources(t *testing.T) {
+	for _, c := range []struct {
+		memoryMB int
+		cpu      float64
+		ok       bool
+	}{
+		{0, 0, true},
+		{1536, 1, true},
+		{minAppMemoryMB, minAppCPU, true},
+		{maxAppMemoryMB, maxAppCPU, true},
+		{64, 0, false},
+		{maxAppMemoryMB + 1, 0, false},
+		{0, 0.05, false},
+		{0, maxAppCPU + 1, false},
+		{-1, 0, false},
+	} {
+		err := BuildSettings{MemoryMB: c.memoryMB, CPU: c.cpu}.validatedErr()
+		if (err == nil) != c.ok {
+			t.Errorf("memoryMB=%d cpu=%v: err=%v, want ok=%v", c.memoryMB, c.cpu, err, c.ok)
+		}
+	}
+
+	if cpu, mem := (BuildSettings{}).resources(); cpu != defaultDeployCPU || mem != defaultDeployMemoryMB {
+		t.Errorf("unset resources = %v/%d, want the defaults", cpu, mem)
+	}
+	if cpu, mem := (BuildSettings{MemoryMB: 1536, CPU: 1}).resources(); cpu != 1 || mem != 1536 {
+		t.Errorf("set resources = %v/%d, want 1/1536", cpu, mem)
+	}
+}
+
+func (b BuildSettings) validatedErr() error {
+	_, err := b.validated()
+	return err
 }

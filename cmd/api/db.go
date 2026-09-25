@@ -1119,6 +1119,14 @@ ALTER TABLE deployments ADD COLUMN IF NOT EXISTS www_redirect_mode TEXT NOT NULL
 		{27, `
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS dockerfile_path TEXT NOT NULL DEFAULT '';
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_port INTEGER NOT NULL DEFAULT 0`},
+		// restart_handlers.go stamps last_restart_at; schema.sql has it but
+		// databases created before it never got the column.
+		{28, `
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS last_restart_at TIMESTAMPTZ`},
+		// Per-app container limits (build_settings.go); 0 = the defaults.
+		{29, `
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS memory_mb INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS cpu DOUBLE PRECISION NOT NULL DEFAULT 0`},
 	}
 
 	for _, migration := range migrations {

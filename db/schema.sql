@@ -231,6 +231,9 @@ CREATE TABLE IF NOT EXISTS deployments (
     -- Monorepo support (see db.go migration 27 and build_settings.go).
     dockerfile_path TEXT NOT NULL DEFAULT '',
     container_port INTEGER NOT NULL DEFAULT 0,
+    -- Per-app container limits (db.go migration 29); 0 = the defaults.
+    memory_mb INTEGER NOT NULL DEFAULT 0,
+    cpu DOUBLE PRECISION NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

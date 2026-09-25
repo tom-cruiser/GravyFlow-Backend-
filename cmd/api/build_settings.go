@@ -31,13 +31,25 @@ import (
 //	                 monorepo Dockerfiles are written: COPY packages/ ...)
 //	container_port   the port the app listens on; 0 = read the Dockerfile's
 //	                 EXPOSE, falling back to the default 8080
+//	memory_mb        the container's memory limit; 0 = defaultDeployMemoryMB
+//	cpu              the container's CPU limit in cores; 0 = defaultDeployCPU
+//	                 (a single-container app running several processes needs
+//	                 more than the defaults)
 
 type BuildSettings struct {
-	DockerfilePath string `json:"dockerfilePath"`
-	ContainerPort  int    `json:"containerPort"`
+	DockerfilePath string  `json:"dockerfilePath"`
+	ContainerPort  int     `json:"containerPort"`
+	MemoryMB       int     `json:"memoryMB"`
+	CPU            float64 `json:"cpu"`
 }
 
-const maxDockerfilePathLen = 200
+const (
+	maxDockerfilePathLen = 200
+	minAppMemoryMB       = 128
+	maxAppMemoryMB       = 16384
+	minAppCPU            = 0.1
+	maxAppCPU            = 8
+)
 
 // normalizeDockerfilePath validates a user-supplied path and returns its
 // clean, slash-separated form ("" means "not set"). It must stay inside the
@@ -70,6 +82,42 @@ func validateContainerPort(port int) error {
 	return nil
 }
 
+func validateAppResources(memoryMB int, cpu float64) error {
+	if memoryMB != 0 && (memoryMB < minAppMemoryMB || memoryMB > maxAppMemoryMB) {
+		return fmt.Errorf("memoryMB must be between %d and %d (or 0 for the default %d)", minAppMemoryMB, maxAppMemoryMB, defaultDeployMemoryMB)
+	}
+	if cpu != 0 && (cpu < minAppCPU || cpu > maxAppCPU) {
+		return fmt.Errorf("cpu must be between %.1f and %d cores (or 0 for the default %.2f)", minAppCPU, maxAppCPU, defaultDeployCPU)
+	}
+	return nil
+}
+
+// resources returns the CPU and memory the app's container runs with.
+func (b BuildSettings) resources() (float64, int64) {
+	cpu, memoryMB := defaultDeployCPU, int64(defaultDeployMemoryMB)
+	if b.CPU > 0 {
+		cpu = b.CPU
+	}
+	if b.MemoryMB > 0 {
+		memoryMB = int64(b.MemoryMB)
+	}
+	return cpu, memoryMB
+}
+
+// deploymentResources is resources() for a stored deployment, falling back to
+// the defaults when its settings can't be read, so a transient DB error never
+// blocks a restart.
+func deploymentResources(ctx context.Context, deploymentID string) (float64, int64) {
+	if deploymentStore == nil {
+		return BuildSettings{}.resources()
+	}
+	settings, err := deploymentStore.GetBuildSettings(ctx, deploymentID)
+	if err != nil {
+		return BuildSettings{}.resources()
+	}
+	return settings.resources()
+}
+
 func (b BuildSettings) validated() (BuildSettings, error) {
 	p, err := normalizeDockerfilePath(b.DockerfilePath)
 	if err != nil {
@@ -78,7 +126,10 @@ func (b BuildSettings) validated() (BuildSettings, error) {
 	if err := validateContainerPort(b.ContainerPort); err != nil {
 		return BuildSettings{}, err
 	}
-	return BuildSettings{DockerfilePath: p, ContainerPort: b.ContainerPort}, nil
+	if err := validateAppResources(b.MemoryMB, b.CPU); err != nil {
+		return BuildSettings{}, err
+	}
+	return BuildSettings{DockerfilePath: p, ContainerPort: b.ContainerPort, MemoryMB: b.MemoryMB, CPU: b.CPU}, nil
 }
 
 // resolveDockerfile returns the absolute path of rel inside repoRoot, and
@@ -226,8 +277,8 @@ func (s *DeploymentStore) GetBuildSettings(ctx context.Context, deploymentID str
 	}
 	var b BuildSettings
 	err := s.pool.QueryRow(ctx, `
-	SELECT dockerfile_path, container_port FROM deployments WHERE id = $1
-	`, deploymentID).Scan(&b.DockerfilePath, &b.ContainerPort)
+	SELECT dockerfile_path, container_port, memory_mb, cpu FROM deployments WHERE id = $1
+	`, deploymentID).Scan(&b.DockerfilePath, &b.ContainerPort, &b.MemoryMB, &b.CPU)
 	if err != nil {
 		return BuildSettings{}, fmt.Errorf("load build settings: %w", err)
 	}
@@ -243,11 +294,33 @@ func (s *DeploymentStore) SetBuildSettings(ctx context.Context, deploymentID str
 		return err
 	}
 	tag, err := s.pool.Exec(ctx, `
-	UPDATE deployments SET dockerfile_path = $2, container_port = $3, updated_at = now()
+	UPDATE deployments SET dockerfile_path = $2, container_port = $3, memory_mb = $4, cpu = $5, updated_at = now()
 	WHERE id = $1 AND deleted_at IS NULL
-	`, deploymentID, validated.DockerfilePath, validated.ContainerPort)
+	`, deploymentID, validated.DockerfilePath, validated.ContainerPort, validated.MemoryMB, validated.CPU)
 	if err != nil {
 		return fmt.Errorf("save build settings: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("deployment not found")
+	}
+	return nil
+}
+
+// SetDeploymentResources changes only a deployment's container limits (the
+// admin resources action), leaving its Dockerfile path and port alone.
+func (s *DeploymentStore) SetDeploymentResources(ctx context.Context, deploymentID string, memoryMB int, cpu float64) error {
+	if s == nil || s.pool == nil {
+		return fmt.Errorf("deployment store is not initialized")
+	}
+	if err := validateAppResources(memoryMB, cpu); err != nil {
+		return err
+	}
+	tag, err := s.pool.Exec(ctx, `
+	UPDATE deployments SET memory_mb = $2, cpu = $3, updated_at = now()
+	WHERE id = $1 AND deleted_at IS NULL
+	`, deploymentID, memoryMB, cpu)
+	if err != nil {
+		return fmt.Errorf("save resources: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("deployment not found")

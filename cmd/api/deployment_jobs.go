@@ -1016,8 +1016,7 @@ func runDeploymentWorkflow(ctx context.Context, payload DeploymentJobPayload, pr
 	fastRestart := !payload.RebuildImage && imageName != ""
 
 	// Note: defaultDeployCPU, defaultDeployMemoryMB, defaultDeployApps are in resources.go
-	requestedCPU := defaultDeployCPU
-	requestedMemoryMB := int64(defaultDeployMemoryMB)
+	requestedCPU, requestedMemoryMB := deploymentResources(ctx, deployment.DeploymentID)
 	requestedApps := int64(defaultDeployApps)
 	var requestedStorageMB int64
 

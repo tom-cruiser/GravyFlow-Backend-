@@ -398,13 +398,41 @@ func (s *DeploymentStore) VerifyDeploymentDomain(
 		status = DomainStatusDNSVerified
 	}
 
+	record, err = s.markDomainVerified(ctx, record.ID, now, expiresAt, status, dnsMessage)
+	if err != nil {
+		return DeploymentDomainRecord{}, err
+	}
+
+	// Record successful ownership verification (history table tracks the
+	// TXT ownership proof only, same as before the reachability check).
+	_ = s.RecordDomainVerificationAttempt(ctx, record.ID, "succeeded", "domain ownership verified successfully")
+
+	return record, nil
+}
+
+// markDomainVerified persists a successful ownership check. Split out of
+// VerifyDeploymentDomain so it can be tested without a live TXT lookup.
+//
+// Every bind parameter must appear in the SQL: this query used to be passed
+// record.CustomDomain as an unreferenced $2, and Postgres rejects a parameter
+// it can't infer a type for ("could not determine data type of parameter $2",
+// SQLSTATE 42P18) — which failed every Verify click after the DNS check passed.
+func (s *DeploymentStore) markDomainVerified(
+	ctx context.Context,
+	domainID string,
+	verifiedAt time.Time,
+	expiresAt *time.Time,
+	status string,
+	statusMessage string,
+) (DeploymentDomainRecord, error) {
+	var record DeploymentDomainRecord
 	if err := s.pool.QueryRow(ctx, `
 	UPDATE domains
 	SET verified = TRUE,
-		verified_at = $3,
-		expires_at = $4,
-		status = $5,
-		status_message = $6,
+		verified_at = $2,
+		expires_at = $3,
+		status = $4,
+		status_message = $5,
 		dns_checked_at = now(),
 		updated_at = now()
 	WHERE id = $1
@@ -412,7 +440,7 @@ func (s *DeploymentStore) VerifyDeploymentDomain(
 			  verified, verification_token, verified_at, expires_at,
 			  status, status_message, is_primary, dns_checked_at,
 			  created_at, updated_at
-	`, record.ID, record.CustomDomain, now, expiresAt, status, dnsMessage).Scan(
+	`, domainID, verifiedAt, expiresAt, status, statusMessage).Scan(
 		&record.ID,
 		&record.DeploymentID,
 		&record.ProjectID,
@@ -430,11 +458,6 @@ func (s *DeploymentStore) VerifyDeploymentDomain(
 	); err != nil {
 		return DeploymentDomainRecord{}, fmt.Errorf("mark deployment domain verified: %w", err)
 	}
-
-	// Record successful ownership verification (history table tracks the
-	// TXT ownership proof only, same as before the reachability check).
-	_ = s.RecordDomainVerificationAttempt(ctx, record.ID, "succeeded", "domain ownership verified successfully")
-
 	return record, nil
 }
 

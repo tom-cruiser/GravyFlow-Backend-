@@ -248,8 +248,11 @@ func (rm *RouteManager) syncToCaddyInternal(ctx context.Context) error {
 		}
 	}
 	
+	// Platform routes go first so no app can claim the dashboard host.
+	routes = append(platformRoutes(), routes...)
+
 	payload := rm.buildCaddyPayload(ctx, routes)
-	
+
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal caddy payload: %w", err)
@@ -291,6 +294,59 @@ func (rm *RouteManager) syncToCaddyInternal(ctx context.Context) error {
 	return nil
 }
 
+// dashboardHost is the public host serving the Next.js dashboard and, under
+// /api/*, this API. Empty means Caddy serves no platform routes (local dev).
+func dashboardHost() string {
+	return strings.Trim(strings.ToLower(strings.TrimSpace(os.Getenv("GRAVYFLOW_DASHBOARD_HOST"))), ".")
+}
+
+// platformRoutes serves the dashboard and API from one host, so the browser
+// never makes a cross-origin request. They must be part of every /load
+// payload: /load replaces Caddy's whole config, Caddyfile sites included.
+func platformRoutes() []map[string]any {
+	host := dashboardHost()
+	if host == "" {
+		return nil
+	}
+	proxy := func(dial string) []any {
+		return []any{map[string]any{
+			"handler":   "reverse_proxy",
+			"upstreams": []any{map[string]any{"dial": dial}},
+		}}
+	}
+	return []map[string]any{
+		{
+			"match":    []any{map[string]any{"host": []string{host}, "path": []string{"/api/*"}}},
+			"handle":   proxy(envOrDefault("GRAVYFLOW_API_UPSTREAM", "api:8080")),
+			"terminal": true,
+		},
+		{
+			"match":    []any{map[string]any{"host": []string{host}}},
+			"handle":   proxy(envOrDefault("GRAVYFLOW_DASHBOARD_UPSTREAM", "gravyflow-frontend:3000")),
+			"terminal": true,
+		},
+	}
+}
+
+// platformHTTPSRedirect sends plain-HTTP dashboard traffic to HTTPS (TLS on only).
+func platformHTTPSRedirect() []map[string]any {
+	host := dashboardHost()
+	if host == "" {
+		return nil
+	}
+	return []map[string]any{{
+		"match": []any{map[string]any{"host": []string{host}}},
+		"handle": []any{map[string]any{
+			"handler":     "static_response",
+			"status_code": 308,
+			"headers": map[string]any{
+				"Location": []string{"https://{http.request.host}{http.request.uri}"},
+			},
+		}},
+		"terminal": true,
+	}}
+}
+
 func (rm *RouteManager) buildRouteConfig() []map[string]any {
 	routes := make([]map[string]any, 0, len(rm.routes))
 	
@@ -328,17 +384,10 @@ func (rm *RouteManager) buildCaddyPayload(ctx context.Context, routes []map[stri
 		servers["gravyflow"] = map[string]any{
 			"listen": []string{fmt.Sprintf(":%s", rm.config.HTTPSPort)},
 			"routes": routes,
-			"tls": map[string]any{
-				"automation": map[string]any{
-					"policy": "acme",
-					"email":  rm.config.TLSEmail,
-					"ca":     rm.config.TLSAcmeCA,
-				},
-			},
 		}
 		servers["gravyflow-http"] = map[string]any{
 			"listen": []string{fmt.Sprintf(":%s", rm.config.HTTPPort)},
-			"routes": rm.buildHTTPPortRoutes(ctx, routes),
+			"routes": append(platformHTTPSRedirect(), rm.buildHTTPPortRoutes(ctx, routes)...),
 		}
 	} else {
 		// TLS off (default/dev): one plain HTTP server, unchanged from
@@ -356,15 +405,31 @@ func (rm *RouteManager) buildCaddyPayload(ctx context.Context, routes []map[stri
 		adminListen = "0.0.0.0:2019"
 	}
 
+	apps := map[string]any{
+		"http": map[string]any{
+			"servers": servers,
+		},
+	}
+	if rm.config.EnableTLS {
+		// Certificate settings live in the tls app, not on the HTTP server
+		// (Caddy rejects an unknown "tls" field there). Hosts on the HTTPS
+		// listener get certificates automatically under this policy.
+		issuer := map[string]any{"module": "acme", "ca": rm.config.TLSAcmeCA}
+		if rm.config.TLSEmail != "" {
+			issuer["email"] = rm.config.TLSEmail
+		}
+		apps["tls"] = map[string]any{
+			"automation": map[string]any{
+				"policies": []any{map[string]any{"issuers": []any{issuer}}},
+			},
+		}
+	}
+
 	return map[string]any{
 		"admin": map[string]any{
 			"listen": adminListen,
 		},
-		"apps": map[string]any{
-			"http": map[string]any{
-				"servers": servers,
-			},
-		},
+		"apps": apps,
 	}
 }
 
@@ -620,6 +685,10 @@ func init() {
 		// ever being added. Container liveness is Docker's restart policy's job.
 		HealthCheck: false,
 		BackupDir:   strings.TrimSpace(os.Getenv("CADDY_BACKUP_DIR")),
+		// Pin this to Caddy's gravyflow-network address in production: on
+		// 0.0.0.0 the admin API (no auth) is reachable from every app
+		// container on gravyflow-apps.
+		AdminListen: strings.TrimSpace(os.Getenv("CADDY_ADMIN_LISTEN")),
 	}
 	defaultRouteManager = NewRouteManager(config)
 }

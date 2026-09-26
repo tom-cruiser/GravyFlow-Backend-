@@ -1,6 +1,8 @@
 {
-	# Expose admin API so the GravyFlow API can push routes from the host.
-	admin 0.0.0.0:2019
+	# Only on gravyflow-network (docker-compose.yml pins this address), so
+	# app containers on gravyflow-apps can't reach the unauthenticated API.
+	# The API replaces this whole config via /load on startup.
+	admin 172.20.255.250:2019
 }
 
 :80 {

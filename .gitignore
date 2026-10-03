@@ -25,3 +25,9 @@ node_modules/
 
 # Compiled binary at the repo root (go build -o api ./cmd/api)
 /api
+
+# Compiled binary from `go build -o gravyflow-api ./cmd/api`
+/gravyflow-api
+
+# Python bytecode
+__pycache__/

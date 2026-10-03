@@ -600,6 +600,25 @@ func checkDockerHealth() string {
 // EXISTING HANDLERS (Updated)
 // ============================================================================
 
+// validateAppName rejects names that can't serve as the app's hostname
+// label: the name becomes the container name and the
+// "<name>.<GRAVYFLOW_APPS_DOMAIN>" host, so e.g. "nerva-frontend-" would
+// yield an unresolvable "nerva-frontend-.apps.example.com".
+func validateAppName(name string) error {
+	if !hostnameLabelPattern.MatchString(name) || len(name) > 63 {
+		suggestion := slugifyName(name)
+		if len(suggestion) > 63 {
+			suggestion = strings.Trim(suggestion[:63], "-")
+		}
+		msg := "name must be 1-63 lowercase letters, digits or hyphens, and must not start or end with a hyphen"
+		if suggestion != "" {
+			msg += fmt.Sprintf(" (try %q)", suggestion)
+		}
+		return errors.New(msg)
+	}
+	return nil
+}
+
 func createAppHandler(c *gin.Context) {
 	user, ok := currentAuthUser(c)
 	if !ok {
@@ -616,6 +635,10 @@ func createAppHandler(c *gin.Context) {
 	req.Name = strings.TrimSpace(req.Name)
 	if req.Name == "" {
 		sendBadRequest(c, "name is required", nil)
+		return
+	}
+	if err := validateAppName(req.Name); err != nil {
+		sendBadRequest(c, err.Error(), nil)
 		return
 	}
 	if req.GitHub == nil {

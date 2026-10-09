@@ -1,0 +1,44 @@
+name: Deploy
+
+# Every push to main is built and tested, then redeploys the server. The
+# deploy key is restricted on the server to ~/Hosting/GravyFlow/deploy.sh,
+# which pulls main and rebuilds.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./...
+
+  deploy:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Deploy over SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o ServerAliveInterval=30 \
+            "$USER@$HOST" backend

@@ -152,8 +152,13 @@ func prepareDeploymentSource(ctx context.Context, deployment DeploymentRecord) (
 }
 
 func prepareDeploymentSourceWithOptions(ctx context.Context, deployment DeploymentRecord, opts GitCloneOptions) (string, error) {
+	// A local app path is only the source for services without a remote
+	// repo. For repo-backed services it is the checkout recorded by the
+	// previous deploy, and building from it as-is would skip the fetch and
+	// redeploy stale code.
 	appPath := strings.TrimSpace(deployment.AppPath)
-	if appPath != "" && !isRemoteRepoSource(appPath) {
+	hasRemoteRepo := isRemoteRepoSource(strings.TrimSpace(deployment.SourceRepoURL))
+	if appPath != "" && !isRemoteRepoSource(appPath) && !hasRemoteRepo {
 		absPath, err := filepath.Abs(appPath)
 		if err != nil {
 			return "", fmt.Errorf("resolve app path: %w", err)

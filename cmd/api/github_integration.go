@@ -222,6 +222,48 @@ WHERE id = $1 AND deleted_at IS NULL
 	return nil
 }
 
+// GitHubSourcedDeployment identifies one deployment wired to a GitHub App
+// installation + repository, with the owner needed to enqueue a build on its
+// behalf (push webhooks carry no user, so the deploy runs as the app owner).
+type GitHubSourcedDeployment struct {
+	DeploymentID string
+	OwnerUserID  string
+}
+
+// DeploymentsByGitHubSource returns every non-deleted deployment wired to a
+// given GitHub App installation + repository. A monorepo maps one repository
+// to many deployments (e.g. Nerva-backend -> 8 services), so a single push can
+// return several rows — the push-webhook path rebuilds all of them.
+func (s *DeploymentStore) DeploymentsByGitHubSource(ctx context.Context, installationID, repositoryID int64) ([]GitHubSourcedDeployment, error) {
+	if s == nil || s.pool == nil {
+		return nil, &StoreError{Type: ErrDatabase, Message: "deployment store is not initialized"}
+	}
+	rows, err := s.pool.Query(ctx, `
+SELECT id::text, owner_user_id::text
+FROM deployments
+WHERE github_installation_id = $1
+  AND github_repository_id = $2
+  AND deleted_at IS NULL
+`, installationID, repositoryID)
+	if err != nil {
+		return nil, &StoreError{Type: ErrDatabase, Message: "failed to list deployments for repository", Err: err}
+	}
+	defer rows.Close()
+
+	var out []GitHubSourcedDeployment
+	for rows.Next() {
+		var d GitHubSourcedDeployment
+		if err := rows.Scan(&d.DeploymentID, &d.OwnerUserID); err != nil {
+			return nil, &StoreError{Type: ErrDatabase, Message: "failed to scan deployment row", Err: err}
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, &StoreError{Type: ErrDatabase, Message: "failed to read deployment rows", Err: err}
+	}
+	return out, nil
+}
+
 // DeploymentGitHubSource is a deployment's GitHub App link. Linked is false
 // for deployments created from a plain repository URL.
 type DeploymentGitHubSource struct {
@@ -640,6 +682,18 @@ func verifyGitHubSignature(secret string, body []byte, header string) bool {
 type githubWebhookPayload struct {
 	Action       string             `json:"action"`
 	Installation GitHubInstallation `json:"installation"`
+
+	// Push-event fields (ignored by every other event type). Ref is the
+	// fully-qualified ref that was pushed, e.g. "refs/heads/main"; Deleted is
+	// true when the push deleted the ref (no code to build). Repository tells
+	// us which linked repo — and its default branch — the push belongs to.
+	Ref        string `json:"ref"`
+	Deleted    bool   `json:"deleted"`
+	Repository struct {
+		ID            int64  `json:"id"`
+		FullName      string `json:"full_name"`
+		DefaultBranch string `json:"default_branch"`
+	} `json:"repository"`
 }
 
 // githubWebhookHandler keeps linked installations in sync. Events can arrive
@@ -686,6 +740,14 @@ func githubWebhookHandler(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"deleted": installationID})
 		return
+	case event == "push":
+		// Auto-deploy: a push to a linked repo's default branch rebuilds every
+		// app wired to that repo. The DB lookup + enqueue run asynchronously
+		// (GitHub times out deliveries after 10s); accepted is the cheap,
+		// synchronous "is this a default-branch push worth acting on?" verdict.
+		accepted := handleGitHubPush(payload, installationID, c.GetHeader("X-GitHub-Delivery"))
+		c.JSON(http.StatusAccepted, gin.H{"event": "push", "accepted": accepted})
+		return
 	case event == "installation", event == "installation_repositories", event == "installation_target":
 		// Handled below.
 	default:
@@ -708,6 +770,68 @@ func githubWebhookHandler(c *gin.Context) {
 	}(c.GetHeader("X-GitHub-Delivery"))
 
 	c.JSON(http.StatusAccepted, gin.H{"queued": installationID})
+}
+
+// handleGitHubPush auto-deploys on a push to a linked repository's default
+// branch: it looks up every deployment wired to that installation+repository
+// and enqueues a rebuild for each (a monorepo repo maps to many services, so
+// one push can redeploy several). It returns true when the push is a
+// default-branch commit worth acting on — that verdict is computed
+// synchronously (cheap string checks) while the DB lookup and enqueues run in
+// a goroutine, because GitHub abandons a webhook delivery after ~10s.
+//
+// The deploy runs as the deployment's owner (a push webhook carries no user),
+// mirroring the manual POST /apps/:id/deploy path. Only the repo's default
+// branch triggers a deploy; feature/PR branches and branch deletions are
+// ignored, matching that apps store no per-branch build setting.
+func handleGitHubPush(payload githubWebhookPayload, installationID int64, delivery string) bool {
+	const branchPrefix = "refs/heads/"
+
+	// Ignore tag pushes and branch deletions — nothing to build.
+	if payload.Deleted || !strings.HasPrefix(payload.Ref, branchPrefix) {
+		return false
+	}
+	branch := strings.TrimPrefix(payload.Ref, branchPrefix)
+	defaultBranch := payload.Repository.DefaultBranch
+	repoID := payload.Repository.ID
+	if defaultBranch == "" || branch != defaultBranch || repoID <= 0 || installationID <= 0 {
+		return false
+	}
+	if deploymentStore == nil {
+		log.Printf("[github] push %s (%s@%s): deployment store unavailable", delivery, payload.Repository.FullName, branch)
+		return false
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), githubWebhookTimeout)
+		defer cancel()
+
+		deps, err := deploymentStore.DeploymentsByGitHubSource(ctx, installationID, repoID)
+		if err != nil {
+			log.Printf("[github] push %s (%s@%s): list deployments for repo %d: %v", delivery, payload.Repository.FullName, branch, repoID, err)
+			return
+		}
+		if len(deps) == 0 {
+			log.Printf("[github] push %s (%s@%s): no deployments linked to repo %d; nothing to redeploy", delivery, payload.Repository.FullName, branch, repoID)
+			return
+		}
+		if deploymentJobs == nil {
+			log.Printf("[github] push %s (%s@%s): %d deployment(s) linked but job manager unavailable", delivery, payload.Repository.FullName, branch, len(deps))
+			return
+		}
+
+		cfg := JobConfig{Priority: PriorityNormal, MaxRetries: 0, Timeout: 30 * time.Minute}
+		for _, d := range deps {
+			jobID, err := deploymentJobs.EnqueueDeploymentWithConfig(ctx, d.OwnerUserID, d.DeploymentID, true, cfg)
+			if err != nil {
+				log.Printf("[github] push %s (%s@%s): enqueue deploy for deployment %s: %v", delivery, payload.Repository.FullName, branch, d.DeploymentID, err)
+				continue
+			}
+			log.Printf("[github] push %s (%s@%s): queued deploy job %s for deployment %s", delivery, payload.Repository.FullName, branch, jobID, d.DeploymentID)
+		}
+	}()
+
+	return true
 }
 
 func refreshGitHubInstallation(ctx context.Context, client *GitHubAppClient, installationID int64) error {

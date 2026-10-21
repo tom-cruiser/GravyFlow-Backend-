@@ -381,6 +381,9 @@ func (s *DeploymentStore) AdminHardDeleteUser(ctx context.Context, targetUserID 
 	}
 	for _, d := range deployments {
 		if d.ContainerID == "" {
+			if err := RemoveDeploymentVolumes(ctx, d.DeploymentID); err != nil {
+				fmt.Printf("[WARN] hard delete: failed to remove volumes for deployment %q: %v\n", d.DeploymentID, err)
+			}
 			continue
 		}
 		// removeVolumes=true: the spec's hard-delete workflow explicitly calls
@@ -391,6 +394,9 @@ func (s *DeploymentStore) AdminHardDeleteUser(ctx context.Context, targetUserID 
 			// Best-effort: log and continue so a stale/already-gone container
 			// doesn't block account deletion the operator explicitly requested.
 			fmt.Printf("[WARN] hard delete: failed to remove container %q for deployment %q: %v\n", d.ContainerID, d.DeploymentID, err)
+		}
+		if err := RemoveDeploymentVolumes(ctx, d.DeploymentID); err != nil {
+			fmt.Printf("[WARN] hard delete: failed to remove volumes for deployment %q: %v\n", d.DeploymentID, err)
 		}
 	}
 

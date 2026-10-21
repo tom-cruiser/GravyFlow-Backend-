@@ -218,6 +218,13 @@ func CreateAndStartContainerWithHealthCheck(
         }
     }
 
+    // Before the old container is removed: if the volumes can't be set up,
+    // the running app stays up instead of being replaced by one without them.
+    mounts, err := deploymentVolumeMounts(ctx, dockerClient, deploymentID)
+    if err != nil {
+        return "", err
+    }
+
     if err := removeContainerByName(ctx, dockerClient, containerName); err != nil {
         return "", err
     }
@@ -266,6 +273,7 @@ func CreateAndStartContainerWithHealthCheck(
             Memory:   memoryMB * 1024 * 1024,
             NanoCPUs: int64(math.Round(cpus * 1_000_000_000)),
         },
+        Mounts: mounts,
     }
 
     // Put the app on the apps network, the one Caddy also joins, so Caddy can

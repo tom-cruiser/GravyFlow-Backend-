@@ -690,7 +690,7 @@ func createAppHandler(c *gin.Context) {
 	}
 
 	// Saved before enqueueing so the very first build already uses them.
-	if buildSettings != (BuildSettings{}) {
+	if !buildSettings.isZero() {
 		if err := deploymentStore.SetBuildSettings(c.Request.Context(), deploymentID, buildSettings); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"error":      "failed_to_save_build_settings",

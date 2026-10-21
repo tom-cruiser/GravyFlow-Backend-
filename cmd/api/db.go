@@ -1129,6 +1129,9 @@ ALTER TABLE deployments ADD COLUMN IF NOT EXISTS last_restart_at TIMESTAMPTZ`},
 		{29, `
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS memory_mb INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS cpu DOUBLE PRECISION NOT NULL DEFAULT 0`},
+		// Container paths kept on named volumes across redeploys (volumes.go).
+		{30, `
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS volume_paths TEXT[] NOT NULL DEFAULT '{}'`},
 	}
 
 	for _, migration := range migrations {

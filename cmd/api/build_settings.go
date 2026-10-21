@@ -35,12 +35,21 @@ import (
 //	cpu              the container's CPU limit in cores; 0 = defaultDeployCPU
 //	                 (a single-container app running several processes needs
 //	                 more than the defaults)
+//	volume_paths     container directories kept across redeploys on named
+//	                 volumes (volumes.go); omitted from a save = unchanged
 
 type BuildSettings struct {
 	DockerfilePath string  `json:"dockerfilePath"`
 	ContainerPort  int     `json:"containerPort"`
 	MemoryMB       int     `json:"memoryMB"`
 	CPU            float64 `json:"cpu"`
+	VolumePaths    []string `json:"volumePaths"`
+}
+
+// isZero reports whether no setting is given (the struct holds a slice, so
+// it can't be compared with ==).
+func (b BuildSettings) isZero() bool {
+	return b.DockerfilePath == "" && b.ContainerPort == 0 && b.MemoryMB == 0 && b.CPU == 0 && len(b.VolumePaths) == 0
 }
 
 const (
@@ -129,7 +138,11 @@ func (b BuildSettings) validated() (BuildSettings, error) {
 	if err := validateAppResources(b.MemoryMB, b.CPU); err != nil {
 		return BuildSettings{}, err
 	}
-	return BuildSettings{DockerfilePath: p, ContainerPort: b.ContainerPort, MemoryMB: b.MemoryMB, CPU: b.CPU}, nil
+	volumePaths, err := normalizeVolumePaths(b.VolumePaths)
+	if err != nil {
+		return BuildSettings{}, err
+	}
+	return BuildSettings{DockerfilePath: p, ContainerPort: b.ContainerPort, MemoryMB: b.MemoryMB, CPU: b.CPU, VolumePaths: volumePaths}, nil
 }
 
 // resolveDockerfile returns the absolute path of rel inside repoRoot, and
@@ -277,10 +290,13 @@ func (s *DeploymentStore) GetBuildSettings(ctx context.Context, deploymentID str
 	}
 	var b BuildSettings
 	err := s.pool.QueryRow(ctx, `
-	SELECT dockerfile_path, container_port, memory_mb, cpu FROM deployments WHERE id = $1
-	`, deploymentID).Scan(&b.DockerfilePath, &b.ContainerPort, &b.MemoryMB, &b.CPU)
+	SELECT dockerfile_path, container_port, memory_mb, cpu, volume_paths FROM deployments WHERE id = $1
+	`, deploymentID).Scan(&b.DockerfilePath, &b.ContainerPort, &b.MemoryMB, &b.CPU, &b.VolumePaths)
 	if err != nil {
 		return BuildSettings{}, fmt.Errorf("load build settings: %w", err)
+	}
+	if len(b.VolumePaths) == 0 {
+		b.VolumePaths = nil
 	}
 	return b, nil
 }
@@ -293,10 +309,17 @@ func (s *DeploymentStore) SetBuildSettings(ctx context.Context, deploymentID str
 	if err != nil {
 		return err
 	}
+	// A save without volumePaths (nil) keeps the stored ones, so a client that
+	// predates the field can't wipe them by saving its other settings.
+	var volumePaths any
+	if validated.VolumePaths != nil {
+		volumePaths = validated.VolumePaths
+	}
 	tag, err := s.pool.Exec(ctx, `
-	UPDATE deployments SET dockerfile_path = $2, container_port = $3, memory_mb = $4, cpu = $5, updated_at = now()
+	UPDATE deployments SET dockerfile_path = $2, container_port = $3, memory_mb = $4, cpu = $5,
+		volume_paths = COALESCE($6::text[], volume_paths), updated_at = now()
 	WHERE id = $1 AND deleted_at IS NULL
-	`, deploymentID, validated.DockerfilePath, validated.ContainerPort, validated.MemoryMB, validated.CPU)
+	`, deploymentID, validated.DockerfilePath, validated.ContainerPort, validated.MemoryMB, validated.CPU, volumePaths)
 	if err != nil {
 		return fmt.Errorf("save build settings: %w", err)
 	}

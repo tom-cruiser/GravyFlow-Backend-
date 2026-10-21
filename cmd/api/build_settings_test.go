@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -215,7 +216,7 @@ func TestBuildSettingsStoreRoundTrip(t *testing.T) {
 	}
 
 	got, err := store.GetBuildSettings(ctx, id)
-	if err != nil || got != (BuildSettings{}) {
+	if err != nil || !reflect.DeepEqual(got, BuildSettings{}) {
 		t.Fatalf("defaults = %+v, %v; want empty settings", got, err)
 	}
 
@@ -223,14 +224,14 @@ func TestBuildSettingsStoreRoundTrip(t *testing.T) {
 	if err := store.SetBuildSettings(ctx, id, want); err != nil {
 		t.Fatalf("SetBuildSettings: %v", err)
 	}
-	if got, _ := store.GetBuildSettings(ctx, id); got != want {
+	if got, _ := store.GetBuildSettings(ctx, id); !reflect.DeepEqual(got, want) {
 		t.Fatalf("round trip = %+v, want %+v", got, want)
 	}
 
 	if err := store.SetBuildSettings(ctx, id, BuildSettings{DockerfilePath: "../evil"}); err == nil {
 		t.Fatal("an unsafe path must be rejected before it reaches the database")
 	}
-	if got, _ := store.GetBuildSettings(ctx, id); got != want {
+	if got, _ := store.GetBuildSettings(ctx, id); !reflect.DeepEqual(got, want) {
 		t.Fatalf("a rejected update changed the stored settings: %+v", got)
 	}
 

@@ -235,6 +235,7 @@ func setupRouter(config ServerConfig) *gin.Engine {
 	// Global middleware
 	router.Use(gin.LoggerWithConfig(gin.LoggerConfig{
 		SkipPaths: []string{"/api/health", "/metrics"},
+		Formatter: redactingLogFormatter,
 	}))
 	router.Use(gin.Recovery())
 	router.Use(requestIDMiddleware())
@@ -443,7 +444,8 @@ func responseTimeMiddleware() gin.HandlerFunc {
 		duration := time.Since(start)
 		
 		// Log slow requests
-		if duration > 5*time.Second {
+		// Long-lived WebSockets (log streams) are expected to outlast this.
+		if duration > 5*time.Second && !c.IsWebsocket() {
 			requestID := c.GetString("requestID")
 			log.Printf("[SLOW] %s %s took %v", requestID, c.Request.URL.Path, duration)
 		}

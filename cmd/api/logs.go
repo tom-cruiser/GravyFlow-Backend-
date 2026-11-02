@@ -29,7 +29,10 @@ const (
     defaultTailLines        = 100
     writeWait               = 10 * time.Second
     pongWait                = 60 * time.Second
-    pingPeriod              = (pongWait * 9) / 10
+    // Ping well inside pongWait so a single delayed pong (Cloudflare/Caddy
+    // in the path) doesn't trip the read deadline, and so idle proxies see
+    // traffic on streams where the container is producing no output.
+    pingPeriod              = 20 * time.Second
     maxMessageSize          = 512
 )
 
@@ -412,17 +415,16 @@ func setupWebSocket(conn *websocket.Conn) {
         return nil
     })
 
-    // Start ping ticker
+    // Start ping ticker. WriteControl is the only write gorilla/websocket
+    // allows concurrently with other writers; WriteMessage here raced the
+    // log-line writers and could corrupt frames or panic.
     go func() {
         ticker := time.NewTicker(pingPeriod)
         defer ticker.Stop()
 
-        for {
-            select {
-            case <-ticker.C:
-                if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-                    return
-                }
+        for range ticker.C {
+            if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait)); err != nil {
+                return
             }
         }
     }()
